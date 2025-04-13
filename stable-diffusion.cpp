@@ -804,7 +804,8 @@ public:
                         float slg_scale              = 0,
                         float skip_layer_start       = 0.01,
                         float skip_layer_end         = 0.2,
-                        ggml_tensor* noise_mask      = nullptr) {
+                        ggml_tensor* noise_mask      = nullptr,
+                        int shifted_timestep         = -1) {
         LOG_DEBUG("Sample");
         struct ggml_init_params params;
         size_t data_size = ggml_row_size(init_latent->type, init_latent->ne[0]);
@@ -860,7 +861,16 @@ public:
             float c_in   = scaling[2];
 
             float t = denoiser->sigma_to_t(sigma);
-            std::vector<float> timesteps_vec(x->ne[3], t);  // [N, ]
+            float t_for_model = t;
+            if (method == TIMESTEP_SHIFT_LCM && shifted_timestep > 0) {
+                // Apply timestep shift: t_shifted = t * shifted_timestep / TIMESTEPS
+                // TIMESTEPS is defined in denoiser.hpp as 1000
+                t_for_model = t * (float)shifted_timestep / (float)TIMESTEPS;
+                // Ensure t_for_model stays within valid range [0, TIMESTEPS-1]
+                t_for_model = std::max(0.f, std::min(t_for_model, (float)TIMESTEPS - 1.f));
+                LOG_DEBUG("Timestep Shift: original t=%.2f, shifted t=%.2f (shifted_timestep=%d)", t, t_for_model, shifted_timestep);
+            }
+            std::vector<float> timesteps_vec(x->ne[3], t_for_model);  // Use t_for_model for the diffusion model call
             auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
             std::vector<float> guidance_vec(x->ne[3], guidance);
             auto guidance_tensor = vector_to_ggml_tensor(work_ctx, guidance_vec);
@@ -1213,7 +1223,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                            float slg_scale              = 0,
                            float skip_layer_start       = 0.01,
                            float skip_layer_end         = 0.2,
-                           ggml_tensor* masked_image    = NULL) {
+                           ggml_tensor* masked_image    = NULL,
+                           int shifted_timestep         = -1) {
     if (seed < 0) {
         // Generally, when using the provided command line, the seed is always >0.
         // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
@@ -1470,7 +1481,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                                                      slg_scale,
                                                      skip_layer_start,
                                                      skip_layer_end,
-                                                     noise_mask);
+                                                     noise_mask,
+                                                     shifted_timestep);
 
         // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
         // print_ggml_tensor(x_0);
@@ -1543,7 +1555,8 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                     size_t skip_layers_count = 0,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
-                    float skip_layer_end     = 0.2) {
+                    float skip_layer_end     = 0.2,
+                    int shifted_timestep     = -1) {
     std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
     LOG_DEBUG("txt2img %dx%d", width, height);
     if (sd_ctx == NULL) {
@@ -1621,7 +1634,9 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                skip_layers_vec,
                                                slg_scale,
                                                skip_layer_start,
-                                               skip_layer_end);
+                                               skip_layer_end,
+                                               NULL, // masked_image is NULL for txt2img
+                                               shifted_timestep);
 
     size_t t1 = ggml_time_ms();
 
@@ -1655,7 +1670,8 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                     size_t skip_layers_count = 0,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
-                    float skip_layer_end     = 0.2) {
+                    float skip_layer_end     = 0.2,
+                    int shifted_timestep     = -1) {
     std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
     LOG_DEBUG("img2img %dx%d", width, height);
     if (sd_ctx == NULL) {
@@ -1802,7 +1818,8 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                                                slg_scale,
                                                skip_layer_start,
                                                skip_layer_end,
-                                               masked_image);
+                                               masked_image, // Pass the actual masked_image for img2img
+                                               shifted_timestep);
 
     size_t t2 = ggml_time_ms();
 

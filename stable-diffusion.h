@@ -46,6 +46,7 @@ enum sample_method_t {
     LCM,
     DDIM_TRAILING,
     TCD,
+    TIMESTEP_SHIFT_LCM,
     N_SAMPLE_METHODS
 };
 
@@ -176,7 +177,8 @@ SD_API sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                            size_t skip_layers_count,
                            float slg_scale,
                            float skip_layer_start,
-                           float skip_layer_end);
+                           float skip_layer_end,
+                           int shifted_timestep);
 
 SD_API sd_image_t* img2img(sd_ctx_t* sd_ctx,
                            sd_image_t init_image,
@@ -203,7 +205,8 @@ SD_API sd_image_t* img2img(sd_ctx_t* sd_ctx,
                            size_t skip_layers_count,
                            float slg_scale,
                            float skip_layer_start,
-                           float skip_layer_end);
+                           float skip_layer_end,
+                           int shifted_timestep);
 
 SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
                            sd_image_t init_image,
