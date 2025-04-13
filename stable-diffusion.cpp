@@ -105,6 +105,7 @@ public:
     bool stacked_id           = false;
 
     std::map<std::string, struct ggml_tensor*> tensors;
+    std::vector<float> alphas_cumprod; // Store alphas_cumprod persistently
 
     std::string lora_model_dir;
     // lora_name => multiplier
@@ -414,6 +415,9 @@ public:
         GGML_ASSERT(ctx != NULL);
         ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TIMESTEPS);
         calculate_alphas_cumprod((float*)alphas_cumprod_tensor->data);
+        // Store alphas_cumprod persistently
+        this->alphas_cumprod.resize(TIMESTEPS);
+        memcpy(this->alphas_cumprod.data(), alphas_cumprod_tensor->data, ggml_nbytes(alphas_cumprod_tensor));
 
         // load weights
         LOG_DEBUG("loading weights");
@@ -805,7 +809,8 @@ public:
                         float skip_layer_start       = 0.01,
                         float skip_layer_end         = 0.2,
                         ggml_tensor* noise_mask      = nullptr,
-                        int shifted_timestep         = -1) {
+                        int shifted_timestep         = -1,
+                        int original_steps           = -1) { // Added original_steps
         LOG_DEBUG("Sample");
         struct ggml_init_params params;
         size_t data_size = ggml_row_size(init_latent->type, init_latent->ne[0]);
@@ -819,6 +824,14 @@ public:
         ggml_context* tmp_ctx = ggml_init(params);
 
         size_t steps = sigmas.size() - 1;
+
+        // Calculate sigmas for the original schedule if needed for timestep shift
+        std::vector<float> original_sigmas_for_shift;
+        if (method == TIMESTEP_SHIFT_LCM && original_steps > 0) {
+            // Use DiscreteSchedule based on previous findings (Attempt #21)
+            original_sigmas_for_shift = DiscreteSchedule().get_sigmas(original_steps);
+            LOG_DEBUG("Calculated original_sigmas_for_shift for %d steps", original_steps);
+        }
         // noise = load_tensor_from_file(work_ctx, "./rand0.bin");
         // print_ggml_tensor(noise);
         struct ggml_tensor* x = ggml_dup_tensor(work_ctx, init_latent);
@@ -848,91 +861,95 @@ public:
         }
         struct ggml_tensor* denoised = ggml_dup_tensor(work_ctx, x);
 
-        auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
+        auto denoise = [&](ggml_tensor* input, float sigma_current_step, int step) -> ggml_tensor* {
             if (step == 1) {
                 pretty_progress(0, (int)steps, 0);
             }
             int64_t t0 = ggml_time_us();
 
-            std::vector<float> scaling = denoiser->get_scalings(sigma);
-            GGML_ASSERT(scaling.size() == 3);
-            float c_skip = scaling[0];
-            float c_out  = scaling[1];
-            float c_in   = scaling[2];
+            // --- Common calculations ---
+            float t_current_step = denoiser->sigma_to_t(sigma_current_step);
+            int t_int_current_step = (int)roundf(t_current_step);
+            t_int_current_step = std::max(0, std::min(t_int_current_step, TIMESTEPS - 1));
 
-            float t = denoiser->sigma_to_t(sigma);
-            float t_for_model = t;
-            if (method == TIMESTEP_SHIFT_LCM && shifted_timestep > 0) {
-                // Apply timestep shift: t_shifted = t * shifted_timestep / TIMESTEPS
-                // TIMESTEPS is defined in denoiser.hpp as 1000
-                t_for_model = t * (float)shifted_timestep / (float)TIMESTEPS;
-                // Ensure t_for_model stays within valid range [0, TIMESTEPS-1]
+            std::vector<float> timesteps_vec;
+            float c_in_to_use;
+
+            // --- Timestep Shift Logic ---
+            if (method == TIMESTEP_SHIFT_LCM && original_steps > 0 && shifted_timestep > 0) {
+                LOG_DEBUG("[Step %d/%zu] TSLCM Start", step, steps);
+                LOG_DEBUG("  sigma_current_step: %.4f, t_current_step: %.4f, t_int_current_step: %d", sigma_current_step, t_current_step, t_int_current_step);
+
+                // 1. Map current step to original schedule index
+                int original_step_index = 0;
+                if (steps > 1) {
+                    // Map step [1, steps] to index [0, original_steps - 1]
+                    original_step_index = (int)roundf(((float)(step - 1) / (steps - 1)) * (original_steps - 1));
+                }
+                original_step_index = std::max(0, std::min(original_step_index, original_steps - 1));
+                LOG_DEBUG("  original_steps: %d, current_step: %d -> original_step_index: %d", original_steps, step, original_step_index);
+
+                // 2. Get original sigma and timestep from the precalculated discrete schedule
+                float sigma_original = original_sigmas_for_shift[original_step_index];
+                float t_original = denoiser->sigma_to_t(sigma_original);
+                int t_int_original = (int)roundf(t_original);
+                t_int_original = std::max(0, std::min(t_int_original, TIMESTEPS - 1));
+                LOG_DEBUG("  sigma_original: %.4f, t_original: %.4f, t_int_original: %d", sigma_original, t_original, t_int_original);
+
+                // 3. Calculate shifted timestep for the model
+                float t_for_model = (float)t_int_original * (float)shifted_timestep / (float)TIMESTEPS;
                 t_for_model = std::max(0.f, std::min(t_for_model, (float)TIMESTEPS - 1.f));
-                LOG_DEBUG("Timestep Shift: original t=%.2f, shifted t=%.2f (shifted_timestep=%d)", t, t_for_model, shifted_timestep);
+                LOG_DEBUG("  shifted_timestep: %d, t_for_model: %.4f", shifted_timestep, t_for_model);
+
+                // 4. Calculate sigma and scaling factor for the shifted timestep
+                float sigma_for_model = denoiser->t_to_sigma(t_for_model);
+                std::vector<float> scaling_shifted = denoiser->get_scalings(sigma_for_model);
+                c_in_to_use = scaling_shifted[2]; // c_in based on shifted sigma
+                LOG_DEBUG("  sigma_for_model: %.4f, c_in_to_use: %.4f", sigma_for_model, c_in_to_use);
+
+                timesteps_vec.assign(x->ne[3], t_for_model); // Use shifted timestep for UNet
+
+            } else {
+                // --- Standard Logic (non-TSLCM or invalid params) ---
+                std::vector<float> scaling_current = denoiser->get_scalings(sigma_current_step);
+                GGML_ASSERT(scaling_current.size() == 3);
+                c_in_to_use = scaling_current[2]; // Use standard c_in
+                timesteps_vec.assign(x->ne[3], t_current_step); // Use standard timestep for UNet
+                if (method == TIMESTEP_SHIFT_LCM) {
+                     LOG_DEBUG("[Step %d/%zu] TSLCM skipped (original_steps=%d, shifted_timestep=%d)", step, steps, original_steps, shifted_timestep);
+                }
             }
-            std::vector<float> timesteps_vec(x->ne[3], t_for_model);  // Use t_for_model for the diffusion model call
+
             auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
             std::vector<float> guidance_vec(x->ne[3], guidance);
             auto guidance_tensor = vector_to_ggml_tensor(work_ctx, guidance_vec);
 
             copy_ggml_tensor(noised_input, input);
-            // noised_input = noised_input * c_in
-            ggml_tensor_scale(noised_input, c_in);
+            // noised_input = noised_input * c_in_to_use
+            ggml_tensor_scale(noised_input, c_in_to_use);
+            if (method == TIMESTEP_SHIFT_LCM) LOG_DEBUG("  Input scaled by c_in_to_use: %.4f", c_in_to_use);
 
             std::vector<struct ggml_tensor*> controls;
-
             if (control_hint != NULL) {
                 control_net->compute(n_threads, noised_input, control_hint, timesteps, cond.c_crossattn, cond.c_vector);
                 controls = control_net->controls;
-                // print_ggml_tensor(controls[12]);
-                // GGML_ASSERT(0);
             }
 
+            // --- UNet Call ---
+            // Always use the (potentially shifted) timesteps and scaled input
             if (start_merge_step == -1 || step <= start_merge_step) {
-                // cond
-                diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         cond.c_crossattn,
-                                         cond.c_concat,
-                                         cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_cond);
+                diffusion_model->compute(n_threads, noised_input, timesteps, cond.c_crossattn, cond.c_concat, cond.c_vector, guidance_tensor, -1, controls, control_strength, &out_cond);
             } else {
-                diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         id_cond.c_crossattn,
-                                         cond.c_concat,
-                                         id_cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_cond);
+                diffusion_model->compute(n_threads, noised_input, timesteps, id_cond.c_crossattn, cond.c_concat, id_cond.c_vector, guidance_tensor, -1, controls, control_strength, &out_cond);
             }
 
             float* negative_data = NULL;
             if (has_unconditioned) {
-                // uncond
                 if (control_hint != NULL) {
                     control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector);
                     controls = control_net->controls;
                 }
-                diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         uncond.c_crossattn,
-                                         uncond.c_concat,
-                                         uncond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_uncond);
+                diffusion_model->compute(n_threads, noised_input, timesteps, uncond.c_crossattn, uncond.c_concat, uncond.c_vector, guidance_tensor, -1, controls, control_strength, &out_uncond);
                 negative_data = (float*)out_uncond->data;
             }
 
@@ -941,34 +958,26 @@ public:
             float* skip_layer_data = NULL;
             if (is_skiplayer_step) {
                 LOG_DEBUG("Skipping layers at step %d\n", step);
-                // skip layer (same as conditionned)
-                diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         cond.c_crossattn,
-                                         cond.c_concat,
-                                         cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_skip,
-                                         NULL,
-                                         skip_layers);
+                diffusion_model->compute(n_threads, noised_input, timesteps, cond.c_crossattn, cond.c_concat, cond.c_vector, guidance_tensor, -1, controls, control_strength, &out_skip, NULL, skip_layers);
                 skip_layer_data = (float*)out_skip->data;
             }
+
+            // --- Final Denoised Calculation ---
             float* vec_denoised  = (float*)denoised->data;
             float* vec_input     = (float*)input->data;
-            float* positive_data = (float*)out_cond->data;
+            float* positive_data = (float*)out_cond->data; // This is eps_cond or v_cond
             int ne_elements      = (int)ggml_nelements(denoised);
+
             for (int i = 0; i < ne_elements; i++) {
-                float latent_result = positive_data[i];
+                // 1. Apply CFG / SLG to get final eps_pred or v_pred
+                float latent_result = positive_data[i]; // eps_cond or v_cond
                 if (has_unconditioned) {
-                    // out_uncond + cfg_scale * (out_cond - out_uncond)
+                    // latent_result = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
                     int64_t ne3 = out_cond->ne[3];
                     if (min_cfg != cfg_scale && ne3 != 1) {
-                        int64_t i3  = i / out_cond->ne[0] * out_cond->ne[1] * out_cond->ne[2];
+                        int64_t i3  = i / (out_cond->ne[0] * out_cond->ne[1] * out_cond->ne[2]); // Corrected index calculation
                         float scale = min_cfg + (cfg_scale - min_cfg) * (i3 * 1.0f / ne3);
+                        latent_result = negative_data[i] + scale * (positive_data[i] - negative_data[i]);
                     } else {
                         latent_result = negative_data[i] + cfg_scale * (positive_data[i] - negative_data[i]);
                     }
@@ -976,27 +985,61 @@ public:
                 if (is_skiplayer_step) {
                     latent_result = latent_result + (positive_data[i] - skip_layer_data[i]) * slg_scale;
                 }
-                // v = latent_result, eps = latent_result
-                // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
-                vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+                // latent_result now holds the final epsilon or v prediction (eps_cfg)
+
+                // 2. Calculate denoised value based on sampler type
+                if (method == LCM || method == TIMESTEP_SHIFT_LCM) {
+                    // Use diffusers LCM formula: x0 = (input - sigma_t * eps) / alpha_t
+                    // Use original sigma/alpha for the update step, even for TSLCM
+                    float alpha_prod_t = this->alphas_cumprod[t_int_current_step];
+                    float alpha_t = sqrtf(alpha_prod_t);
+                    float sigma_t = sqrtf(1.0f - alpha_prod_t);
+
+                    // Ensure alpha_t is not zero to avoid division by zero
+                    if (alpha_t < 1e-6f) {
+                        alpha_t = 1e-6f; // Prevent division by zero
+                        if (i == 0 && step == 1) LOG_WARN("alpha_t near zero at step %d, t_int %d. Clamping.", step, t_int_current_step);
+                    }
+
+                    vec_denoised[i] = (vec_input[i] - sigma_t * latent_result) / alpha_t;
+
+                    if (method == TIMESTEP_SHIFT_LCM && i == 0) { // Log only once per step
+                         LOG_DEBUG("  Update: alpha_prod_t: %.4f, alpha_t: %.4f, sigma_t: %.4f", alpha_prod_t, alpha_t, sigma_t);
+                         LOG_DEBUG("  Update: input[0]: %.4f, eps_cfg[0]: %.4f -> x0_pred[0]: %.4f", vec_input[0], latent_result, vec_denoised[i]);
+                    }
+
+                } else {
+                    // Standard k-diffusion update: x0 = eps * c_out + input * c_skip (for eps models)
+                    // Or x0 = v * c_out + input * c_skip (for v models)
+                    // Note: c_skip/c_out are calculated from sigma_current_step
+                    std::vector<float> scaling_current = denoiser->get_scalings(sigma_current_step);
+                    float c_skip = scaling_current[0];
+                    float c_out  = scaling_current[1];
+                    vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+                }
             }
+
             int64_t t1 = ggml_time_us();
             if (step > 0) {
                 pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);
-                // LOG_INFO("step %d sampling completed taking %.2fs", step, (t1 - t0) * 1.0f / 1000000);
             }
+
             if (noise_mask != nullptr) {
+                // Apply mask (relevant for img2img with mask but not inpaint model)
                 for (int64_t x = 0; x < denoised->ne[0]; x++) {
                     for (int64_t y = 0; y < denoised->ne[1]; y++) {
-                        float mask = ggml_tensor_get_f32(noise_mask, x, y);
+                        float mask_val = ggml_tensor_get_f32(noise_mask, x, y); // Mask is [W/8, H/8, 1, 1]
                         for (int64_t k = 0; k < denoised->ne[2]; k++) {
-                            float init = ggml_tensor_get_f32(init_latent, x, y, k);
-                            float den  = ggml_tensor_get_f32(denoised, x, y, k);
-                            ggml_tensor_set_f32(denoised, init + mask * (den - init), x, y, k);
+                            float init_val = ggml_tensor_get_f32(init_latent, x, y, k);
+                            float den_val  = ggml_tensor_get_f32(denoised, x, y, k);
+                            // Blend based on mask: result = init_latent * (1-mask) + denoised * mask
+                            // Assuming mask 1 means keep denoised, 0 means keep init_latent
+                            ggml_tensor_set_f32(denoised, init_val * (1.0f - mask_val) + den_val * mask_val, x, y, k);
                         }
                     }
                 }
             }
+             if (method == TIMESTEP_SHIFT_LCM) LOG_DEBUG("[Step %d/%zu] TSLCM End", step, steps);
 
             return denoised;
         };
@@ -1556,7 +1599,8 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
                     float skip_layer_end     = 0.2,
-                    int shifted_timestep     = -1) {
+                    int shifted_timestep     = -1,
+                    int original_steps       = -1) { // Added original_steps
     std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
     LOG_DEBUG("txt2img %dx%d", width, height);
     if (sd_ctx == NULL) {
@@ -1636,7 +1680,8 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                skip_layer_start,
                                                skip_layer_end,
                                                NULL, // masked_image is NULL for txt2img
-                                               shifted_timestep);
+                                               shifted_timestep,
+                                               original_steps); // Pass original_steps
 
     size_t t1 = ggml_time_ms();
 
@@ -1671,7 +1716,8 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
                     float skip_layer_end     = 0.2,
-                    int shifted_timestep     = -1) {
+                    int shifted_timestep     = -1,
+                    int original_steps       = -1) { // Added original_steps
     std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
     LOG_DEBUG("img2img %dx%d", width, height);
     if (sd_ctx == NULL) {
@@ -1819,7 +1865,8 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                                                skip_layer_start,
                                                skip_layer_end,
                                                masked_image, // Pass the actual masked_image for img2img
-                                               shifted_timestep);
+                                               shifted_timestep,
+                                               original_steps); // Pass original_steps
 
     size_t t2 = ggml_time_ms();
 

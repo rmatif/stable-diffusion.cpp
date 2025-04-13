@@ -178,7 +178,8 @@ SD_API sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                            float slg_scale,
                            float skip_layer_start,
                            float skip_layer_end,
-                           int shifted_timestep);
+                           int shifted_timestep,
+                           int original_steps); // Added original_steps
 
 SD_API sd_image_t* img2img(sd_ctx_t* sd_ctx,
                            sd_image_t init_image,
@@ -206,7 +207,8 @@ SD_API sd_image_t* img2img(sd_ctx_t* sd_ctx,
                            float slg_scale,
                            float skip_layer_start,
                            float skip_layer_end,
-                           int shifted_timestep);
+                           int shifted_timestep,
+                           int original_steps); // Added original_steps
 
 SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
                            sd_image_t init_image,
