@@ -175,6 +175,12 @@ std::unordered_map<std::string, std::string> pmid_v2_name_map = {
 };
 
 std::string convert_open_clip_to_hf_clip(const std::string& name) {
+    // Specific fix for ComfyUI-style SDXL CLIP-G text projection name
+    // Check this *before* any other modifications
+    if (name == "conditioner.embedders.1.model.text_projection.weight") {
+        return "cond_stage_model.1.transformer.text_model.text_projection";
+    }
+
     std::string new_name = name;
     std::string prefix;
     if (starts_with(new_name, "conditioner.embedders.0.open_clip.")) {
@@ -185,7 +191,7 @@ std::string convert_open_clip_to_hf_clip(const std::string& name) {
         new_name = new_name.substr(strlen("conditioner.embedders.0."));
     } else if (starts_with(new_name, "conditioner.embedders.1.")) {
         prefix   = "cond_stage_model.1.";
-        new_name = new_name.substr(strlen("conditioner.embedders.0."));
+        new_name = new_name.substr(strlen("conditioner.embedders.1.")); // Fix bug: use correct length for prefix 1
     } else if (starts_with(new_name, "cond_stage_model.")) {
         prefix   = "cond_stage_model.";
         new_name = new_name.substr(strlen("cond_stage_model."));
