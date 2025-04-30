@@ -46,7 +46,6 @@ enum sample_method_t {
     LCM,
     DDIM_TRAILING,
     TCD,
-    TIMESTEP_SHIFT_LCM,
     N_SAMPLE_METHODS
 };
 

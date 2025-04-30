@@ -804,9 +804,13 @@ public:
                         float slg_scale              = 0,
                         float skip_layer_start       = 0.01,
                         float skip_layer_end         = 0.2,
-                        ggml_tensor* noise_mask      = nullptr,
-                        int shifted_timestep         = -1) {
+                        int shifted_timestep         = -1, // Added parameter
+                        ggml_tensor* noise_mask      = nullptr) {
         LOG_DEBUG("Sample");
+        if (shifted_timestep > 0 && !sd_version_is_sdxl(version)) {
+             LOG_WARN("Timestep shifting is only supported for SDXL models. Ignoring --timestep-shift.");
+             shifted_timestep = -1;
+        }
         struct ggml_init_params params;
         size_t data_size = ggml_row_size(init_latent->type, init_latent->ne[0]);
         for (int i = 1; i < 4; i++) {
@@ -848,7 +852,27 @@ public:
         }
         struct ggml_tensor* denoised = ggml_dup_tensor(work_ctx, x);
 
-        auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
+        // Capture necessary variables for the denoising step lambda
+        auto denoise = [this, // Capture 'this' to access members like version, rng, n_threads etc.
+                        &work_ctx, // Context for tensor creation
+                        denoiser = this->denoiser, // Capture shared_ptr by value (copies the pointer)
+                        steps, // Capture steps by value
+                        &x, // Capture latent tensor by reference (modified in loop)
+                        &sigmas, // Capture sigmas vector by reference (read-only needed)
+                        &cond, &uncond, &id_cond, // Capture conditions by reference
+                        control_hint, // Capture control hint pointer by value
+                        control_strength, min_cfg, cfg_scale, guidance, eta, // Capture floats by value
+                        start_merge_step, // Capture int by value
+                        &skip_layers, slg_scale, skip_layer_start, skip_layer_end, // Capture skip layer params
+                        shifted_timestep, // Capture shifted timestep by value
+                        &noise_mask, // Capture noise mask pointer by reference/value
+                        &noise, // Capture noise tensor by reference (modified in loop)
+                        &init_latent, // Capture initial latent tensor by reference (read-only for mask)
+                        &denoised, // Capture output denoised tensor by reference
+                        &noised_input, &out_cond, &out_uncond, &out_skip, // Capture intermediate tensors by reference
+                        has_unconditioned, has_skiplayer // Capture bools by value
+                       ]
+                       (ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
             if (step == 1) {
                 pretty_progress(0, (int)steps, 0);
             }
@@ -861,22 +885,32 @@ public:
             float c_in   = scaling[2];
 
             float t = denoiser->sigma_to_t(sigma);
-            float t_for_model = t;
-            if (method == TIMESTEP_SHIFT_LCM && shifted_timestep > 0) {
-                // Apply timestep shift: t_shifted = t * shifted_timestep / TIMESTEPS
-                // TIMESTEPS is defined in denoiser.hpp as 1000
-                t_for_model = t * (float)shifted_timestep / (float)TIMESTEPS;
-                // Ensure t_for_model stays within valid range [0, TIMESTEPS-1]
-                t_for_model = std::max(0.f, std::min(t_for_model, (float)TIMESTEPS - 1.f));
-                LOG_DEBUG("Timestep Shift: original t=%.2f, shifted t=%.2f (shifted_timestep=%d)", t, t_for_model, shifted_timestep);
+            std::vector<float> timesteps_vec;
+            // --- Timestep Shifting Logic ---
+            if (shifted_timestep > 0 && sd_version_is_sdxl(version)) {
+                // Calculate the shifted timestep value based on the original t
+                // Python: (original_index * (shifted_timestep / total_timesteps)).long()
+                // Assuming TIMESTEPS (1000) is the total_timesteps for SDXL
+                float shifted_t_float = t * (float(shifted_timestep) / float(TIMESTEPS));
+                // Clamp and round to nearest integer timestep index
+                int64_t shifted_t = static_cast<int64_t>(roundf(shifted_t_float));
+                shifted_t = std::max((int64_t)0, std::min((int64_t)(TIMESTEPS - 1), shifted_t));
+                LOG_DEBUG("Shifting timestep from %.2f to %" PRId64 " (sigma: %.4f)", t, shifted_t, sigma);
+                timesteps_vec.assign(x->ne[3], (float)shifted_t);
+            } else {
+                // Use original timestep if shifting is disabled or model is not SDXL
+                timesteps_vec.assign(x->ne[3], t);
             }
-            std::vector<float> timesteps_vec(x->ne[3], t_for_model);  // Use t_for_model for the diffusion model call
+            // --- End Timestep Shifting Logic ---
+
             auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
             std::vector<float> guidance_vec(x->ne[3], guidance);
             auto guidance_tensor = vector_to_ggml_tensor(work_ctx, guidance_vec);
 
             copy_ggml_tensor(noised_input, input);
             // noised_input = noised_input * c_in
+            // NOTE: c_in is calculated based on the *original* sigma, which seems
+            // consistent with how the Python code uses xc derived from original sigma.
             ggml_tensor_scale(noised_input, c_in);
 
             std::vector<struct ggml_tensor*> controls;
@@ -960,26 +994,83 @@ public:
             float* vec_denoised  = (float*)denoised->data;
             float* vec_input     = (float*)input->data;
             float* positive_data = (float*)out_cond->data;
+            float* negative_data_ptr = has_unconditioned ? (float*)out_uncond->data : nullptr; // Get pointer if needed
+            float* skip_layer_data_ptr = is_skiplayer_step ? (float*)out_skip->data : nullptr; // Get pointer if needed
             int ne_elements      = (int)ggml_nelements(denoised);
-            for (int i = 0; i < ne_elements; i++) {
-                float latent_result = positive_data[i];
-                if (has_unconditioned) {
-                    // out_uncond + cfg_scale * (out_cond - out_uncond)
-                    int64_t ne3 = out_cond->ne[3];
-                    if (min_cfg != cfg_scale && ne3 != 1) {
-                        int64_t i3  = i / out_cond->ne[0] * out_cond->ne[1] * out_cond->ne[2];
-                        float scale = min_cfg + (cfg_scale - min_cfg) * (i3 * 1.0f / ne3);
-                    } else {
-                        latent_result = negative_data[i] + cfg_scale * (positive_data[i] - negative_data[i]);
+
+            // --- Select Calculation Path based on Timestep Shifting ---
+            if (shifted_timestep > 0 && sd_version_is_sdxl(version)) {
+                // --- Shifted Timestep Final Calculation ---
+
+                // Retrieve the integer shifted timestep calculated earlier
+                // Assuming shifted_t is the float representation of the index
+                int64_t shifted_t_idx = static_cast<int64_t>(roundf(timesteps_vec[0])); // Get the index back
+
+                float shifted_sigma = denoiser->t_to_sigma((float)shifted_t_idx);
+                std::vector<float> shifted_scaling = denoiser->get_scalings(shifted_sigma);
+                float shifted_c_skip = shifted_scaling[0];
+                float shifted_c_out  = shifted_scaling[1];
+                // shifted_c_in is scaling[2] if needed, but we adjust input instead
+
+                // Need sigma_data from the denoiser (assuming CompVis type for SDXL)
+                auto compvis_denoiser_ptr = std::dynamic_pointer_cast<CompVisDenoiser>(denoiser);
+                float sigma_data = compvis_denoiser_ptr ? compvis_denoiser_ptr->sigma_data : 1.0f; // Default needed? SDXL uses CompVis.
+
+                float sigma_sq = sigma * sigma; // Original sigma for this step
+                float shifted_sigma_sq = shifted_sigma * shifted_sigma;
+                float sigma_data_sq = sigma_data * sigma_data;
+
+                // Calculate the scaling factor needed to adjust the input `x` (vec_input)
+                // Equivalent to Python: sqrt(denoised_sigma^2 + sigma_data^2) / sqrt(sigma^2 + sigma_data^2)
+                float input_scale_factor = sqrtf((shifted_sigma_sq + sigma_data_sq) / (sigma_sq + sigma_data_sq));
+
+                LOG_DEBUG("Shifted calc [Step %d]: sigma=%.4f, shifted_t_idx=%ld, shifted_sigma=%.4f, input_scale=%.4f, shifted_c_skip=%.4f, shifted_c_out=%.4f",
+                          step, sigma, shifted_t_idx, shifted_sigma, input_scale_factor, shifted_c_skip, shifted_c_out);
+
+                for (int i = 0; i < ne_elements; i++) {
+                    // CFG and SLG apply to the raw model output *before* the final scaling
+                    float model_output_result = positive_data[i]; // Start with positive prediction
+                    if (has_unconditioned) {
+                        // Apply CFG scale: uncond + cfg_scale * (cond - uncond)
+                        model_output_result = negative_data_ptr[i] + cfg_scale * (positive_data[i] - negative_data_ptr[i]);
+                        // TODO: Add min_cfg logic if necessary
                     }
+                    if (is_skiplayer_step) {
+                        // Apply SLG: result + slg_scale * (cond - skip)
+                        model_output_result = model_output_result + slg_scale * (positive_data[i] - skip_layer_data_ptr[i]);
+                    }
+
+                    // Recalculate input term based on Python logic: x_recalc = x * input_scale_factor
+                    float adjusted_input = vec_input[i] * input_scale_factor;
+
+                    // Final calculation using shifted sigma scales and adjusted input
+                    // Equivalent to Python: calculate_denoised(shifted_sigma, model_output_result, adjusted_input)
+                    // denoised = adjusted_input * shifted_c_skip + model_output_result * shifted_c_out;
+                    vec_denoised[i] = adjusted_input * shifted_c_skip + model_output_result * shifted_c_out;
                 }
-                if (is_skiplayer_step) {
-                    latent_result = latent_result + (positive_data[i] - skip_layer_data[i]) * slg_scale;
-                }
-                // v = latent_result, eps = latent_result
-                // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
-                vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+
+            } else {
+                 // --- Original Final Calculation ---
+                 LOG_DEBUG("Original calc [Step %d]: sigma=%.4f, c_skip=%.4f, c_out=%.4f", step, sigma, c_skip, c_out);
+                 for (int i = 0; i < ne_elements; i++) {
+                    // CFG and SLG apply to the raw model output *before* the final scaling
+                    float model_output_result = positive_data[i]; // Start with positive prediction
+                     if (has_unconditioned) {
+                         // Apply CFG scale: uncond + cfg_scale * (cond - uncond)
+                         model_output_result = negative_data_ptr[i] + cfg_scale * (positive_data[i] - negative_data_ptr[i]);
+                         // TODO: Add min_cfg logic if necessary
+                     }
+                     if (is_skiplayer_step) {
+                         // Apply SLG: result + slg_scale * (cond - skip)
+                         model_output_result = model_output_result + slg_scale * (positive_data[i] - skip_layer_data_ptr[i]);
+                     }
+
+                     // Original calculation: denoised = input * c_skip + model_output * c_out;
+                     vec_denoised[i] = vec_input[i] * c_skip + model_output_result * c_out;
+                 }
             }
+            // --- End Calculation Path Selection ---
+
             int64_t t1 = ggml_time_us();
             if (step > 0) {
                 pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);
@@ -1002,7 +1093,7 @@ public:
         };
 
         sample_k_diffusion(method, denoise, work_ctx, x, sigmas, rng, eta);
-
+        // No changes needed for inverse_noise_scaling as it depends on the final sigma, not the intermediate timesteps used.
         x = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x);
 
         if (control_net) {
@@ -1223,8 +1314,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                            float slg_scale              = 0,
                            float skip_layer_start       = 0.01,
                            float skip_layer_end         = 0.2,
-                           ggml_tensor* masked_image    = NULL,
-                           int shifted_timestep         = -1) {
+                           int shifted_timestep         = -1, // Added parameter
+                           ggml_tensor* masked_image    = NULL) {
     if (seed < 0) {
         // Generally, when using the provided command line, the seed is always >0.
         // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
@@ -1481,8 +1572,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                                                      slg_scale,
                                                      skip_layer_start,
                                                      skip_layer_end,
-                                                     noise_mask,
-                                                     shifted_timestep);
+                                                     shifted_timestep, // Passed parameter
+                                                     noise_mask);
 
         // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
         // print_ggml_tensor(x_0);
@@ -1556,7 +1647,7 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
                     float skip_layer_end     = 0.2,
-                    int shifted_timestep     = -1) {
+                    int shifted_timestep     = -1) { // Added parameter to definition
     std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
     LOG_DEBUG("txt2img %dx%d", width, height);
     if (sd_ctx == NULL) {
@@ -1635,8 +1726,7 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                slg_scale,
                                                skip_layer_start,
                                                skip_layer_end,
-                                               NULL, // masked_image is NULL for txt2img
-                                               shifted_timestep);
+                                               shifted_timestep); // Passed parameter
 
     size_t t1 = ggml_time_ms();
 
@@ -1671,9 +1761,9 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                     float slg_scale          = 0,
                     float skip_layer_start   = 0.01,
                     float skip_layer_end     = 0.2,
-                    int shifted_timestep     = -1) {
-    std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
-    LOG_DEBUG("img2img %dx%d", width, height);
+                    int shifted_timestep     = -1) { // Added parameter
+std::vector<int> skip_layers_vec(skip_layers, skip_layers + skip_layers_count);
+LOG_DEBUG("img2img %dx%d", width, height);
     if (sd_ctx == NULL) {
         return NULL;
     }
@@ -1818,8 +1908,8 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                                                slg_scale,
                                                skip_layer_start,
                                                skip_layer_end,
-                                               masked_image, // Pass the actual masked_image for img2img
-                                               shifted_timestep);
+                                               shifted_timestep, // Passed parameter
+                                               masked_image);
 
     size_t t2 = ggml_time_ms();
 

@@ -971,8 +971,7 @@ static void sample_k_diffusion(sample_method_t method,
                 d_cur = ggml_dup_tensor(work_ctx, x_next);
             }
         } break;
-        case LCM:             // Latent Consistency Models
-        case TIMESTEP_SHIFT_LCM: // Timestep Shift LCM (uses same core logic as LCM here)
+        case LCM:  // Latent Consistency Models
         {
             struct ggml_tensor* noise = ggml_dup_tensor(work_ctx, x);
             struct ggml_tensor* d     = ggml_dup_tensor(work_ctx, x);

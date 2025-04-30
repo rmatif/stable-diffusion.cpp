@@ -175,12 +175,6 @@ std::unordered_map<std::string, std::string> pmid_v2_name_map = {
 };
 
 std::string convert_open_clip_to_hf_clip(const std::string& name) {
-    // Specific fix for ComfyUI-style SDXL CLIP-G text projection name
-    // Check this *before* any other modifications
-    if (name == "conditioner.embedders.1.model.text_projection.weight") {
-        return "cond_stage_model.1.transformer.text_model.text_projection";
-    }
-
     std::string new_name = name;
     std::string prefix;
     if (starts_with(new_name, "conditioner.embedders.0.open_clip.")) {
@@ -191,7 +185,8 @@ std::string convert_open_clip_to_hf_clip(const std::string& name) {
         new_name = new_name.substr(strlen("conditioner.embedders.0."));
     } else if (starts_with(new_name, "conditioner.embedders.1.")) {
         prefix   = "cond_stage_model.1.";
-        new_name = new_name.substr(strlen("conditioner.embedders.1.")); // Fix bug: use correct length for prefix 1
+        // Corrected the substring length to match the prefix being checked
+        new_name = new_name.substr(strlen("conditioner.embedders.1."));
     } else if (starts_with(new_name, "cond_stage_model.")) {
         prefix   = "cond_stage_model.";
         new_name = new_name.substr(strlen("cond_stage_model."));
@@ -199,6 +194,8 @@ std::string convert_open_clip_to_hf_clip(const std::string& name) {
         prefix   = new_name.substr(0, new_name.size() - strlen("vision_model.visual_projection.weight"));
         new_name = prefix + "visual_projection.weight";
         return new_name;
+    // This specific case seems less common or might be handled implicitly later,
+    // but we keep the original logic for now. If issues arise, review if this mapping is needed.
     } else if (ends_with(new_name, "transformer.text_projection.weight")) {
         prefix   = new_name.substr(0, new_name.size() - strlen("transformer.text_projection.weight"));
         new_name = prefix + "transformer.text_model.text_projection";
@@ -207,9 +204,13 @@ std::string convert_open_clip_to_hf_clip(const std::string& name) {
         return new_name;
     }
 
-    if (open_clip_to_hf_clip_model.find(new_name) != open_clip_to_hf_clip_model.end()) {
+    // Specific handling for text_projection variants before generic map lookup
+    if (new_name == "model.text_projection.weight" || new_name == "model.text_projection") {
+        new_name = "transformer.text_model.text_projection";
+    } else if (open_clip_to_hf_clip_model.count(new_name)) { // Use .count() for safety
         new_name = open_clip_to_hf_clip_model[new_name];
     }
+    // Note: The specific handling above takes precedence over the map for this tensor.
 
     std::string open_clip_resblock_prefix = "model.transformer.resblocks.";
     std::string hf_clip_resblock_prefix   = "transformer.text_model.encoder.layers.";

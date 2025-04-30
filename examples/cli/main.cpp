@@ -41,7 +41,6 @@ const char* sample_method_str[] = {
     "lcm",
     "ddim_trailing",
     "tcd",
-    "timestep_shift_lcm",
 };
 
 // Names of the sigma schedule overrides, same order as sample_schedule in stable-diffusion.h
@@ -102,7 +101,6 @@ struct SDParams {
     int width         = 512;
     int height        = 512;
     int batch_count   = 1;
-    int shifted_timestep = -1; // for timestep_shift_lcm
 
     int video_frames         = 6;
     int motion_bucket_id     = 127;
@@ -128,9 +126,10 @@ struct SDParams {
     int upscale_repeats           = 1;
 
     std::vector<int> skip_layers = {7, 8, 9};
-    float slg_scale              = 0.f;
+    float slg_scale              = 0.f; // Removed duplicate line
     float skip_layer_start       = 0.01f;
     float skip_layer_end         = 0.2f;
+    int shifted_timestep         = -1; // Keep the added parameter from previous step
 };
 
 void print_params(SDParams params) {
@@ -180,9 +179,7 @@ void print_params(SDParams params) {
     printf("    batch_count:       %d\n", params.batch_count);
     printf("    vae_tiling:        %s\n", params.vae_tiling ? "true" : "false");
     printf("    upscale_repeats:   %d\n", params.upscale_repeats);
-    if (params.shifted_timestep > 0) {
-        printf("    shifted_timestep:  %d\n", params.shifted_timestep);
-    }
+    printf("    timestep_shift:    %d\n", params.shifted_timestep);
 }
 
 void print_usage(int argc, const char* argv[]) {
@@ -231,7 +228,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("                                     1.0 corresponds to full destruction of information in init image\n");
     printf("  -H, --height H                     image height, in pixel space (default: 512)\n");
     printf("  -W, --width W                      image width, in pixel space (default: 512)\n");
-    printf("  --sampling-method {euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, timestep_shift_lcm}\n");
+    printf("  --sampling-method {euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd}\n");
     printf("                                     sampling method (default: \"euler_a\")\n");
     printf("  --steps  STEPS                     number of sample steps (default: 20)\n");
     printf("  --rng {std_default, cuda}          RNG (default: cuda)\n");
@@ -249,7 +246,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --control-net-cpu                  keep controlnet in cpu (for low vram)\n");
     printf("  --canny                            apply canny preprocessor (edge detection)\n");
     printf("  --color                            Colors the logging tags according to level\n");
-    printf("  --shifted-timestep N               Timestep shift value for timestep_shift_lcm sampler (default: -1, disabled)\n");
+    printf("  --timestep-shift N                 shift timestep for SDXL models (NitroFusion paper, default: -1 off, N between 1 and 1000)\n");
     printf("  -v, --verbose                      print extra info\n");
 }
 
@@ -635,12 +632,16 @@ void parse_args(int argc, const char** argv, SDParams& params) {
                 break;
             }
             params.skip_layer_end = std::stof(argv[i]);
-        } else if (arg == "--shifted-timestep") {
-            if (++i >= argc) {
-                invalid_arg = true;
-                break;
-            }
-            params.shifted_timestep = std::stoi(argv[i]);
+        } else if (arg == "--timestep-shift") { // Added block
+             if (++i >= argc) {
+                 invalid_arg = true;
+                 break;
+             }
+             params.shifted_timestep = std::stoi(argv[i]);
+             if (params.shifted_timestep != -1 && (params.shifted_timestep < 1 || params.shifted_timestep > 1000)) {
+                  fprintf(stderr, "error: timestep-shift must be between 1 and 1000, or -1 to disable\n");
+                  exit(1);
+             }
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv);
@@ -980,10 +981,10 @@ int main(int argc, const char* argv[]) {
                           params.slg_scale,
                           params.skip_layer_start,
                           params.skip_layer_end,
-                          params.shifted_timestep);
-    } else {
-        sd_image_t input_image = {(uint32_t)params.width,
-                                  (uint32_t)params.height,
+                          params.shifted_timestep); // Passed parameter
+   } else {
+       sd_image_t input_image = {(uint32_t)params.width,
+                                 (uint32_t)params.height,
                                   3,
                                   input_image_buffer};
 
@@ -1050,9 +1051,9 @@ int main(int argc, const char* argv[]) {
                               params.slg_scale,
                               params.skip_layer_start,
                               params.skip_layer_end,
-                              params.shifted_timestep);
-        }
-    }
+                              params.shifted_timestep); // Passed parameter
+       }
+   }
 
     if (results == NULL) {
         printf("generate failed\n");
