@@ -585,6 +585,11 @@ public:
                     denoiser->schedule          = std::make_shared<SGMUniformSchedule>();
                     denoiser->schedule->version = version; // version might not be used by SGMUniform but good to keep pattern
                     break;
+                case SIMPLE:
+                    LOG_INFO("Running with Simple schedule");
+                    denoiser->schedule          = std::make_shared<SimpleSchedule>();
+                    denoiser->schedule->version = version; // version might not be used by Simple but good to keep pattern
+                    break;                    
                 case DEFAULT:
                     // Don't touch anything.
                     break;

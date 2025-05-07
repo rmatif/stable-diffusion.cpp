@@ -57,6 +57,7 @@ enum schedule_t {
     AYS,
     GITS,
     SGM_UNIFORM,
+    SIMPLE,
     N_SCHEDULES
 };
 
