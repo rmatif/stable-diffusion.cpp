@@ -580,6 +580,11 @@ public:
                     denoiser->schedule          = std::make_shared<GITSSchedule>();
                     denoiser->schedule->version = version;
                     break;
+                case SGM_UNIFORM:
+                    LOG_INFO("Running with SGM Uniform schedule");
+                    denoiser->schedule          = std::make_shared<SGMUniformSchedule>();
+                    denoiser->schedule->version = version; // version might not be used by SGMUniform but good to keep pattern
+                    break;
                 case DEFAULT:
                     // Don't touch anything.
                     break;

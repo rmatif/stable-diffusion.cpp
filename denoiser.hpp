@@ -235,6 +235,31 @@ struct GITSSchedule : SigmaSchedule {
     }
 };
 
+struct SGMUniformSchedule : SigmaSchedule {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min_in, float sigma_max_in, t_to_sigma_t t_to_sigma_func) override {
+        // This schedule's core logic is now handled directly in Denoiser::get_sigmas
+        // to ensure correct access to both sigma_to_t and t_to_sigma.
+        // This method is overridden to fulfill the virtual contract but ideally should not be
+        // the primary execution path for SGMUniform when called from Denoiser::get_sigmas.
+        // If it IS called, it means the Denoiser::get_sigmas logic wasn't triggered, which is unexpected.
+        LOG_WARN("SGMUniformSchedule::get_sigmas was called directly. This might indicate an issue with Denoiser dispatch.");
+        // Provide a default (potentially incorrect for SGMUniform's intent) or empty schedule to avoid crashes.
+        // For safety, returning a simple discrete-like schedule in t-space if this is ever hit.
+        std::vector<float> result;
+        if (n == 0) {
+            result.push_back(0.0f);
+            return result;
+        }
+        result.reserve(n + 1);
+        int t_max = TIMESTEPS -1; // A common max t value
+        float step = static_cast<float>(t_max) / static_cast<float>(n > 1 ? (n -1) : 1) ;
+        for(uint32_t i=0; i<n; ++i) {
+            result.push_back(t_to_sigma_func(t_max - step * i));
+        }
+        result.push_back(0.0f);
+        return result;
+    }
+};
 struct KarrasSchedule : SigmaSchedule {
     std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
         // These *COULD* be function arguments here,
@@ -265,8 +290,44 @@ struct Denoiser {
     virtual ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent)             = 0;
 
     virtual std::vector<float> get_sigmas(uint32_t n) {
-        auto bound_t_to_sigma = std::bind(&Denoiser::t_to_sigma, this, std::placeholders::_1);
-        return schedule->get_sigmas(n, sigma_min(), sigma_max(), bound_t_to_sigma);
+        // Check if the current schedule is SGMUniformSchedule
+        if (std::dynamic_pointer_cast<SGMUniformSchedule>(schedule)) {
+            LOG_DEBUG("Denoiser::get_sigmas - Using SGM_UNIFORM specific logic");
+            std::vector<float> sigs;
+            sigs.reserve(n + 1);
+
+            if (n == 0) {
+                sigs.push_back(0.0f);
+                return sigs;
+            }
+
+            // Use the Denoiser's own sigma_to_t and t_to_sigma methods
+            float start_t_val = this->sigma_to_t(this->sigma_max());
+            float end_t_val   = this->sigma_to_t(this->sigma_min());
+
+            // Python: torch.linspace(start, end, n + 1)[:-1]
+            // This creates n points. The k-th point (0-indexed) is start_t_val + k * (end_t_val - start_t_val) / n.
+            float dt_per_step;
+            if (n > 0) { // Avoid division by zero if n=0, though covered by earlier check
+                 dt_per_step = (end_t_val - start_t_val) / static_cast<float>(n);
+            } else {
+                 dt_per_step = 0.0f;
+            }
+
+
+            for (uint32_t i = 0; i < n; ++i) {
+                float current_t = start_t_val + static_cast<float>(i) * dt_per_step;
+                sigs.push_back(this->t_to_sigma(current_t));
+            }
+
+            sigs.push_back(0.0f); // Append the final zero sigma
+            return sigs;
+
+        } else { // For all other schedules, use the existing virtual dispatch
+            LOG_DEBUG("Denoiser::get_sigmas - Using general schedule dispatch for %s", typeid(*schedule.get()).name());
+            auto bound_t_to_sigma = std::bind(&Denoiser::t_to_sigma, this, std::placeholders::_1);
+            return schedule->get_sigmas(n, sigma_min(), sigma_max(), bound_t_to_sigma);
+        }
     }
 };
 

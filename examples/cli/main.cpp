@@ -51,6 +51,7 @@ const char* schedule_str[] = {
     "exponential",
     "ays",
     "gits",
+    "sgm_uniform",
 };
 
 const char* modes_str[] = {
@@ -234,7 +235,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --rng {std_default, cuda}          RNG (default: cuda)\n");
     printf("  -s SEED, --seed SEED               RNG seed (default: 42, use random seed for < 0)\n");
     printf("  -b, --batch-count COUNT            number of images to generate\n");
-    printf("  --schedule {discrete, karras, exponential, ays, gits} Denoiser sigma schedule (default: discrete)\n");
+    printf("  --schedule {discrete, karras, exponential, ays, gits, sgm_uniform} Denoiser sigma schedule (default: discrete)\n");
     printf("  --clip-skip N                      ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)\n");
     printf("                                     <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x\n");
     printf("  --vae-tiling                       process vae in tiles to reduce memory usage\n");
@@ -537,14 +538,15 @@ void parse_args(int argc, const char** argv, SDParams& params) {
             }
             const char* schedule_selected = argv[i];
             int schedule_found            = -1;
-            for (int d = 0; d < N_SCHEDULES; d++) {
+            // N_SCHEDULES will be updated by the .h change, so this loop limit is fine
+            for (int d = 0; d < N_SCHEDULES; d++) { 
                 if (!strcmp(schedule_selected, schedule_str[d])) {
                     schedule_found = d;
                 }
             }
             if (schedule_found == -1) {
-                invalid_arg = true;
-                break;
+                fprintf(stderr, "error: invalid schedule %s, must be one of [discrete, karras, exponential, ays, gits, sgm_uniform]\n", schedule_selected);
+                exit(1); // Exit directly as invalid_arg only triggers at the end
             }
             params.schedule = (schedule_t)schedule_found;
         } else if (arg == "-s" || arg == "--seed") {

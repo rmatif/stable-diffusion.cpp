@@ -56,6 +56,7 @@ enum schedule_t {
     EXPONENTIAL,
     AYS,
     GITS,
+    SGM_UNIFORM,
     N_SCHEDULES
 };
 
