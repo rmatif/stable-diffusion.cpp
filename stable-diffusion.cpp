@@ -591,6 +591,7 @@ public:
                     denoiser->schedule->version = version; 
                     break;                    
                 case DEFAULT:
+                    // Don't touch anything.
                     break;
                 default:
                     LOG_ERROR("Unknown schedule %i", schedule);
@@ -910,6 +911,7 @@ public:
             auto guidance_tensor = vector_to_ggml_tensor(work_ctx, guidance_vec);
 
             copy_ggml_tensor(noised_input, input);
+            // noised_input = noised_input * c_in
             ggml_tensor_scale(noised_input, c_in);
 
             std::vector<struct ggml_tensor*> controls;
@@ -917,6 +919,8 @@ public:
             if (control_hint != NULL) {
                 control_net->compute(n_threads, noised_input, control_hint, timesteps, cond.c_crossattn, cond.c_vector);
                 controls = control_net->controls;
+                // print_ggml_tensor(controls[12]);
+                // GGML_ASSERT(0);
             }
 
             if (start_merge_step == -1 || step <= start_merge_step) {
@@ -1553,7 +1557,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                                                      slg_scale,
                                                      skip_layer_start,
                                                      skip_layer_end,
-                                                     shifted_timestep, // Passed parameter
+                                                     shifted_timestep,
                                                      noise_mask);
 
         // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
