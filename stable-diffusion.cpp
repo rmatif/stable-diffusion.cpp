@@ -1039,7 +1039,7 @@ public:
                 }
 
             } else {
-                 LOG_DEBUG("Original calc [Step %d]: sigma=%.4f, c_skip=%.4f, c_out=%.4f", step, sigma, c_skip, c_out);
+                
                  for (int i = 0; i < ne_elements; i++) {
                     // CFG and SLG apply to the raw model output *before* the final scaling
                     float model_output_result = positive_data[i]; // Start with positive prediction
