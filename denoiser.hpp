@@ -237,21 +237,14 @@ struct GITSSchedule : SigmaSchedule {
 
 struct SGMUniformSchedule : SigmaSchedule {
     std::vector<float> get_sigmas(uint32_t n, float sigma_min_in, float sigma_max_in, t_to_sigma_t t_to_sigma_func) override {
-        // This schedule's core logic is now handled directly in Denoiser::get_sigmas
-        // to ensure correct access to both sigma_to_t and t_to_sigma.
-        // This method is overridden to fulfill the virtual contract but ideally should not be
-        // the primary execution path for SGMUniform when called from Denoiser::get_sigmas.
-        // If it IS called, it means the Denoiser::get_sigmas logic wasn't triggered, which is unexpected.
-        LOG_WARN("SGMUniformSchedule::get_sigmas was called directly. This might indicate an issue with Denoiser dispatch.");
-        // Provide a default (potentially incorrect for SGMUniform's intent) or empty schedule to avoid crashes.
-        // For safety, returning a simple discrete-like schedule in t-space if this is ever hit.
+
         std::vector<float> result;
         if (n == 0) {
             result.push_back(0.0f);
             return result;
         }
         result.reserve(n + 1);
-        int t_max = TIMESTEPS -1; // A common max t value
+        int t_max = TIMESTEPS -1; 
         float step = static_cast<float>(t_max) / static_cast<float>(n > 1 ? (n -1) : 1) ;
         for(uint32_t i=0; i<n; ++i) {
             result.push_back(t_to_sigma_func(t_max - step * i));
@@ -284,39 +277,27 @@ struct SimpleSchedule : SigmaSchedule {
         std::vector<float> result_sigmas;
 
         if (n == 0) {
-            return result_sigmas; // Return empty for n=0, consistent with DiscreteSchedule
+            return result_sigmas;
         }
 
         result_sigmas.reserve(n + 1);
 
-        // TIMESTEPS is the length of the model's internal sigmas array, typically 1000.
-        // t_to_sigma(t) maps a timestep t (0 to TIMESTEPS-1) to its sigma value.
         int model_sigmas_len = TIMESTEPS; 
 
-        // ss = len(s.sigmas) / steps in Python
         float step_factor = static_cast<float>(model_sigmas_len) / static_cast<float>(n);
 
         for (uint32_t i = 0; i < n; ++i) {
-            // Python: s.sigmas[-(1 + int(x * ss))]
-            // x corresponds to i (0 to n-1)
-            // int(x * ss) in Python is static_cast<int>(static_cast<float>(i) * step_factor)
-            // The index -(1 + offset) means (model_sigmas_len - 1 - offset) from the start of a 0-indexed array.
+
             int offset_from_start_of_py_array = static_cast<int>(static_cast<float>(i) * step_factor);
             int timestep_index = model_sigmas_len - 1 - offset_from_start_of_py_array;
 
-            // Ensure the index is within valid bounds [0, model_sigmas_len - 1]
             if (timestep_index < 0) {
                 timestep_index = 0;
             }
-            // No need for upper bound check like `timestep_index >= model_sigmas_len` because
-            // max offset is for i=n-1: int((n-1)/n * model_sigmas_len) which is < model_sigmas_len.
-            // So, model_sigmas_len - 1 - max_offset is >= 0 if model_sigmas_len/n >= 1.
-            // If n > model_sigmas_len, then model_sigmas_len/n < 1, resulting in timestep_index potentially being <0,
-            // which is handled by the clamp above.
 
             result_sigmas.push_back(t_to_sigma(static_cast<float>(timestep_index)));
         }
-        result_sigmas.push_back(0.0f); // Append the final zero sigma
+        result_sigmas.push_back(0.0f);
         return result_sigmas;
     }
 };
@@ -334,7 +315,6 @@ struct Denoiser {
     virtual std::vector<float> get_sigmas(uint32_t n) {
         // Check if the current schedule is SGMUniformSchedule
         if (std::dynamic_pointer_cast<SGMUniformSchedule>(schedule)) {
-            LOG_DEBUG("Denoiser::get_sigmas - Using SGM_UNIFORM specific logic");
             std::vector<float> sigs;
             sigs.reserve(n + 1);
 
@@ -347,26 +327,22 @@ struct Denoiser {
             float start_t_val = this->sigma_to_t(this->sigma_max());
             float end_t_val   = this->sigma_to_t(this->sigma_min());
 
-            // Python: torch.linspace(start, end, n + 1)[:-1]
-            // This creates n points. The k-th point (0-indexed) is start_t_val + k * (end_t_val - start_t_val) / n.
             float dt_per_step;
-            if (n > 0) { // Avoid division by zero if n=0, though covered by earlier check
+            if (n > 0) { 
                  dt_per_step = (end_t_val - start_t_val) / static_cast<float>(n);
             } else {
                  dt_per_step = 0.0f;
             }
-
 
             for (uint32_t i = 0; i < n; ++i) {
                 float current_t = start_t_val + static_cast<float>(i) * dt_per_step;
                 sigs.push_back(this->t_to_sigma(current_t));
             }
 
-            sigs.push_back(0.0f); // Append the final zero sigma
+            sigs.push_back(0.0f); 
             return sigs;
 
         } else { // For all other schedules, use the existing virtual dispatch
-            LOG_DEBUG("Denoiser::get_sigmas - Using general schedule dispatch for %s", typeid(*schedule.get()).name());
             auto bound_t_to_sigma = std::bind(&Denoiser::t_to_sigma, this, std::placeholders::_1);
             return schedule->get_sigmas(n, sigma_min(), sigma_max(), bound_t_to_sigma);
         }

@@ -128,10 +128,10 @@ struct SDParams {
     int upscale_repeats           = 1;
 
     std::vector<int> skip_layers = {7, 8, 9};
-    float slg_scale              = 0.f; // Removed duplicate line
+    float slg_scale              = 0.f;
     float skip_layer_start       = 0.01f;
     float skip_layer_end         = 0.2f;
-    int shifted_timestep         = -1; // Keep the added parameter from previous step
+    int shifted_timestep         = -1;
 };
 
 void print_params(SDParams params) {
@@ -248,7 +248,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --control-net-cpu                  keep controlnet in cpu (for low vram)\n");
     printf("  --canny                            apply canny preprocessor (edge detection)\n");
     printf("  --color                            Colors the logging tags according to level\n");
-    printf("  --timestep-shift N                 shift timestep for SDXL models (NitroFusion paper, default: -1 off, N between 1 and 1000)\n");
+    printf("  --timestep-shift N                 shift timestep for NitroFusion models, default: -1 off, recommended N for NitroSD-Realism around 250 and 500 for NitroSD-Vibrant\n");
     printf("  -v, --verbose                      print extra info\n");
 }
 
@@ -539,7 +539,6 @@ void parse_args(int argc, const char** argv, SDParams& params) {
             }
             const char* schedule_selected = argv[i];
             int schedule_found            = -1;
-            // N_SCHEDULES will be updated by the .h change, so this loop limit is fine
             for (int d = 0; d < N_SCHEDULES; d++) { 
                 if (!strcmp(schedule_selected, schedule_str[d])) {
                     schedule_found = d;
@@ -547,7 +546,7 @@ void parse_args(int argc, const char** argv, SDParams& params) {
             }
             if (schedule_found == -1) {
                 fprintf(stderr, "error: invalid schedule %s, must be one of [discrete, karras, exponential, ays, gits, sgm_uniform, simple]\n", schedule_selected);
-                exit(1); // Exit directly as invalid_arg only triggers at the end
+                exit(1); 
             }
             params.schedule = (schedule_t)schedule_found;
         } else if (arg == "-s" || arg == "--seed") {
@@ -635,7 +634,7 @@ void parse_args(int argc, const char** argv, SDParams& params) {
                 break;
             }
             params.skip_layer_end = std::stof(argv[i]);
-        } else if (arg == "--timestep-shift") { // Added block
+        } else if (arg == "--timestep-shift") { 
              if (++i >= argc) {
                  invalid_arg = true;
                  break;
@@ -984,7 +983,7 @@ int main(int argc, const char* argv[]) {
                           params.slg_scale,
                           params.skip_layer_start,
                           params.skip_layer_end,
-                          params.shifted_timestep); // Passed parameter
+                          params.shifted_timestep); 
    } else {
        sd_image_t input_image = {(uint32_t)params.width,
                                  (uint32_t)params.height,
@@ -1054,7 +1053,7 @@ int main(int argc, const char* argv[]) {
                               params.slg_scale,
                               params.skip_layer_start,
                               params.skip_layer_end,
-                              params.shifted_timestep); // Passed parameter
+                              params.shifted_timestep);
        }
    }
 
