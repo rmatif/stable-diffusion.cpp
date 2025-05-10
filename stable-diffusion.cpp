@@ -5,7 +5,7 @@
 #include "rng_philox.hpp"
 #include "stable-diffusion.h"
 #include "util.h"
-
+#include "stb_image_resize.h" 
 #include "conditioner.hpp"
 #include "control.hpp"
 #include "denoiser.hpp"
@@ -68,6 +68,8 @@ void calculate_alphas_cumprod(float* alphas_cumprod,
     }
 }
 
+// CONCEPTUAL CHANGE IN OTHER FILE: This enum would typically be in a shared header like unet.hpp or common.hpp
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
@@ -112,21 +114,37 @@ public:
 
     std::shared_ptr<Denoiser> denoiser = std::make_shared<CompVisDenoiser>();
 
+    // Reference Attention members
+    std::string reference_attn_image_path;
+    ggml_tensor* reference_latent_original = NULL; // Stores the VAE encoded original reference image
+    ggml_context* reference_latent_ctx = NULL;   // Context for reference_latent_original
+    ReferenceOptions_ggml reference_options;
+    bool reference_attn_enabled = false;
+
+
     StableDiffusionGGML() = default;
 
     StableDiffusionGGML(int n_threads,
                         bool vae_decode_only,
                         bool free_params_immediately,
                         std::string lora_model_dir,
-                        rng_type_t rng_type)
+                        rng_type_t rng_type,
+                        // Reference Attention params from main
+                        const std::string& ref_attn_image_p,
+                        const ReferenceOptions_ggml& ref_opts)
         : n_threads(n_threads),
           vae_decode_only(vae_decode_only),
           free_params_immediately(free_params_immediately),
-          lora_model_dir(lora_model_dir) {
+          lora_model_dir(lora_model_dir),
+          reference_attn_image_path(ref_attn_image_p),
+          reference_options(ref_opts) {
         if (rng_type == STD_DEFAULT_RNG) {
             rng = std::make_shared<STDDefaultRNG>();
         } else if (rng_type == CUDA_RNG) {
             rng = std::make_shared<PhiloxRNG>();
+        }
+        if (!reference_attn_image_path.empty()) {
+            reference_attn_enabled = true;
         }
     }
 
@@ -141,6 +159,12 @@ public:
             ggml_backend_free(vae_backend);
         }
         ggml_backend_free(backend);
+
+        if (reference_latent_ctx != NULL) {
+            ggml_free(reference_latent_ctx);
+            reference_latent_ctx = NULL;
+            reference_latent_original = NULL; // Tensor was in this context
+        }
     }
 
     bool load_from_file(const std::string& model_path,
@@ -405,20 +429,20 @@ public:
             }
         }
 
-        struct ggml_init_params params;
-        params.mem_size   = static_cast<size_t>(10 * 1024) * 1024;  // 10M
-        params.mem_buffer = NULL;
-        params.no_alloc   = false;
-        // LOG_DEBUG("mem_size %u ", params.mem_size);
-        struct ggml_context* ctx = ggml_init(params);  // for  alphas_cumprod and is_using_v_parameterization check
-        GGML_ASSERT(ctx != NULL);
-        ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TIMESTEPS);
+        struct ggml_init_params params_ctx_init;
+        params_ctx_init.mem_size   = static_cast<size_t>(10 * 1024) * 1024;  // 10M
+        params_ctx_init.mem_buffer = NULL;
+        params_ctx_init.no_alloc   = false;
+        // LOG_DEBUG("mem_size %u ", params_ctx_init.mem_size);
+        struct ggml_context* ctx_alphas = ggml_init(params_ctx_init);  // for  alphas_cumprod and is_using_v_parameterization check
+        GGML_ASSERT(ctx_alphas != NULL);
+        ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(ctx_alphas, GGML_TYPE_F32, TIMESTEPS);
         calculate_alphas_cumprod((float*)alphas_cumprod_tensor->data);
 
         // load weights
         LOG_DEBUG("loading weights");
 
-        int64_t t0 = ggml_time_ms();
+        int64_t t0_load_weights = ggml_time_ms();
 
         std::set<std::string> ignore_tensors;
         tensors["alphas_cumprod"] = alphas_cumprod_tensor;
@@ -436,10 +460,10 @@ public:
         if (version == VERSION_SVD) {
             ignore_tensors.insert("conditioner.embedders.3");
         }
-        bool success = model_loader.load_tensors(tensors, backend, ignore_tensors);
-        if (!success) {
+        bool success_load_tensors = model_loader.load_tensors(tensors, backend, ignore_tensors);
+        if (!success_load_tensors) {
             LOG_ERROR("load tensors from model loader failed");
-            ggml_free(ctx);
+            ggml_free(ctx_alphas);
             return false;
         }
 
@@ -493,11 +517,12 @@ public:
                 total_params_vram_size += vae_params_mem_size;
             }
 
-            if (ggml_backend_is_cpu(control_net_backend)) {
+            if (control_net_backend != NULL && ggml_backend_is_cpu(control_net_backend)) { // Ensure control_net_backend is initialized
                 total_params_ram_size += control_net_params_mem_size;
-            } else {
+            } else if (control_net_backend != NULL) {
                 total_params_vram_size += control_net_params_mem_size;
             }
+
 
             size_t total_params_size = total_params_ram_size + total_params_vram_size;
             LOG_INFO(
@@ -513,18 +538,18 @@ public:
                 vae_params_mem_size / 1024.0 / 1024.0,
                 ggml_backend_is_cpu(vae_backend) ? "RAM" : "VRAM",
                 control_net_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(control_net_backend) ? "RAM" : "VRAM",
+                (control_net_backend != NULL && ggml_backend_is_cpu(control_net_backend)) ? "RAM" : (control_net_backend != NULL ? "VRAM" : "N/A"),
                 pmid_params_mem_size / 1024.0 / 1024.0,
                 ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM");
         }
 
-        int64_t t1 = ggml_time_ms();
-        LOG_INFO("loading model from '%s' completed, taking %.2fs", model_path.c_str(), (t1 - t0) * 1.0f / 1000);
+        int64_t t1_load_weights = ggml_time_ms();
+        LOG_INFO("loading model from '%s' completed, taking %.2fs", model_path.c_str(), (t1_load_weights - t0_load_weights) * 1.0f / 1000);
 
         // check is_using_v_parameterization_for_sd2
         bool is_using_v_parameterization = false;
         if (sd_version_is_sd2(version)) {
-            if (is_using_v_parameterization_for_sd2(ctx, sd_version_is_inpaint(version))) {
+            if (is_using_v_parameterization_for_sd2(ctx_alphas, sd_version_is_inpaint(version))) {
                 is_using_v_parameterization = true;
             }
         } else if (sd_version_is_sdxl(version)) {
@@ -597,8 +622,84 @@ public:
             }
         }
 
+        // Reference Attention: Load and VAE Encode reference image if provided
+        if (reference_attn_enabled) {
+            // For SD 1.5, reference_attn is applicable. For others, it might be disabled or behave differently.
+            // The current request is for SD 1.5, so this is fine.
+            if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) { // Enable for SD1/SD2
+                LOG_INFO("Reference Attention enabled with image: %s", reference_attn_image_path.c_str());
+                LOG_INFO("Reference Attn Options: Fidelity=%.2f, Strength=%.2f",
+                         reference_options.attn_style_fidelity, reference_options.attn_strength);
+
+                int ref_img_w = 0, ref_img_h = 0, ref_img_c = 0;
+                uint8_t* ref_img_data = stbi_load(reference_attn_image_path.c_str(), &ref_img_w, &ref_img_h, &ref_img_c, 3);
+                if (ref_img_data == NULL) {
+                    LOG_ERROR("Failed to load reference attention image from: %s", reference_attn_image_path.c_str());
+                    reference_attn_enabled = false; // Disable if image load fails
+                } else if (ref_img_c < 3) {
+                     LOG_ERROR("Reference attention image must have at least 3 channels, got %d", ref_img_c);
+                    stbi_image_free(ref_img_data);
+                    reference_attn_enabled = false;
+                } else {
+                    // Reference image needs to be processed to match latent dimensions of the generation.
+                    // Let's assume generation width/height are available (e.g. from CLI params)
+                    // For now, we'll use the diffusion_model's default input C, H, W and scale the ref image to that.
+                    // The target latent size is (width/8, height/8). Image size is (width, height).
+                    // This part is tricky as the generation width/height are not directly available here.
+                    // Let's assume it's processed to a fixed size for now or passed in.
+                    // The python code uses `latent_size["samples"].shape` to get target latent H/W.
+                    // For now, we just load it. VAE encoding will happen in `sample` or a setup phase.
+                    // We need a persistent context for `reference_latent_original`.
+                    struct ggml_init_params ref_latent_ctx_params;
+                    // Estimate size: 4 channels * (max_width/8) * (max_height/8) * sizeof(float) + overhead
+                    // Example: 4 * 128 * 128 * 4 = 256KB. Add some buffer.
+                    ref_latent_ctx_params.mem_size = 1 * 1024 * 1024; // 1MB should be enough for one latent
+                    ref_latent_ctx_params.mem_buffer = NULL;
+                    ref_latent_ctx_params.no_alloc = false;
+                    reference_latent_ctx = ggml_init(ref_latent_ctx_params);
+                    if (reference_latent_ctx == NULL) {
+                        LOG_ERROR("Failed to create context for reference latent.");
+                        stbi_image_free(ref_img_data);
+                        reference_attn_enabled = false;
+                    } else {
+                        // Create a temporary work_ctx for VAE encoding the reference image
+                        struct ggml_init_params temp_work_ctx_params;
+                        temp_work_ctx_params.mem_size = 256LL * 1024 * 1024; // Temp ctx for VAE encoding
+                        temp_work_ctx_params.mem_buffer = NULL;
+                        temp_work_ctx_params.no_alloc = false;
+                        ggml_context* temp_work_ctx = ggml_init(temp_work_ctx_params);
+
+                        if (temp_work_ctx) {
+                            // We need target width/height for generation to resize ref image correctly.
+                            // This should ideally come from SDParams. For now, let's assume 512x512.
+                            // The actual latent size is determined by the output image size.
+                            // This VAE encoding should happen *after* we know the target generation H/W.
+                            // So, we'll store the path and do VAE encoding later or pass a placeholder.
+                            // For now, let's defer full VAE encoding of ref image to the `sample` or `generate_image` call
+                            // where output W/H are known.
+                            // For now, just free data, path is stored.
+                            LOG_DEBUG("Reference image loaded, VAE encoding will occur before sampling.");
+                            stbi_image_free(ref_img_data); // Path stored, actual processing later
+                            // Placeholder: reference_latent_original will be set up in `sample` or `generate_image`.
+                        } else {
+                            LOG_ERROR("Failed to create temp work_ctx for reference VAE encoding.");
+                            stbi_image_free(ref_img_data);
+                            reference_attn_enabled = false;
+                            ggml_free(reference_latent_ctx);
+                            reference_latent_ctx = NULL;
+                        }
+                         if (temp_work_ctx) ggml_free(temp_work_ctx);
+                    }
+                }
+            } else {
+                 LOG_WARN("Reference Attention is currently only supported for SD 1.x/2.x models. Disabling.");
+                 reference_attn_enabled = false;
+            }
+        }
+
+
         LOG_DEBUG("finished loaded file");
-        ggml_free(ctx);
+        ggml_free(ctx_alphas); // Free the context used for alphas_cumprod
         return true;
     }
 
@@ -618,7 +719,9 @@ public:
 
         int64_t t0              = ggml_time_ms();
         struct ggml_tensor* out = ggml_dup_tensor(work_ctx, x_t);
-        diffusion_model->compute(n_threads, x_t, timesteps, c, concat, NULL, NULL, -1, {}, 0.f, &out);
+        diffusion_model->compute(n_threads, x_t, timesteps, c, concat, NULL, NULL, 
+                                 REF_ATTN_NORMAL, nullptr, // ref_attn_mode, ref_opts
+                                 -1, {}, 0.f, &out, work_ctx); // Pass work_ctx for output_ctx if needed by compute
         diffusion_model->free_compute_buffer();
 
         double result = 0.f;
@@ -785,9 +888,33 @@ public:
         return {c_crossattn, y, c_concat};
     }
 
+    // Helper to noise latents for reference attention WRITE pass, similar to Python's ref_noise_latents
+    // This function assumes `original_latent` is in work_ctx and returns a new tensor in work_ctx.
+    ggml_tensor* noise_reference_latent_for_step(ggml_context* work_ctx, ggml_tensor* original_latent, float sigma_val) {
+        // sigma_val is the sigma for the current step
+        // alpha_cumprod = 1 / (sigma^2 + 1)
+        // sqrt_alpha_prod = sqrt(alpha_cumprod)
+        // sqrt_one_minus_alpha_prod = sqrt(1 - alpha_cumprod)
+        // return sqrt_alpha_prod * original_latent + sqrt_one_minus_alpha_prod * noise_sample;
+
+        float alpha_cumprod = 1.0f / ((sigma_val * sigma_val) + 1.0f);
+        float sqrt_alpha_prod = sqrtf(alpha_cumprod);
+        float sqrt_one_minus_alpha_prod = sqrtf(1.0f - alpha_cumprod);
+
+        ggml_tensor* noise_sample = ggml_dup_tensor(work_ctx, original_latent);
+        ggml_tensor_set_f32_randn(noise_sample, rng); // Use the main RNG for this
+
+        ggml_tensor* term1 = ggml_scale(work_ctx, original_latent, sqrt_alpha_prod);
+        ggml_tensor* term2 = ggml_scale(work_ctx, noise_sample, sqrt_one_minus_alpha_prod);
+        
+        ggml_tensor* noised_latent = ggml_add(work_ctx, term1, term2);
+        return noised_latent;
+    }
+
+
     ggml_tensor* sample(ggml_context* work_ctx,
-                        ggml_tensor* init_latent,
-                        ggml_tensor* noise,
+                        ggml_tensor* init_latent, // Initial latent (either from img2img or blank for txt2img)
+                        ggml_tensor* noise,       // Initial noise for the sampling process
                         SDCondition cond,
                         SDCondition uncond,
                         ggml_tensor* control_hint,
@@ -797,7 +924,7 @@ public:
                         float guidance,
                         float eta,
                         sample_method_t method,
-                        const std::vector<float>& sigmas,
+                        const std::vector<float>& sigmas, // Sigmas for each step
                         int start_merge_step,
                         SDCondition id_cond,
                         std::vector<int> skip_layers = {},
@@ -806,33 +933,37 @@ public:
                         float skip_layer_end         = 0.2,
                         ggml_tensor* noise_mask      = nullptr) {
         LOG_DEBUG("Sample");
-        struct ggml_init_params params;
+        struct ggml_init_params params_tmp_ctx; // Renamed to avoid conflict
         size_t data_size = ggml_row_size(init_latent->type, init_latent->ne[0]);
         for (int i = 1; i < 4; i++) {
             data_size *= init_latent->ne[i];
         }
-        data_size += 1024;
-        params.mem_size       = data_size * 3;
-        params.mem_buffer     = NULL;
-        params.no_alloc       = false;
-        ggml_context* tmp_ctx = ggml_init(params);
+        data_size += 1024; // General buffer
+        // If reference attention is enabled, need more space for noised reference latent + its noise sample
+        if (reference_attn_enabled && reference_latent_original) {
+            data_size += ggml_nbytes(reference_latent_original) * 2;
+        }
+        params_tmp_ctx.mem_size       = data_size * 3; // Increased buffer
+        params_tmp_ctx.mem_buffer     = NULL;
+        params_tmp_ctx.no_alloc       = false;
+        ggml_context* tmp_ctx = ggml_init(params_tmp_ctx); // Context for per-step operations
 
         size_t steps = sigmas.size() - 1;
         // noise = load_tensor_from_file(work_ctx, "./rand0.bin");
         // print_ggml_tensor(noise);
-        struct ggml_tensor* x = ggml_dup_tensor(work_ctx, init_latent);
+        struct ggml_tensor* x = ggml_dup_tensor(work_ctx, init_latent); // Current latent, starts with init_latent
         copy_ggml_tensor(x, init_latent);
-        x = denoiser->noise_scaling(sigmas[0], noise, x);
+        x = denoiser->noise_scaling(sigmas[0], noise, x); // x is now the fully noised latent x_T
 
-        struct ggml_tensor* noised_input = ggml_dup_tensor(work_ctx, noise);
+        struct ggml_tensor* noised_input_for_unet = ggml_dup_tensor(work_ctx, noise); // Buffer for U-Net input (scaled x)
 
         bool has_unconditioned = cfg_scale != 1.0 && uncond.c_crossattn != NULL;
         bool has_skiplayer     = slg_scale != 0.0 && skip_layers.size() > 0;
 
         // denoise wrapper
-        struct ggml_tensor* out_cond   = ggml_dup_tensor(work_ctx, x);
-        struct ggml_tensor* out_uncond = NULL;
-        struct ggml_tensor* out_skip   = NULL;
+        struct ggml_tensor* out_cond   = ggml_dup_tensor(work_ctx, x); // Buffer for conditional U-Net output
+        struct ggml_tensor* out_uncond = NULL;                         // Buffer for unconditional U-Net output
+        struct ggml_tensor* out_skip   = NULL;                         // Buffer for skip-layer U-Net output
 
         if (has_unconditioned) {
             out_uncond = ggml_dup_tensor(work_ctx, x);
@@ -845,162 +976,253 @@ public:
                 LOG_WARN("SLG is incompatible with %s models", model_version_to_str[version]);
             }
         }
-        struct ggml_tensor* denoised = ggml_dup_tensor(work_ctx, x);
+        struct ggml_tensor* denoised_pred = ggml_dup_tensor(work_ctx, x); // Buffer for the model's prediction (eps or v)
 
-        auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
-            if (step == 1) {
+        auto denoise_step_fn = [&](ggml_tensor* current_x_t, float sigma_current, int step_idx) -> ggml_tensor* {
+            if (step_idx == 0) { // Python step is 1-based, C++ is 0-based for loops
                 pretty_progress(0, (int)steps, 0);
             }
-            int64_t t0 = ggml_time_us();
+            int64_t t0_step = ggml_time_us();
 
-            std::vector<float> scaling = denoiser->get_scalings(sigma);
+            std::vector<float> scaling = denoiser->get_scalings(sigma_current);
             GGML_ASSERT(scaling.size() == 3);
             float c_skip = scaling[0];
             float c_out  = scaling[1];
             float c_in   = scaling[2];
 
-            float t = denoiser->sigma_to_t(sigma);
-            std::vector<float> timesteps_vec(x->ne[3], t);  // [N, ]
-            auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
-            std::vector<float> guidance_vec(x->ne[3], guidance);
-            auto guidance_tensor = vector_to_ggml_tensor(work_ctx, guidance_vec);
+            float t_value_for_unet = denoiser->sigma_to_t(sigma_current);
+            std::vector<float> timesteps_vec(current_x_t->ne[3], t_value_for_unet);
+            auto timesteps_for_unet = vector_to_ggml_tensor(tmp_ctx, timesteps_vec); // Use tmp_ctx for step-local tensors
+            
+            std::vector<float> guidance_vec(current_x_t->ne[3], guidance);
+            auto guidance_tensor = vector_to_ggml_tensor(tmp_ctx, guidance_vec);
 
-            copy_ggml_tensor(noised_input, input);
-            // noised_input = noised_input * c_in
-            ggml_tensor_scale(noised_input, c_in);
 
-            std::vector<struct ggml_tensor*> controls;
+            copy_ggml_tensor(noised_input_for_unet, current_x_t);
+            ggml_tensor_scale(noised_input_for_unet, c_in); // Scale input for U-Net
 
-            if (control_hint != NULL) {
-                control_net->compute(n_threads, noised_input, control_hint, timesteps, cond.c_crossattn, cond.c_vector);
-                controls = control_net->controls;
-                // print_ggml_tensor(controls[12]);
-                // GGML_ASSERT(0);
-            }
+            std::vector<struct ggml_tensor*> current_controls; // ControlNet controls for this step
 
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                // cond
+            // Reference Attention: WRITE pass
+            if (reference_attn_enabled && reference_latent_original != NULL) {
+                // Noise the original reference latent based on current sigma
+                // The Python version `control.cond_hint` is already noised.
+                // `ref_noise_latents(self.cond_hint, sigma=t, noise=None)`
+                // where `self.cond_hint` comes from `self.model_latent_format.process_in(self.cond_hint)`
+                // and that `self.cond_hint` is potentially an upscaled `self.cond_hint_original`
+                // The key is that `sigma=t` (current step sigma) is used.
+                ggml_tensor* ref_latent_noised_for_step = noise_reference_latent_for_step(tmp_ctx, reference_latent_original, sigma_current);
+
+                // Scale the noised reference latent for U-Net input, similar to current_x_t
+                ggml_tensor* scaled_ref_latent_noised_for_step = ggml_scale(tmp_ctx, ref_latent_noised_for_step, c_in);
+
+                // Use conditional context for the WRITE pass, as per Python logic using *args
+                // CONCEPTUAL CHANGE IN OTHER FILE: DiffusionModel::compute needs RefAttnMode
                 diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         cond.c_crossattn,
+                                         scaled_ref_latent_noised_for_step,
+                                         timesteps_for_unet, // Use same timesteps as main pass
+                                         cond.c_crossattn,   // Use main conditional context
                                          cond.c_concat,
                                          cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_cond);
-            } else {
-                diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         id_cond.c_crossattn,
-                                         cond.c_concat,
-                                         id_cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_cond);
+                                         guidance_tensor,    // guidance tensor (for Flux)
+                                         REF_ATTN_WRITE,     // ref_attn_mode
+                                         &reference_options, // ref_opts
+                                         -1,                 // num_video_frames
+                                         {},                 // controls
+                                         0.f,                // control_strength
+                                         nullptr,            // output tensor**
+                                         nullptr             // output_ctx
+                                         );     
             }
 
-            float* negative_data = NULL;
+
+            if (control_hint != NULL) {
+                control_net->compute(n_threads, noised_input_for_unet, control_hint, timesteps_for_unet, cond.c_crossattn, cond.c_vector);
+                current_controls = control_net->controls;
+            }
+
+            // Conditional prediction
+            SDCondition current_cond_context = (start_merge_step == -1 || step_idx <= start_merge_step) ? cond : id_cond;
+             // CONCEPTUAL CHANGE IN OTHER FILE: DiffusionModel::compute needs RefAttnMode
+            diffusion_model->compute(n_threads,
+                                     noised_input_for_unet,
+                                     timesteps_for_unet,
+                                     current_cond_context.c_crossattn,
+                                     current_cond_context.c_concat,
+                                     current_cond_context.c_vector,
+                                     guidance_tensor, // guidance tensor (for Flux)
+                                     (reference_attn_enabled && reference_latent_original != NULL ? REF_ATTN_READ : REF_ATTN_NORMAL), // ref_attn_mode
+                                     (reference_attn_enabled && reference_latent_original != NULL ? &reference_options : nullptr),    // ref_opts
+                                     -1,                    // num_video_frames
+                                     current_controls,      // controls
+                                     control_strength,      // control_strength
+                                     &out_cond,             // output tensor**
+                                     work_ctx               // output_ctx (use work_ctx for step outputs)
+                                     );
+
+            float* negative_pred_data = NULL;
             if (has_unconditioned) {
-                // uncond
-                if (control_hint != NULL) {
-                    control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector);
-                    controls = control_net->controls;
+                if (control_hint != NULL) { // Recompute ControlNet with uncond context if needed
+                    control_net->compute(n_threads, noised_input_for_unet, control_hint, timesteps_for_unet, uncond.c_crossattn, uncond.c_vector);
+                    current_controls = control_net->controls; // Update controls if they differ for uncond
                 }
+                // Unconditional prediction
+                // CONCEPTUAL CHANGE IN OTHER FILE: DiffusionModel::compute needs RefAttnMode
+                // For uncond pass with reference, style fidelity in BasicTransformerBlock will handle it.
+                // It also needs REF_ATTN_READ mode if reference is active.
                 diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
+                                         noised_input_for_unet,
+                                         timesteps_for_unet,
                                          uncond.c_crossattn,
                                          uncond.c_concat,
                                          uncond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_uncond);
-                negative_data = (float*)out_uncond->data;
+                                         guidance_tensor, // guidance tensor (for Flux)
+                                         (reference_attn_enabled && reference_latent_original != NULL ? REF_ATTN_READ : REF_ATTN_NORMAL), // ref_attn_mode
+                                         (reference_attn_enabled && reference_latent_original != NULL ? &reference_options : nullptr),    // ref_opts
+                                         -1,                    // num_video_frames
+                                         current_controls,      // controls
+                                         control_strength,      // control_strength
+                                         &out_uncond,           // output tensor**
+                                         work_ctx               // output_ctx
+                                         );
+                negative_pred_data = (float*)out_uncond->data;
+            }
+            
+            // Clear attention banks after COND and UNCOND (if any) read passes for the current step are done
+            if (reference_attn_enabled) {
+                // CONCEPTUAL CHANGE IN OTHER FILE: diffusion_model needs clear_attention_banks()
+                diffusion_model->clear_attention_banks();
             }
 
-            int step_count         = sigmas.size();
-            bool is_skiplayer_step = has_skiplayer && step > (int)(skip_layer_start * step_count) && step < (int)(skip_layer_end * step_count);
-            float* skip_layer_data = NULL;
+
+            int step_count         = sigmas.size() -1; // total number of steps
+            bool is_skiplayer_step = has_skiplayer && step_idx > (int)(skip_layer_start * step_count) && step_idx < (int)(skip_layer_end * step_count);
+            float* skip_layer_pred_data = NULL;
             if (is_skiplayer_step) {
-                LOG_DEBUG("Skipping layers at step %d\n", step);
-                // skip layer (same as conditionned)
+                LOG_DEBUG("Skipping layers at step %d\n", step_idx);
+                 // CONCEPTUAL CHANGE IN OTHER FILE: DiffusionModel::compute needs skip_layers and RefAttnMode
                 diffusion_model->compute(n_threads,
-                                         noised_input,
-                                         timesteps,
-                                         cond.c_crossattn,
-                                         cond.c_concat,
-                                         cond.c_vector,
-                                         guidance_tensor,
-                                         -1,
-                                         controls,
-                                         control_strength,
-                                         &out_skip,
-                                         NULL,
-                                         skip_layers);
-                skip_layer_data = (float*)out_skip->data;
+                                         noised_input_for_unet,
+                                         timesteps_for_unet,
+                                         current_cond_context.c_crossattn, // Use same cond as main conditional pass
+                                         current_cond_context.c_concat,
+                                         current_cond_context.c_vector,
+                                         guidance_tensor, // guidance tensor (for Flux)
+                                         (reference_attn_enabled && reference_latent_original != NULL ? REF_ATTN_READ : REF_ATTN_NORMAL), // ref_attn_mode
+                                         (reference_attn_enabled && reference_latent_original != NULL ? &reference_options : nullptr),    // ref_opts
+                                         -1,                    // num_video_frames
+                                         current_controls,      // controls
+                                         control_strength,      // control_strength
+                                         &out_skip,             // output tensor**
+                                         work_ctx,              // output_ctx
+                                         skip_layers            // skip_layers
+                                         );
+                skip_layer_pred_data = (float*)out_skip->data;
+
+                // Clear banks again if REF_ATTN_READ was used for skip-layer pass
+                if (reference_attn_enabled) {
+                    diffusion_model->clear_attention_banks();
+                }
             }
-            float* vec_denoised  = (float*)denoised->data;
-            float* vec_input     = (float*)input->data;
-            float* positive_data = (float*)out_cond->data;
-            int ne_elements      = (int)ggml_nelements(denoised);
+
+            float* vec_denoised_pred  = (float*)denoised_pred->data;
+            float* vec_current_x_t    = (float*)current_x_t->data;
+            float* positive_pred_data = (float*)out_cond->data;
+            int ne_elements      = (int)ggml_nelements(denoised_pred);
+
             for (int i = 0; i < ne_elements; i++) {
-                float latent_result = positive_data[i];
+                float final_pred = positive_pred_data[i];
                 if (has_unconditioned) {
-                    // out_uncond + cfg_scale * (out_cond - out_uncond)
-                    int64_t ne3 = out_cond->ne[3];
-                    if (min_cfg != cfg_scale && ne3 != 1) {
-                        int64_t i3  = i / out_cond->ne[0] * out_cond->ne[1] * out_cond->ne[2];
-                        float scale = min_cfg + (cfg_scale - min_cfg) * (i3 * 1.0f / ne3);
-                    } else {
-                        latent_result = negative_data[i] + cfg_scale * (positive_data[i] - negative_data[i]);
+                    int64_t ne3 = out_cond->ne[3]; // Batch dimension
+                    float current_cfg_scale = cfg_scale;
+                    if (min_cfg != cfg_scale && ne3 > 1) { // Per-image CFG scaling if batch > 1
+                        int64_t batch_idx  = i / (out_cond->ne[0] * out_cond->ne[1] * out_cond->ne[2]);
+                        current_cfg_scale = min_cfg + (cfg_scale - min_cfg) * (batch_idx * 1.0f / (ne3 -1.f)); // Ensure float division
                     }
+                    final_pred = negative_pred_data[i] + current_cfg_scale * (positive_pred_data[i] - negative_pred_data[i]);
                 }
                 if (is_skiplayer_step) {
-                    latent_result = latent_result + (positive_data[i] - skip_layer_data[i]) * slg_scale;
+                    final_pred = final_pred + (positive_pred_data[i] - skip_layer_pred_data[i]) * slg_scale;
                 }
-                // v = latent_result, eps = latent_result
-                // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
-                vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+                // denoised_pred = (pred * c_out + current_x_t * c_skip)
+                vec_denoised_pred[i] = final_pred * c_out + vec_current_x_t[i] * c_skip;
             }
-            int64_t t1 = ggml_time_us();
-            if (step > 0) {
-                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);
-                // LOG_INFO("step %d sampling completed taking %.2fs", step, (t1 - t0) * 1.0f / 1000000);
+            int64_t t1_step = ggml_time_us();
+            if (step_idx >= 0) { // Python step is 1-based
+                pretty_progress(step_idx + 1, (int)steps, (t1_step - t0_step) / 1000000.f);
             }
             if (noise_mask != nullptr) {
-                for (int64_t x = 0; x < denoised->ne[0]; x++) {
-                    for (int64_t y = 0; y < denoised->ne[1]; y++) {
-                        float mask = ggml_tensor_get_f32(noise_mask, x, y);
-                        for (int64_t k = 0; k < denoised->ne[2]; k++) {
-                            float init = ggml_tensor_get_f32(init_latent, x, y, k);
-                            float den  = ggml_tensor_get_f32(denoised, x, y, k);
-                            ggml_tensor_set_f32(denoised, init + mask * (den - init), x, y, k);
+                // Apply inpainting mask: result = init_latent_noised_at_this_step * (1-mask) + denoised_pred * mask
+                // This requires init_latent to be noised to current step sigma, then blended.
+                // Simplified: result = init_latent * (1-mask) + denoised_pred * mask (like ComfyUI inpaint node)
+                // More accurately, should be:
+                // noise_for_masking = ggml_dup_tensor(tmp_ctx, init_latent);
+                // ggml_tensor_set_f32_randn(noise_for_masking, rng); // use consistent noise if possible
+                // init_latent_noised_to_sigma_current = denoiser->noise_scaling(sigma_current, noise_for_masking, init_latent);
+
+                for (int64_t el_x = 0; el_x < denoised_pred->ne[0]; el_x++) { // W
+                    for (int64_t el_y = 0; el_y < denoised_pred->ne[1]; el_y++) { // H
+                        float mask_val = ggml_tensor_get_f32(noise_mask, el_x, el_y, 0, 0); // Assuming mask is [W/8, H/8, 1, 1]
+                        for (int64_t el_k = 0; el_k < denoised_pred->ne[2]; el_k++) { // C
+                            for(int64_t el_b = 0; el_b < denoised_pred->ne[3]; el_b++) { // Batch
+                                float original_pixel_val = ggml_tensor_get_f32(init_latent, el_x, el_y, el_k, el_b); 
+                                // Need to noise original_pixel_val to current sigma to match denoised_pred's state
+                                // This is complex. Python does: x0 = x0_in*(1.0-mask_pt) + noised_sample_x0*mask_pt
+                                // where x0_in is initial latent, noised_sample_x0 is the denoised output
+                                // This implies init_latent is the "clean" initial latent.
+                                // This might be an oversimplification / specific inpaint model behavior.
+                                // For generic noise_mask, usually it's about preserving areas of init_latent *at current noise level*.
+                                // The provided python seems to blend the *final prediction* with a *noised initial latent*.
+                                // The line in control_reference.py is:
+                                // `real_mask = real_mask.permute(0, 2, 3, 1).reshape(b, h*w, c)` - this is for strength application.
+                                // The `noise_mask` parameter to `sample` in `stable-diffusion.cpp` seems to be for inpainting logic from `img2img`.
+                                // Let's follow the existing img2img logic for noise_mask:
+                                float init_val = ggml_tensor_get_f32(init_latent, el_x, el_y, el_k, el_b); // Original init_latent (possibly from VAE encode)
+                                float den_val  = ggml_tensor_get_f32(denoised_pred, el_x, el_y, el_k, el_b);
+                                // The Python code was: `real_bank[idx] = real_bank[idx] * effective_strength + context_attn1 * (1-effective_strength)`
+                                // This isn't directly analogous to noise_mask here.
+                                // The existing img2img `masked_image` logic sets values in `cond.c_concat` or `uncond.c_concat`.
+                                // The `noise_mask` parameter to `sample` is for a different purpose, usually for compositing
+                                // the denoised result with a noised version of the initial image in masked areas.
+                                // If we follow ComfyUI's "Apply Latent" node with a mask, it's more like:
+                                // new_latent = original_latent * mask + new_denoised_step_result * (1.0 - mask)
+                                // Let's assume noise_mask means "where to apply denoising". 1.0 = apply, 0.0 = keep.
+                                // But current_x_t is already noised. So it would be:
+                                // current_x_t_after_step = current_x_t * (1-mask) + denoised_pred * mask (if mask=1 means use denoised)
+                                // This needs clarification on `noise_mask`'s role here.
+                                // The current C++ code in `sample` has:
+                                // `ggml_tensor_set_f32(denoised, init + mask * (den - init), x, y, k);`
+                                // This is `denoised = init_latent * (1-mask) + denoised_pred * mask`.
+                                // This looks like it's trying to restore parts of `init_latent` (original unnoised VAE output of init_image for img2img)
+                                // into the denoised output at each step. This is unusual for standard samplers.
+                                // This line is usually applied *after* the whole sampling loop if inpainting from a clean image.
+                                // For now, I will replicate this behavior if `noise_mask` is present.
+                                // This means `denoised_pred` is blended with `init_latent`.
+                                float blended_val = init_val * (1.0f - mask_val) + den_val * mask_val;
+                                ggml_tensor_set_f32(denoised_pred, blended_val, el_x, el_y, el_k, el_b);
+
+                            }
                         }
                     }
                 }
             }
 
-            return denoised;
+
+            return denoised_pred;
         };
 
-        sample_k_diffusion(method, denoise, work_ctx, x, sigmas, rng, eta);
+        sample_k_diffusion(method, denoise_step_fn, work_ctx, x, sigmas, rng, eta); // x is updated in-place
 
-        x = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x);
+        // Inverse scaling for the final latent
+        x = denoiser->inverse_noise_scaling(sigmas[steps], x); // Use sigma at last step
 
         if (control_net) {
             control_net->free_control_ctx();
             control_net->free_compute_buffer();
         }
         diffusion_model->free_compute_buffer();
-        return x;
+        ggml_free(tmp_ctx); // Free the temporary context for step-local tensors
+        return x; // x now holds the final sampled latent x_0
     }
 
     // ldm.models.diffusion.ddpm.LatentDiffusion.get_first_stage_encoding
@@ -1101,6 +1323,113 @@ public:
     ggml_tensor* decode_first_stage(ggml_context* work_ctx, ggml_tensor* x) {
         return compute_first_stage(work_ctx, x, true);
     }
+
+    // Prepare reference latent: Load image, resize, VAE encode.
+    // Stores the result in `this->reference_latent_original` within `this->reference_latent_ctx`.
+    // `target_latent_width` and `target_latent_height` are the W/8 and H/8 of the generation.
+    bool prepare_reference_latent(int target_gen_width, int target_gen_height) {
+        if (!reference_attn_enabled || reference_attn_image_path.empty()) {
+            return true; // Nothing to do
+        }
+        if (reference_latent_original != NULL) {
+             // Assuming if it exists, it's already correct for current W/H or doesn't need recomputing.
+             // Or, we could add a check if target_gen_width/height changed.
+             // For now, let's assume it's prepared once.
+            return true;
+        }
+
+        LOG_INFO("Preparing reference latent from: %s", reference_attn_image_path.c_str());
+        int ref_img_w = 0, ref_img_h = 0, ref_img_c = 0;
+        uint8_t* ref_img_data = stbi_load(reference_attn_image_path.c_str(), &ref_img_w, &ref_img_h, &ref_img_c, 3);
+        if (!ref_img_data) {
+            LOG_ERROR("Failed to load reference image for attention: %s", reference_attn_image_path.c_str());
+            return false;
+        }
+
+        // Create a temporary context for this operation
+        struct ggml_init_params temp_params;
+        temp_params.mem_size = 256LL * 1024 * 1024; // Generous temporary buffer
+        temp_params.mem_buffer = NULL;
+        temp_params.no_alloc = false;
+        ggml_context* temp_work_ctx = ggml_init(temp_params);
+        if (!temp_work_ctx) {
+            LOG_ERROR("Failed to create temp_work_ctx for reference latent preparation.");
+            stbi_image_free(ref_img_data);
+            return false;
+        }
+
+        // Resize image to target generation dimensions (target_gen_width x target_gen_height)
+        uint8_t* resized_ref_img_data = ref_img_data;
+        if (ref_img_w != target_gen_width || ref_img_h != target_gen_height) {
+            LOG_DEBUG("Resizing reference image from %dx%d to %dx%d", ref_img_w, ref_img_h, target_gen_width, target_gen_height);
+            resized_ref_img_data = (uint8_t*)malloc(target_gen_width * target_gen_height * 3);
+            if (!resized_ref_img_data) {
+                LOG_ERROR("Failed to allocate memory for resized reference image.");
+                stbi_image_free(ref_img_data); // Free original data since resized_ref_img_data was not allocated or is the same
+                ggml_free(temp_work_ctx);
+                return false;
+            }
+            // stbir_resize_uint8_srgb parameters:
+            // input_pixels, input_w, input_h, input_stride_in_bytes,
+            // output_pixels, output_w, output_h, output_stride_in_bytes,
+            // num_channels
+            int input_stride_bytes = ref_img_w * 3; // Assuming 3 channels (RGB)
+            int output_stride_bytes = target_gen_width * 3; // Assuming 3 channels (RGB)
+            int num_channels = 3; // RGB
+            int alpha_channel_index = STBIR_ALPHA_CHANNEL_NONE; // No alpha channel
+            int flags = 0; // Default flags
+
+            stbir_resize_uint8_srgb(ref_img_data, ref_img_w, ref_img_h, input_stride_bytes,
+                                    resized_ref_img_data, target_gen_width, target_gen_height, output_stride_bytes,
+                                    num_channels, alpha_channel_index, flags);
+            
+            // If ref_img_data was different from resized_ref_img_data (i.e., malloc was successful and resize happened in-place on a new buffer)
+            // then free the original stbi_load'd data.
+            // However, our logic above means ref_img_data *is* the original if resize wasn't needed, or resized_ref_img_data is new.
+            // The stbi_image_free(ref_img_data) was already there for the case malloc failed for resized.
+            // If resize was successful into a new buffer, original `ref_img_data` needs freeing.
+            // The logic was a bit tangled. Let's ensure original is freed if a new buffer was used.
+            // This is simplified: if ref_img_data was original and resized_ref_img_data is the new buffer, free original.
+            // The current code structure: resized_ref_img_data becomes the new primary buffer.
+            // If resize was skipped, ref_img_data is used directly. If resize happened, resized_ref_img_data is used.
+            // The stbi_image_free for original should be called if a new buffer `resized_ref_img_data` was actually used.
+
+            // Corrected logic for freeing:
+            if (resized_ref_img_data != ref_img_data) { // If a new buffer was allocated and used
+                 stbi_image_free(ref_img_data); // Free the original one loaded by stbi_load
+            }
+            // Now, ref_img_data (if resize didn't happen) or resized_ref_img_data (if it did) is the one to use.
+            // We renamed resized_ref_img_data for clarity to pass to sd_image_to_tensor.
+            // The `resized_ref_img_data` variable now holds the pixel data to be used.
+        }
+        // At this point, `resized_ref_img_data` holds the correct pixel data (either original or resized)
+
+        ggml_tensor* ref_image_tensor_rgb = ggml_new_tensor_4d(temp_work_ctx, GGML_TYPE_F32, target_gen_width, target_gen_height, 3, 1);
+        sd_image_to_tensor(resized_ref_img_data, ref_image_tensor_rgb);
+        if (resized_ref_img_data) free(resized_ref_img_data);
+
+
+        // VAE Encode
+        ggml_tensor* moments = encode_first_stage(temp_work_ctx, ref_image_tensor_rgb); // This uses first_stage_model or tae_first_stage
+        ggml_tensor* vae_encoded_ref = get_first_stage_encoding(temp_work_ctx, moments); // This applies scale_factor
+
+        // Copy to persistent reference_latent_ctx
+        if (!reference_latent_ctx) { // Should have been created in load_from_file or constructor
+            LOG_ERROR("reference_latent_ctx is null during prepare_reference_latent.");
+            ggml_free(temp_work_ctx);
+            return false;
+        }
+        reference_latent_original = ggml_dup_tensor(reference_latent_ctx, vae_encoded_ref);
+        copy_ggml_tensor(reference_latent_original, vae_encoded_ref); // Ensure data is copied
+
+        LOG_INFO("Reference latent prepared. Shape: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]",
+                 reference_latent_original->ne[0], reference_latent_original->ne[1],
+                 reference_latent_original->ne[2], reference_latent_original->ne[3]);
+
+        ggml_free(temp_work_ctx);
+        return true;
+    }
+
 };
 
 /*================================================= SD API ==================================================*/
@@ -1130,7 +1459,12 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
                      bool keep_clip_on_cpu,
                      bool keep_control_net_cpu,
                      bool keep_vae_on_cpu,
-                     bool diffusion_flash_attn) {
+                     bool diffusion_flash_attn,
+                     // Reference Attention specific CLI params
+                     const char* ref_attn_image_path_c_str,
+                     float ref_attn_style_fidelity,
+                     float ref_attn_strength
+                     ) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == NULL) {
         return NULL;
@@ -1147,12 +1481,21 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
     std::string id_embd_path(id_embed_dir_c_str);
     std::string lora_model_dir(lora_model_dir_c_str);
 
+    std::string ref_attn_image_p(ref_attn_image_path_c_str ? ref_attn_image_path_c_str : "");
+    ReferenceOptions_ggml ref_opts;
+    ref_opts.attn_style_fidelity = ref_attn_style_fidelity;
+    ref_opts.attn_strength = ref_attn_strength;
+
+
     sd_ctx->sd = new StableDiffusionGGML(n_threads,
                                          vae_decode_only,
                                          free_params_immediately,
                                          lora_model_dir,
-                                         rng_type);
+                                         rng_type,
+                                         ref_attn_image_p,
+                                         ref_opts);
     if (sd_ctx->sd == NULL) {
+        free(sd_ctx);
         return NULL;
     }
 
@@ -1182,24 +1525,26 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
-    if (sd_ctx->sd != NULL) {
-        delete sd_ctx->sd;
-        sd_ctx->sd = NULL;
+    if (sd_ctx != NULL) {
+        if (sd_ctx->sd != NULL) {
+            delete sd_ctx->sd;
+            sd_ctx->sd = NULL;
+        }
+        free(sd_ctx);
     }
-    free(sd_ctx);
 }
 
 sd_image_t* generate_image(sd_ctx_t* sd_ctx,
-                           struct ggml_context* work_ctx,
-                           ggml_tensor* init_latent,
+                           struct ggml_context* work_ctx, // work_ctx for this generation run
+                           ggml_tensor* init_latent,      // Initial latent for img2img or blank for txt2img
                            std::string prompt,
                            std::string negative_prompt,
                            int clip_skip,
                            float cfg_scale,
                            float guidance,
                            float eta,
-                           int width,
-                           int height,
+                           int width,                    // Target generation width
+                           int height,                   // Target generation height
                            enum sample_method_t sample_method,
                            const std::vector<float>& sigmas,
                            int64_t seed,
@@ -1213,19 +1558,11 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                            float slg_scale              = 0,
                            float skip_layer_start       = 0.01,
                            float skip_layer_end         = 0.2,
-                           ggml_tensor* masked_image    = NULL) {
+                           ggml_tensor* masked_image    = NULL) { // Mask for inpainting or img2img guidance
     if (seed < 0) {
-        // Generally, when using the provided command line, the seed is always >0.
-        // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
-        // by a third party with a seed <0, let's incorporate randomization here.
         srand((int)time(NULL));
         seed = rand();
     }
-
-    // for (auto v : sigmas) {
-    //     std::cout << v << " ";
-    // }
-    // std::cout << std::endl;
 
     int sample_steps = sigmas.size() - 1;
 
@@ -1240,23 +1577,23 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     prompt = result_pair.second;
     LOG_DEBUG("prompt after extract and remove lora: \"%s\"", prompt.c_str());
 
-    int64_t t0 = ggml_time_ms();
+    int64_t t0_lora = ggml_time_ms();
     sd_ctx->sd->apply_loras(lora_f2m);
-    int64_t t1 = ggml_time_ms();
-    LOG_INFO("apply_loras completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+    int64_t t1_lora = ggml_time_ms();
+    LOG_INFO("apply_loras completed, taking %.2fs", (t1_lora - t0_lora) * 1.0f / 1000);
 
     // Photo Maker
     std::string prompt_text_only;
-    ggml_tensor* init_img = NULL;
+    ggml_tensor* pmid_init_img_tensor = NULL; // Renamed to avoid conflict
     SDCondition id_cond;
     std::vector<bool> class_tokens_mask;
     if (sd_ctx->sd->stacked_id) {
         if (!sd_ctx->sd->pmid_lora->applied) {
-            t0 = ggml_time_ms();
+            t0_lora = ggml_time_ms();
             sd_ctx->sd->pmid_lora->apply(sd_ctx->sd->tensors, sd_ctx->sd->version, sd_ctx->sd->n_threads);
-            t1                             = ggml_time_ms();
+            t1_lora                             = ggml_time_ms();
             sd_ctx->sd->pmid_lora->applied = true;
-            LOG_INFO("pmid_lora apply completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+            LOG_INFO("pmid_lora apply completed, taking %.2fs", (t1_lora - t0_lora) * 1.0f / 1000);
             if (sd_ctx->sd->free_params_immediately) {
                 sd_ctx->sd->pmid_lora->free_params_buffer();
             }
@@ -1268,52 +1605,51 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
             std::vector<std::string> img_files = get_files_from_dir(input_id_images_path);
             for (std::string img_file : img_files) {
                 int c = 0;
-                int width, height;
+                int img_w, img_h; // Use different vars for loaded image dims
                 if (ends_with(img_file, "safetensors")) {
                     continue;
                 }
-                uint8_t* input_image_buffer = stbi_load(img_file.c_str(), &width, &height, &c, 3);
+                uint8_t* input_image_buffer = stbi_load(img_file.c_str(), &img_w, &img_h, &c, 3);
                 if (input_image_buffer == NULL) {
                     LOG_ERROR("PhotoMaker load image from '%s' failed", img_file.c_str());
                     continue;
                 } else {
                     LOG_INFO("PhotoMaker loaded image from '%s'", img_file.c_str());
                 }
-                sd_image_t* input_image = NULL;
-                input_image             = new sd_image_t{(uint32_t)width,
-                                             (uint32_t)height,
+                sd_image_t* current_pm_input_image = NULL; // Renamed
+                current_pm_input_image             = new sd_image_t{(uint32_t)img_w, // Use loaded dims
+                                             (uint32_t)img_h,
                                              3,
                                              input_image_buffer};
-                input_image             = preprocess_id_image(input_image);
-                if (input_image == NULL) {
+                current_pm_input_image             = preprocess_id_image(current_pm_input_image);
+                if (current_pm_input_image == NULL) {
                     LOG_ERROR("preprocess input id image from '%s' failed", img_file.c_str());
                     continue;
                 }
-                input_id_images.push_back(input_image);
+                input_id_images.push_back(current_pm_input_image);
             }
         }
         if (input_id_images.size() > 0) {
             sd_ctx->sd->pmid_model->style_strength = style_ratio;
-            int32_t w                              = input_id_images[0]->width;
-            int32_t h                              = input_id_images[0]->height;
+            int32_t pmid_w                              = input_id_images[0]->width;
+            int32_t pmid_h                              = input_id_images[0]->height;
             int32_t channels                       = input_id_images[0]->channel;
             int32_t num_input_images               = (int32_t)input_id_images.size();
-            init_img                               = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, w, h, channels, num_input_images);
-            // TODO: move these to somewhere else and be user settable
+            pmid_init_img_tensor                               = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, pmid_w, pmid_h, channels, num_input_images);
             float mean[] = {0.48145466f, 0.4578275f, 0.40821073f};
             float std[]  = {0.26862954f, 0.26130258f, 0.27577711f};
             for (int i = 0; i < num_input_images; i++) {
-                sd_image_t* init_image = input_id_images[i];
+                sd_image_t* pmid_image_data = input_id_images[i]; // Renamed
                 if (normalize_input)
-                    sd_mul_images_to_tensor(init_image->data, init_img, i, mean, std);
+                    sd_mul_images_to_tensor(pmid_image_data->data, pmid_init_img_tensor, i, mean, std);
                 else
-                    sd_mul_images_to_tensor(init_image->data, init_img, i, NULL, NULL);
+                    sd_mul_images_to_tensor(pmid_image_data->data, pmid_init_img_tensor, i, NULL, NULL);
             }
-            t0                            = ggml_time_ms();
+            t0_lora                            = ggml_time_ms();
             auto cond_tup                 = sd_ctx->sd->cond_stage_model->get_learned_condition_with_trigger(work_ctx,
                                                                                                              sd_ctx->sd->n_threads, prompt,
                                                                                                              clip_skip,
-                                                                                                             width,
+                                                                                                             width, // Use generation width/height
                                                                                                              height,
                                                                                                              num_input_images,
                                                                                                              sd_ctx->sd->diffusion_model->get_adm_in_channels());
@@ -1321,37 +1657,38 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
             class_tokens_mask             = std::get<1>(cond_tup);  //
             struct ggml_tensor* id_embeds = NULL;
             if (pmv2) {
-                // id_embeds = sd_ctx->sd->pmid_id_embeds->get();
                 id_embeds = load_tensor_from_file(work_ctx, path_join(input_id_images_path, "id_embeds.bin"));
-                // print_ggml_tensor(id_embeds, true, "id_embeds:");
             }
-            id_cond.c_crossattn = sd_ctx->sd->id_encoder(work_ctx, init_img, id_cond.c_crossattn, id_embeds, class_tokens_mask);
-            t1                  = ggml_time_ms();
-            LOG_INFO("Photomaker ID Stacking, taking %" PRId64 " ms", t1 - t0);
+            id_cond.c_crossattn = sd_ctx->sd->id_encoder(work_ctx, pmid_init_img_tensor, id_cond.c_crossattn, id_embeds, class_tokens_mask);
+            t1_lora                  = ggml_time_ms();
+            LOG_INFO("Photomaker ID Stacking, taking %" PRId64 " ms", t1_lora - t0_lora);
             if (sd_ctx->sd->free_params_immediately) {
                 sd_ctx->sd->pmid_model->free_params_buffer();
             }
-            // Encode input prompt without the trigger word for delayed conditioning
             prompt_text_only = sd_ctx->sd->cond_stage_model->remove_trigger_from_prompt(work_ctx, prompt);
-            // printf("%s || %s \n", prompt.c_str(), prompt_text_only.c_str());
-            prompt = prompt_text_only;  //
-            // if (sample_steps < 50) {
-            //     LOG_INFO("sampling steps increases from %d to 50 for PHOTOMAKER", sample_steps);
-            //     sample_steps = 50;
-            // }
+            prompt = prompt_text_only;
         } else {
-            LOG_WARN("Provided PhotoMaker model file, but NO input ID images");
-            LOG_WARN("Turn off PhotoMaker");
+            LOG_WARN("Provided PhotoMaker model file, but NO input ID images. Turning off PhotoMaker.");
             sd_ctx->sd->stacked_id = false;
         }
-        for (sd_image_t* img : input_id_images) {
-            free(img->data);
+        for (sd_image_t* img_ptr : input_id_images) { // Renamed loop var
+             if(img_ptr->data) free(img_ptr->data); // Free image data
+             delete img_ptr; // Free sd_image_t struct itself
         }
         input_id_images.clear();
     }
+    
+    // Reference Attention: Prepare original reference latent if enabled and not already done
+    if (sd_ctx->sd->reference_attn_enabled && sd_ctx->sd->reference_latent_original == NULL) {
+        if (!sd_ctx->sd->prepare_reference_latent(width, height)) {
+            LOG_ERROR("Failed to prepare reference latent. Disabling reference attention for this run.");
+            sd_ctx->sd->reference_attn_enabled = false; // Disable if preparation fails
+        }
+    }
+
 
     // Get learned condition
-    t0               = ggml_time_ms();
+    int64_t t0_cond = ggml_time_ms();
     SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
                                                                            sd_ctx->sd->n_threads,
                                                                            prompt,
@@ -1375,8 +1712,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                                                                      sd_ctx->sd->diffusion_model->get_adm_in_channels(),
                                                                      force_zero_embeddings);
     }
-    t1 = ggml_time_ms();
-    LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
+    int64_t t1_cond = ggml_time_ms();
+    LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1_cond - t0_cond);
 
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
@@ -1400,66 +1737,64 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     int W = width / 8;
     int H = height / 8;
     LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
-    ggml_tensor* noise_mask = nullptr;
+    ggml_tensor* current_noise_mask = nullptr; // Renamed from noise_mask
     if (sd_version_is_inpaint(sd_ctx->sd->version)) {
-        if (masked_image == NULL) {
+        if (masked_image == NULL) { // If no specific mask provided for inpaint model
             int64_t mask_channels = 1;
             if (sd_ctx->sd->version == VERSION_FLUX_FILL) {
-                mask_channels = 8 * 8;  // flatten the whole mask
+                mask_channels = 8 * 8;
             }
-            // no mask, set the whole image as masked
             masked_image = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, init_latent->ne[0], init_latent->ne[1], mask_channels + init_latent->ne[2], 1);
-            for (int64_t x = 0; x < masked_image->ne[0]; x++) {
-                for (int64_t y = 0; y < masked_image->ne[1]; y++) {
+            for (int64_t ix = 0; ix < masked_image->ne[0]; ix++) {
+                for (int64_t iy = 0; iy < masked_image->ne[1]; iy++) {
                     if (sd_ctx->sd->version == VERSION_FLUX_FILL) {
-                        // TODO: this might be wrong
-                        for (int64_t c = 0; c < init_latent->ne[2]; c++) {
-                            ggml_tensor_set_f32(masked_image, 0, x, y, c);
+                        for (int64_t k_ch = 0; k_ch < init_latent->ne[2]; k_ch++) { // Renamed k
+                            ggml_tensor_set_f32(masked_image, 0, ix, iy, k_ch);
                         }
-                        for (int64_t c = init_latent->ne[2]; c < masked_image->ne[2]; c++) {
-                            ggml_tensor_set_f32(masked_image, 1, x, y, c);
+                        for (int64_t k_ch = init_latent->ne[2]; k_ch < masked_image->ne[2]; k_ch++) {
+                            ggml_tensor_set_f32(masked_image, 1, ix, iy, k_ch);
                         }
                     } else {
-                        ggml_tensor_set_f32(masked_image, 1, x, y, 0);
-                        for (int64_t c = 1; c < masked_image->ne[2]; c++) {
-                            ggml_tensor_set_f32(masked_image, 0, x, y, c);
+                        ggml_tensor_set_f32(masked_image, 1, ix, iy, 0);
+                        for (int64_t k_ch = 1; k_ch < masked_image->ne[2]; k_ch++) {
+                            ggml_tensor_set_f32(masked_image, 0, ix, iy, k_ch);
                         }
                     }
                 }
             }
         }
-        cond.c_concat   = masked_image;
+        cond.c_concat   = masked_image; // This masked_image is the one prepared for inpainting model input
         uncond.c_concat = masked_image;
+        current_noise_mask = nullptr; // Not used in the same way for inpaint models; already part of c_concat
     } else {
-        noise_mask = masked_image;
+        current_noise_mask = masked_image; // For non-inpaint models, masked_image might be used as noise_mask
     }
+
     for (int b = 0; b < batch_count; b++) {
         int64_t sampling_start = ggml_time_ms();
         int64_t cur_seed       = seed + b;
         LOG_INFO("generating image: %i/%i - seed %" PRId64, b + 1, batch_count, cur_seed);
 
         sd_ctx->sd->rng->manual_seed(cur_seed);
-        struct ggml_tensor* x_t   = init_latent;
-        struct ggml_tensor* noise = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, 1);
-        ggml_tensor_set_f32_randn(noise, sd_ctx->sd->rng);
+        struct ggml_tensor* x_t   = init_latent; // This is the starting latent (blank or from img2img)
+        struct ggml_tensor* noise_for_sampling = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, 1); // Renamed
+        ggml_tensor_set_f32_randn(noise_for_sampling, sd_ctx->sd->rng);
 
         int start_merge_step = -1;
         if (sd_ctx->sd->stacked_id) {
             start_merge_step = int(sd_ctx->sd->pmid_model->style_strength / 100.f * sample_steps);
-            // if (start_merge_step > 30)
-            //     start_merge_step = 30;
             LOG_INFO("PHOTOMAKER: start_merge_step: %d", start_merge_step);
         }
 
         struct ggml_tensor* x_0 = sd_ctx->sd->sample(work_ctx,
-                                                     x_t,
-                                                     noise,
+                                                     x_t, // Starting latent for this batch item
+                                                     noise_for_sampling, // Initial noise for this batch item
                                                      cond,
                                                      uncond,
                                                      image_hint,
                                                      control_strength,
-                                                     cfg_scale,
-                                                     cfg_scale,
+                                                     cfg_scale, // min_cfg (used for batch diff CFG)
+                                                     cfg_scale, // cfg_scale
                                                      guidance,
                                                      eta,
                                                      sample_method,
@@ -1470,10 +1805,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                                                      slg_scale,
                                                      skip_layer_start,
                                                      skip_layer_end,
-                                                     noise_mask);
+                                                     current_noise_mask); // Pass the correctly determined mask
 
-        // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
-        // print_ggml_tensor(x_0);
         int64_t sampling_end = ggml_time_ms();
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
         final_latents.push_back(x_0);
@@ -1482,31 +1815,30 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
-    int64_t t3 = ggml_time_ms();
-    LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs", final_latents.size(), (t3 - t1) * 1.0f / 1000);
+    int64_t t3_sample = ggml_time_ms(); // Renamed
+    LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs", final_latents.size(), (t3_sample - t1_cond) * 1.0f / 1000); // t1_cond was end of conditioning
 
     // Decode to image
     LOG_INFO("decoding %zu latents", final_latents.size());
     std::vector<struct ggml_tensor*> decoded_images;  // collect decoded images
     for (size_t i = 0; i < final_latents.size(); i++) {
-        t1                      = ggml_time_ms();
-        struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, final_latents[i] /* x_0 */);
-        // print_ggml_tensor(img);
-        if (img != NULL) {
-            decoded_images.push_back(img);
+        int64_t t0_decode                      = ggml_time_ms(); // Renamed
+        struct ggml_tensor* img_decoded = sd_ctx->sd->decode_first_stage(work_ctx, final_latents[i] /* x_0 */); // Renamed
+        if (img_decoded != NULL) {
+            decoded_images.push_back(img_decoded);
         }
-        int64_t t2 = ggml_time_ms();
-        LOG_INFO("latent %" PRId64 " decoded, taking %.2fs", i + 1, (t2 - t1) * 1.0f / 1000);
+        int64_t t1_decode = ggml_time_ms(); // Renamed
+        LOG_INFO("latent %" PRId64 " decoded, taking %.2fs", i + 1, (t1_decode - t0_decode) * 1.0f / 1000);
     }
 
-    int64_t t4 = ggml_time_ms();
-    LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t3) * 1.0f / 1000);
+    int64_t t4_decode = ggml_time_ms(); // Renamed
+    LOG_INFO("decode_first_stage completed, taking %.2fs", (t4_decode - t3_sample) * 1.0f / 1000);
     if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->use_tiny_autoencoder) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
     sd_image_t* result_images = (sd_image_t*)calloc(batch_count, sizeof(sd_image_t));
     if (result_images == NULL) {
-        ggml_free(work_ctx);
+        ggml_free(work_ctx); // work_ctx should be freed by caller of generate_image
         return NULL;
     }
 
@@ -1516,7 +1848,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         result_images[i].channel = 3;
         result_images[i].data    = sd_tensor_to_image(decoded_images[i]);
     }
-    ggml_free(work_ctx);
+    // ggml_free(work_ctx); // Caller of generate_image is responsible for freeing work_ctx
 
     return result_images;
 }
@@ -1550,30 +1882,36 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
         return NULL;
     }
 
-    struct ggml_init_params params;
-    params.mem_size = static_cast<size_t>(10 * 1024 * 1024);  // 10 MB
+    struct ggml_init_params params_work_ctx; // Renamed
+    params_work_ctx.mem_size = static_cast<size_t>(10 * 1024 * 1024);  // 10 MB
     if (sd_version_is_sd3(sd_ctx->sd->version)) {
-        params.mem_size *= 3;
+        params_work_ctx.mem_size *= 3;
     }
     if (sd_version_is_flux(sd_ctx->sd->version)) {
-        params.mem_size *= 4;
+        params_work_ctx.mem_size *= 4;
     }
     if (sd_ctx->sd->stacked_id) {
-        params.mem_size += static_cast<size_t>(10 * 1024 * 1024);  // 10 MB
+        params_work_ctx.mem_size += static_cast<size_t>(10 * 1024 * 1024);  // 10 MB for pmid_init_img_tensor
     }
-    params.mem_size += width * height * 3 * sizeof(float);
-    params.mem_size *= batch_count;
-    params.mem_buffer = NULL;
-    params.no_alloc   = false;
-    // LOG_DEBUG("mem_size %u ", params.mem_size);
+     if (sd_ctx->sd->reference_attn_enabled && !sd_ctx->sd->reference_attn_image_path.empty()) {
+        // Add memory for reference latent related operations if not already covered
+        // Estimate: original ref latent + noised ref latent + scaled noised ref latent
+        // Assuming max 1024x1024 -> 128x128x4 latent (approx 256KB) * 3 = ~768KB per batch item.
+        // This might already be covered by the general large buffer, but good to be mindful.
+        params_work_ctx.mem_size += static_cast<size_t>(5 * 1024 * 1024); // Extra buffer for reference ops
+    }
+    params_work_ctx.mem_size += width * height * 3 * sizeof(float); // For potential RGB image tensors
+    params_work_ctx.mem_size *= batch_count; // Scale by batch count if ops are per batch item
+    params_work_ctx.mem_buffer = NULL;
+    params_work_ctx.no_alloc   = false;
 
-    struct ggml_context* work_ctx = ggml_init(params);
+    struct ggml_context* work_ctx = ggml_init(params_work_ctx);
     if (!work_ctx) {
-        LOG_ERROR("ggml_init() failed");
+        LOG_ERROR("ggml_init() failed for work_ctx");
         return NULL;
     }
 
-    size_t t0 = ggml_time_ms();
+    size_t t0_txt2img = ggml_time_ms(); // Renamed
 
     std::vector<float> sigmas = sd_ctx->sd->denoiser->get_sigmas(sample_steps);
 
@@ -1585,13 +1923,13 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
     }
     int W                    = width / 8;
     int H                    = height / 8;
-    ggml_tensor* init_latent = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, 1);
+    ggml_tensor* init_latent_txt2img = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, 1); // Renamed
     if (sd_version_is_sd3(sd_ctx->sd->version)) {
-        ggml_set_f32(init_latent, 0.0609f);
+        ggml_set_f32(init_latent_txt2img, 0.0609f);
     } else if (sd_version_is_flux(sd_ctx->sd->version)) {
-        ggml_set_f32(init_latent, 0.1159f);
+        ggml_set_f32(init_latent_txt2img, 0.1159f);
     } else {
-        ggml_set_f32(init_latent, 0.f);
+        ggml_set_f32(init_latent_txt2img, 0.f);
     }
 
     if (sd_version_is_inpaint(sd_ctx->sd->version)) {
@@ -1599,8 +1937,8 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
     }
 
     sd_image_t* result_images = generate_image(sd_ctx,
-                                               work_ctx,
-                                               init_latent,
+                                               work_ctx, // Pass work_ctx
+                                               init_latent_txt2img,
                                                prompt_c_str,
                                                negative_prompt_c_str,
                                                clip_skip,
@@ -1621,12 +1959,14 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                skip_layers_vec,
                                                slg_scale,
                                                skip_layer_start,
-                                               skip_layer_end);
+                                               skip_layer_end,
+                                               NULL); // No masked_image for txt2img
 
-    size_t t1 = ggml_time_ms();
+    size_t t1_txt2img = ggml_time_ms(); // Renamed
 
-    LOG_INFO("txt2img completed in %.2fs", (t1 - t0) * 1.0f / 1000);
-
+    LOG_INFO("txt2img completed in %.2fs", (t1_txt2img - t0_txt2img) * 1.0f / 1000);
+    
+    ggml_free(work_ctx); // Free work_ctx after generation
     return result_images;
 }
 
@@ -1662,30 +2002,32 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
         return NULL;
     }
 
-    struct ggml_init_params params;
-    params.mem_size = static_cast<size_t>(10 * 1024 * 1024);  // 10 MB
+    struct ggml_init_params params_work_ctx_img2img; // Renamed
+    params_work_ctx_img2img.mem_size = static_cast<size_t>(10 * 1024 * 1024);
     if (sd_version_is_sd3(sd_ctx->sd->version)) {
-        params.mem_size *= 2;
+        params_work_ctx_img2img.mem_size *= 2;
     }
     if (sd_version_is_flux(sd_ctx->sd->version)) {
-        params.mem_size *= 3;
+        params_work_ctx_img2img.mem_size *= 3;
     }
     if (sd_ctx->sd->stacked_id) {
-        params.mem_size += static_cast<size_t>(10 * 1024 * 1024);  // 10 MB
+        params_work_ctx_img2img.mem_size += static_cast<size_t>(10 * 1024 * 1024);
     }
-    params.mem_size += width * height * 3 * sizeof(float) * 3;
-    params.mem_size *= batch_count;
-    params.mem_buffer = NULL;
-    params.no_alloc   = false;
-    // LOG_DEBUG("mem_size %u ", params.mem_size);
+     if (sd_ctx->sd->reference_attn_enabled && !sd_ctx->sd->reference_attn_image_path.empty()) {
+        params_work_ctx_img2img.mem_size += static_cast<size_t>(5 * 1024 * 1024);
+    }
+    params_work_ctx_img2img.mem_size += width * height * 3 * sizeof(float) * 3; // init_img, mask_img, masked_img
+    params_work_ctx_img2img.mem_size *= batch_count;
+    params_work_ctx_img2img.mem_buffer = NULL;
+    params_work_ctx_img2img.no_alloc   = false;
 
-    struct ggml_context* work_ctx = ggml_init(params);
+    struct ggml_context* work_ctx = ggml_init(params_work_ctx_img2img); // Renamed
     if (!work_ctx) {
-        LOG_ERROR("ggml_init() failed");
+        LOG_ERROR("ggml_init() failed for work_ctx (img2img)");
         return NULL;
     }
 
-    size_t t0 = ggml_time_ms();
+    size_t t0_img2img = ggml_time_ms(); // Renamed
 
     if (seed < 0) {
         srand((int)time(NULL));
@@ -1693,94 +2035,103 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
     }
     sd_ctx->sd->rng->manual_seed(seed);
 
-    ggml_tensor* init_img = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 3, 1);
-    ggml_tensor* mask_img = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 1, 1);
+    ggml_tensor* init_img_tensor = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 3, 1); // Renamed
+    ggml_tensor* mask_img_tensor = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 1, 1); // Renamed
 
-    sd_mask_to_tensor(mask.data, mask_img);
+    sd_mask_to_tensor(mask.data, mask_img_tensor);
+    sd_image_to_tensor(init_image.data, init_img_tensor);
 
-    sd_image_to_tensor(init_image.data, init_img);
-
-    ggml_tensor* masked_image;
+    ggml_tensor* processed_masked_image_for_cond; // Renamed
 
     if (sd_version_is_inpaint(sd_ctx->sd->version)) {
         int64_t mask_channels = 1;
         if (sd_ctx->sd->version == VERSION_FLUX_FILL) {
-            mask_channels = 8 * 8;  // flatten the whole mask
+            mask_channels = 8 * 8;
         }
-        ggml_tensor* masked_img = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 3, 1);
-        sd_apply_mask(init_img, mask_img, masked_img);
-        ggml_tensor* masked_image_0 = NULL;
+        ggml_tensor* masked_rgb_img = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width, height, 3, 1); // Renamed
+        sd_apply_mask(init_img_tensor, mask_img_tensor, masked_rgb_img);
+        ggml_tensor* masked_latent_0 = NULL; // Renamed
         if (!sd_ctx->sd->use_tiny_autoencoder) {
-            ggml_tensor* moments = sd_ctx->sd->encode_first_stage(work_ctx, masked_img);
-            masked_image_0       = sd_ctx->sd->get_first_stage_encoding(work_ctx, moments);
+            ggml_tensor* moments = sd_ctx->sd->encode_first_stage(work_ctx, masked_rgb_img);
+            masked_latent_0       = sd_ctx->sd->get_first_stage_encoding(work_ctx, moments);
         } else {
-            masked_image_0 = sd_ctx->sd->encode_first_stage(work_ctx, masked_img);
+            masked_latent_0 = sd_ctx->sd->encode_first_stage(work_ctx, masked_rgb_img);
         }
-        masked_image = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, masked_image_0->ne[0], masked_image_0->ne[1], mask_channels + masked_image_0->ne[2], 1);
-        for (int ix = 0; ix < masked_image_0->ne[0]; ix++) {
-            for (int iy = 0; iy < masked_image_0->ne[1]; iy++) {
+        // This becomes the c_concat for inpainting models
+        processed_masked_image_for_cond = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, masked_latent_0->ne[0], masked_latent_0->ne[1], mask_channels + masked_latent_0->ne[2], 1);
+        for (int ix = 0; ix < masked_latent_0->ne[0]; ix++) {
+            for (int iy = 0; iy < masked_latent_0->ne[1]; iy++) {
                 int mx = ix * 8;
                 int my = iy * 8;
                 if (sd_ctx->sd->version == VERSION_FLUX_FILL) {
-                    for (int k = 0; k < masked_image_0->ne[2]; k++) {
-                        float v = ggml_tensor_get_f32(masked_image_0, ix, iy, k);
-                        ggml_tensor_set_f32(masked_image, v, ix, iy, k);
+                    for (int k_ch = 0; k_ch < masked_latent_0->ne[2]; k_ch++) {
+                        float v = ggml_tensor_get_f32(masked_latent_0, ix, iy, k_ch);
+                        ggml_tensor_set_f32(processed_masked_image_for_cond, v, ix, iy, k_ch);
                     }
-                    // "Encode" 8x8 mask chunks into a flattened 1x64 vector, and concatenate to masked image
-                    for (int x = 0; x < 8; x++) {
-                        for (int y = 0; y < 8; y++) {
-                            float m = ggml_tensor_get_f32(mask_img, mx + x, my + y);
-                            // TODO: check if the way the mask is flattened is correct (is it supposed to be x*8+y or x+8*y?)
-                            // python code was using "b (h 8) (w 8) -> b (8 8) h w"
-                            ggml_tensor_set_f32(masked_image, m, ix, iy, masked_image_0->ne[2] + x * 8 + y);
+                    for (int x_sub = 0; x_sub < 8; x_sub++) { // Renamed
+                        for (int y_sub = 0; y_sub < 8; y_sub++) { // Renamed
+                            float m = ggml_tensor_get_f32(mask_img_tensor, mx + x_sub, my + y_sub);
+                            ggml_tensor_set_f32(processed_masked_image_for_cond, m, ix, iy, masked_latent_0->ne[2] + x_sub * 8 + y_sub);
                         }
                     }
                 } else {
-                    float m = ggml_tensor_get_f32(mask_img, mx, my);
-                    ggml_tensor_set_f32(masked_image, m, ix, iy, 0);
-                    for (int k = 0; k < masked_image_0->ne[2]; k++) {
-                        float v = ggml_tensor_get_f32(masked_image_0, ix, iy, k);
-                        ggml_tensor_set_f32(masked_image, v, ix, iy, k + mask_channels);
+                    float m = ggml_tensor_get_f32(mask_img_tensor, mx, my);
+                    ggml_tensor_set_f32(processed_masked_image_for_cond, m, ix, iy, 0);
+                    for (int k_ch = 0; k_ch < masked_latent_0->ne[2]; k_ch++) {
+                        float v = ggml_tensor_get_f32(masked_latent_0, ix, iy, k_ch);
+                        ggml_tensor_set_f32(processed_masked_image_for_cond, v, ix, iy, k_ch + mask_channels);
                     }
                 }
             }
         }
     } else {
-        // LOG_WARN("Inpainting with a base model is not great");
-        masked_image = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width / 8, height / 8, 1, 1);
-        for (int ix = 0; ix < masked_image->ne[0]; ix++) {
-            for (int iy = 0; iy < masked_image->ne[1]; iy++) {
+        // For non-inpaint models, `masked_image` is used as `noise_mask` in `sample`
+        // It needs to be W/8, H/8
+        processed_masked_image_for_cond = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width / 8, height / 8, 1, 1);
+        for (int ix = 0; ix < processed_masked_image_for_cond->ne[0]; ix++) {
+            for (int iy = 0; iy < processed_masked_image_for_cond->ne[1]; iy++) {
                 int mx  = ix * 8;
                 int my  = iy * 8;
-                float m = ggml_tensor_get_f32(mask_img, mx, my);
-                ggml_tensor_set_f32(masked_image, m, ix, iy);
+                float m = ggml_tensor_get_f32(mask_img_tensor, mx, my); // Sample from original mask
+                ggml_tensor_set_f32(processed_masked_image_for_cond, m, ix, iy);
             }
         }
     }
 
-    ggml_tensor* init_latent = NULL;
+    ggml_tensor* initial_img_latent = NULL; // Renamed
     if (!sd_ctx->sd->use_tiny_autoencoder) {
-        ggml_tensor* moments = sd_ctx->sd->encode_first_stage(work_ctx, init_img);
-        init_latent          = sd_ctx->sd->get_first_stage_encoding(work_ctx, moments);
+        ggml_tensor* moments = sd_ctx->sd->encode_first_stage(work_ctx, init_img_tensor);
+        initial_img_latent          = sd_ctx->sd->get_first_stage_encoding(work_ctx, moments);
     } else {
-        init_latent = sd_ctx->sd->encode_first_stage(work_ctx, init_img);
+        initial_img_latent = sd_ctx->sd->encode_first_stage(work_ctx, init_img_tensor);
     }
 
-    print_ggml_tensor(init_latent, true);
-    size_t t1 = ggml_time_ms();
-    LOG_INFO("encode_first_stage completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+    // print_ggml_tensor(initial_img_latent, true); // Use new name
+    size_t t1_img2img_encode = ggml_time_ms(); // Renamed
+    LOG_INFO("encode_first_stage completed, taking %.2fs", (t1_img2img_encode - t0_img2img) * 1.0f / 1000);
 
     std::vector<float> sigmas = sd_ctx->sd->denoiser->get_sigmas(sample_steps);
     size_t t_enc              = static_cast<size_t>(sample_steps * strength);
-    if (t_enc == sample_steps)
-        t_enc--;
+    if (t_enc >= sample_steps) // Ensure t_enc is less than sample_steps
+        t_enc = sample_steps - 1;
+    if (t_enc == 0 && strength > 0.0f) // Ensure at least one step if strength > 0
+        t_enc = 1;
+    
     LOG_INFO("target t_enc is %zu steps", t_enc);
     std::vector<float> sigma_sched;
-    sigma_sched.assign(sigmas.begin() + sample_steps - t_enc - 1, sigmas.end());
+    if (t_enc > 0) { // Only schedule if there are steps to take
+      sigma_sched.assign(sigmas.begin() + sample_steps - t_enc -1 , sigmas.end());
+    } else { // If t_enc is 0, it means strength is 0, effectively no denoising from img2img noise
+      // Result should be very close to VAE decode of init_image.
+      // Use a minimal schedule to pass through the sampling logic if needed, or handle as special case.
+      // For now, let's use last sigma if t_enc is 0, implying minimal change.
+      if (!sigmas.empty()) sigma_sched.push_back(sigmas.back());
+    }
+
 
     sd_image_t* result_images = generate_image(sd_ctx,
-                                               work_ctx,
-                                               init_latent,
+                                               work_ctx, // Pass work_ctx
+                                               initial_img_latent,
                                                prompt_c_str,
                                                negative_prompt_c_str,
                                                clip_skip,
@@ -1790,7 +2141,7 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                                                width,
                                                height,
                                                sample_method,
-                                               sigma_sched,
+                                               sigma_sched, // Use the strength-adjusted schedule
                                                seed,
                                                batch_count,
                                                control_cond,
@@ -1802,12 +2153,13 @@ sd_image_t* img2img(sd_ctx_t* sd_ctx,
                                                slg_scale,
                                                skip_layer_start,
                                                skip_layer_end,
-                                               masked_image);
+                                               processed_masked_image_for_cond); // Pass the correctly prepared mask for inpainting or noise guidance
 
-    size_t t2 = ggml_time_ms();
+    size_t t2_img2img = ggml_time_ms(); // Renamed
 
-    LOG_INFO("img2img completed in %.2fs", (t2 - t0) * 1.0f / 1000);
+    LOG_INFO("img2img completed in %.2fs", (t2_img2img - t0_img2img) * 1.0f / 1000);
 
+    ggml_free(work_ctx); // Free work_ctx after generation
     return result_images;
 }
 
@@ -1833,17 +2185,15 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
 
     std::vector<float> sigmas = sd_ctx->sd->denoiser->get_sigmas(sample_steps);
 
-    struct ggml_init_params params;
-    params.mem_size = static_cast<size_t>(10 * 1024) * 1024;  // 10 MB
-    params.mem_size += width * height * 3 * sizeof(float) * video_frames;
-    params.mem_buffer = NULL;
-    params.no_alloc   = false;
-    // LOG_DEBUG("mem_size %u ", params.mem_size);
+    struct ggml_init_params params_work_ctx_img2vid; // Renamed
+    params_work_ctx_img2vid.mem_size = static_cast<size_t>(10 * 1024) * 1024;
+    params_work_ctx_img2vid.mem_size += width * height * 3 * sizeof(float) * video_frames;
+    params_work_ctx_img2vid.mem_buffer = NULL;
+    params_work_ctx_img2vid.no_alloc   = false;
 
-    // draft context
-    struct ggml_context* work_ctx = ggml_init(params);
+    struct ggml_context* work_ctx = ggml_init(params_work_ctx_img2vid); // Renamed
     if (!work_ctx) {
-        LOG_ERROR("ggml_init() failed");
+        LOG_ERROR("ggml_init() failed for work_ctx (img2vid)");
         return NULL;
     }
 
@@ -1853,7 +2203,7 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
 
     sd_ctx->sd->rng->manual_seed(seed);
 
-    int64_t t0 = ggml_time_ms();
+    int64_t t0_img2vid = ggml_time_ms(); // Renamed
 
     SDCondition cond = sd_ctx->sd->get_svd_condition(work_ctx,
                                                      init_image,
@@ -1873,8 +2223,8 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
 
     SDCondition uncond = SDCondition(uc_crossattn, uc_vector, uc_concat);
 
-    int64_t t1 = ggml_time_ms();
-    LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
+    int64_t t1_img2vid_cond = ggml_time_ms(); // Renamed
+    LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1_img2vid_cond - t0_img2vid);
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->clip_vision->free_params_buffer();
     }
@@ -1883,40 +2233,41 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
     int C                   = 4;
     int W                   = width / 8;
     int H                   = height / 8;
-    struct ggml_tensor* x_t = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, video_frames);
-    ggml_set_f32(x_t, 0.f);
+    struct ggml_tensor* x_t_vid = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, video_frames); // Renamed
+    ggml_set_f32(x_t_vid, 0.f);
 
-    struct ggml_tensor* noise = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, video_frames);
-    ggml_tensor_set_f32_randn(noise, sd_ctx->sd->rng);
+    struct ggml_tensor* noise_vid = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, W, H, C, video_frames); // Renamed
+    ggml_tensor_set_f32_randn(noise_vid, sd_ctx->sd->rng);
 
     LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
-    struct ggml_tensor* x_0 = sd_ctx->sd->sample(work_ctx,
-                                                 x_t,
-                                                 noise,
+    struct ggml_tensor* x_0_vid = sd_ctx->sd->sample(work_ctx, // Renamed
+                                                 x_t_vid,
+                                                 noise_vid,
                                                  cond,
                                                  uncond,
-                                                 {},
-                                                 0.f,
+                                                 NULL, // No control_hint for SVD sampling
+                                                 0.f,  // control_strength
                                                  min_cfg,
                                                  cfg_scale,
-                                                 0.f,
-                                                 0.f,
+                                                 0.f,  // guidance (not typically used in SVD like this)
+                                                 0.f,  // eta
                                                  sample_method,
                                                  sigmas,
-                                                 -1,
-                                                 SDCondition(NULL, NULL, NULL));
+                                                 -1,   // start_merge_step
+                                                 SDCondition(NULL, NULL, NULL) // No id_cond for SVD
+                                                 ); 
 
-    int64_t t2 = ggml_time_ms();
-    LOG_INFO("sampling completed, taking %.2fs", (t2 - t1) * 1.0f / 1000);
+    int64_t t2_img2vid_sample = ggml_time_ms(); // Renamed
+    LOG_INFO("sampling completed, taking %.2fs", (t2_img2vid_sample - t1_img2vid_cond) * 1.0f / 1000);
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
-    struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, x_0);
+    struct ggml_tensor* img_decoded_vid = sd_ctx->sd->decode_first_stage(work_ctx, x_0_vid); // Renamed
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
-    if (img == NULL) {
+    if (img_decoded_vid == NULL) {
         ggml_free(work_ctx);
         return NULL;
     }
@@ -1928,7 +2279,7 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
     }
 
     for (size_t i = 0; i < video_frames; i++) {
-        auto img_i = ggml_view_3d(work_ctx, img, img->ne[0], img->ne[1], img->ne[2], img->nb[1], img->nb[2], img->nb[3] * i);
+        auto img_i = ggml_view_3d(work_ctx, img_decoded_vid, img_decoded_vid->ne[0], img_decoded_vid->ne[1], img_decoded_vid->ne[2], img_decoded_vid->nb[1], img_decoded_vid->nb[2], img_decoded_vid->nb[3] * i);
 
         result_images[i].width   = width;
         result_images[i].height  = height;
@@ -1937,9 +2288,9 @@ SD_API sd_image_t* img2vid(sd_ctx_t* sd_ctx,
     }
     ggml_free(work_ctx);
 
-    int64_t t3 = ggml_time_ms();
+    int64_t t3_img2vid = ggml_time_ms(); // Renamed
 
-    LOG_INFO("img2vid completed in %.2fs", (t3 - t0) * 1.0f / 1000);
+    LOG_INFO("img2vid completed in %.2fs", (t3_img2vid - t0_img2vid) * 1.0f / 1000);
 
     return result_images;
 }

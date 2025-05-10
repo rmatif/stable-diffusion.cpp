@@ -124,6 +124,14 @@ struct SDParams {
     bool canny_preprocess         = false;
     bool color                    = false;
     int upscale_repeats           = 1;
+    bool vae_decode_only          = true; // Default: true (only load VAE decoder)
+    bool free_params_immediately  = false; // Default: false (keep params in memory)
+
+
+    // Reference Attention parameters
+    std::string ref_attn_image_path;
+    float ref_attn_style_fidelity = 0.5f;
+    float ref_attn_strength       = 1.0f;
 
     std::vector<int> skip_layers = {7, 8, 9};
     float slg_scale              = 0.f;
@@ -178,6 +186,9 @@ void print_params(SDParams params) {
     printf("    batch_count:       %d\n", params.batch_count);
     printf("    vae_tiling:        %s\n", params.vae_tiling ? "true" : "false");
     printf("    upscale_repeats:   %d\n", params.upscale_repeats);
+    printf("    ref_attn_image:    %s\n", params.ref_attn_image_path.c_str());
+    printf("    ref_attn_fidelity: %.2f\n", params.ref_attn_style_fidelity);
+    printf("    ref_attn_strength: %.2f\n", params.ref_attn_strength);
 }
 
 void print_usage(int argc, const char* argv[]) {
@@ -244,6 +255,9 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --control-net-cpu                  keep controlnet in cpu (for low vram)\n");
     printf("  --canny                            apply canny preprocessor (edge detection)\n");
     printf("  --color                            Colors the logging tags according to level\n");
+    printf("  --reference-attn-img [IMAGE]       path to the reference image for attention-based style transfer\n");
+    printf("  --reference-attn-fidelity F        style fidelity for reference attention (0.0 to 1.0, default: 0.5)\n");
+    printf("  --reference-attn-strength S        strength of reference attention (0.0 to 1.0, default: 1.0)\n");
     printf("  -v, --verbose                      print extra info\n");
 }
 
@@ -505,6 +519,12 @@ void parse_args(int argc, const char** argv, SDParams& params) {
             params.vae_on_cpu = true;  // will slow down latent decoding but necessary for low MEM GPUs
         } else if (arg == "--diffusion-fa") {
             params.diffusion_flash_attn = true;  // can reduce MEM significantly
+        } else if (arg == "--vae-decode-only") {
+            params.vae_decode_only = true;
+        } else if (arg == "--no-vae-decode-only") {
+            params.vae_decode_only = false;
+        } else if (arg == "--free-params-immediately") {
+            params.free_params_immediately = true;
         } else if (arg == "--canny") {
             params.canny_preprocess = true;
         } else if (arg == "-b" || arg == "--batch-count") {
@@ -629,6 +649,24 @@ void parse_args(int argc, const char** argv, SDParams& params) {
                 break;
             }
             params.skip_layer_end = std::stof(argv[i]);
+        } else if (arg == "--reference-attn-img") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            params.ref_attn_image_path = argv[i];
+        } else if (arg == "--reference-attn-fidelity") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            params.ref_attn_style_fidelity = std::stof(argv[i]);
+        } else if (arg == "--reference-attn-strength") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            params.ref_attn_strength = std::stof(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv);
@@ -879,28 +917,33 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    sd_ctx_t* sd_ctx = new_sd_ctx(params.model_path.c_str(),
-                                  params.clip_l_path.c_str(),
-                                  params.clip_g_path.c_str(),
-                                  params.t5xxl_path.c_str(),
-                                  params.diffusion_model_path.c_str(),
-                                  params.vae_path.c_str(),
-                                  params.taesd_path.c_str(),
-                                  params.controlnet_path.c_str(),
-                                  params.lora_model_dir.c_str(),
-                                  params.embeddings_path.c_str(),
-                                  params.stacked_id_embeddings_path.c_str(),
-                                  vae_decode_only,
-                                  params.vae_tiling,
-                                  true,
-                                  params.n_threads,
-                                  params.wtype,
-                                  params.rng_type,
-                                  params.schedule,
-                                  params.clip_on_cpu,
-                                  params.control_net_cpu,
-                                  params.vae_on_cpu,
-                                  params.diffusion_flash_attn);
+    sd_ctx_t* sd_ctx = new_sd_ctx(                                  params.model_path.c_str(),                 // 1
+                                  params.clip_l_path.c_str(),                // 2
+                                  params.clip_g_path.c_str(),                // 3
+                                  params.t5xxl_path.c_str(),                 // 4
+                                  params.diffusion_model_path.c_str(),       // 5
+                                  params.vae_path.c_str(),                   // 6
+                                  params.taesd_path.c_str(),                 // 7
+                                  params.controlnet_path.c_str(),            // 8
+                                  params.lora_model_dir.c_str(),             // 9
+                                  params.embeddings_path.c_str(),            // 10
+                                  params.stacked_id_embeddings_path.c_str(), // 11
+                                  params.vae_decode_only,                    // 12
+                                  params.vae_tiling,                         // 13
+                                  params.free_params_immediately,            // 14 <--- USE THE PARSED PARAM
+                                  params.n_threads,                         // 15
+                                  params.wtype,                              // 16
+                                  params.rng_type,                           // 17
+                                  params.schedule,                           // 18
+                                  params.clip_on_cpu,                        // 19
+                                  params.control_net_cpu,                    // 20
+                                  params.vae_on_cpu,                         // 21
+                                  params.diffusion_flash_attn,               // 22
+                                  // Reference Attention parameters
+                                  params.ref_attn_image_path.c_str(),        // 23
+                                  params.ref_attn_style_fidelity,            // 24
+                                  params.ref_attn_strength                   // 25
+                                  );
 
     if (sd_ctx == NULL) {
         printf("new_sd_ctx_t failed\n");

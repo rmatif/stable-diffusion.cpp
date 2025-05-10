@@ -150,7 +150,12 @@ SD_API sd_ctx_t* new_sd_ctx(const char* model_path,
                             bool keep_clip_on_cpu,
                             bool keep_control_net_cpu,
                             bool keep_vae_on_cpu,
-                            bool diffusion_flash_attn);
+                            bool diffusion_flash_attn,
+                            // Reference Attention specific parameters
+                            const char* ref_attn_image_path,    // Path to the reference image for attention
+                            float ref_attn_style_fidelity,      // Style fidelity for reference attention
+                            float ref_attn_strength             // Strength for reference attention
+                            );
 
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 
