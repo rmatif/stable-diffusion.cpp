@@ -330,8 +330,13 @@ public:
             diffusion_model->alloc_params_buffer();
             diffusion_model->get_param_tensors(tensors);
 
-            first_stage_model = std::make_shared<AutoEncoderKL>(backend, model_loader.tensor_storages_types, "first_stage_model", vae_decode_only, true, version);
-            LOG_DEBUG("vae_decode_only %d", vae_decode_only);
+            bool final_svd_vae_decode_only = vae_decode_only;
+            if (reference_attn_enabled && vae_decode_only) { // Should not happen with SVD typically
+                LOG_WARN("Reference attention enabled with SVD and vae_decode_only. Forcing VAE to be capable of encoding for reference image.");
+                final_svd_vae_decode_only = false;
+            }
+            first_stage_model = std::make_shared<AutoEncoderKL>(backend, model_loader.tensor_storages_types, "first_stage_model", final_svd_vae_decode_only, true, version);
+            LOG_DEBUG("vae_decode_only (for SVD VAE init): %d", final_svd_vae_decode_only);
             first_stage_model->alloc_params_buffer();
             first_stage_model->get_param_tensors(tensors, "first_stage_model");
         } else {
@@ -382,7 +387,14 @@ public:
                 } else {
                     vae_backend = backend;
                 }
-                first_stage_model = std::make_shared<AutoEncoderKL>(vae_backend, model_loader.tensor_storages_types, "first_stage_model", vae_decode_only, false, version);
+                // If reference attention is enabled, VAE *must* be able to encode the reference image.
+                // So, override vae_decode_only to false in this case.
+                bool final_vae_decode_only = vae_decode_only;
+                if (reference_attn_enabled && vae_decode_only) {
+                    LOG_INFO("Reference attention is enabled, forcing VAE to be capable of encoding (vae_decode_only set to false for VAE initialization).");
+                    final_vae_decode_only = false;
+                }
+                first_stage_model = std::make_shared<AutoEncoderKL>(vae_backend, model_loader.tensor_storages_types, "first_stage_model", final_vae_decode_only, false, version);
                 first_stage_model->alloc_params_buffer();
                 first_stage_model->get_param_tensors(tensors, "first_stage_model");
             } else {
