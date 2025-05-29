@@ -18,7 +18,8 @@ struct DiffusionModel {
                          float control_strength                    = 0.f,
                          struct ggml_tensor** output               = NULL,
                          struct ggml_context* output_ctx           = NULL,
-                         std::vector<int> skip_layers              = std::vector<int>())             = 0;
+                         std::vector<int> skip_layers              = std::vector<int>(),
+                         UNetModelRunner::ClockworkParams clockwork_params = UNetModelRunner::ClockworkParams()) = 0;
     virtual void alloc_params_buffer()                                                  = 0;
     virtual void free_params_buffer()                                                   = 0;
     virtual void free_compute_buffer()                                                  = 0;
@@ -73,9 +74,10 @@ struct UNetModel : public DiffusionModel {
                  float control_strength                    = 0.f,
                  struct ggml_tensor** output               = NULL,
                  struct ggml_context* output_ctx           = NULL,
-                 std::vector<int> skip_layers              = std::vector<int>()) {
+                 std::vector<int> skip_layers              = std::vector<int>(),
+                 UNetModelRunner::ClockworkParams clockwork_params = UNetModelRunner::ClockworkParams()) {
         (void)skip_layers;  // SLG doesn't work with UNet models
-        return unet.compute(n_threads, x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, output, output_ctx);
+        return unet.compute(n_threads, x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, output, output_ctx, clockwork_params);
     }
 };
 
@@ -123,10 +125,12 @@ struct MMDiTModel : public DiffusionModel {
                  float control_strength                    = 0.f,
                  struct ggml_tensor** output               = NULL,
                  struct ggml_context* output_ctx           = NULL,
-                 std::vector<int> skip_layers              = std::vector<int>()) {
+                 std::vector<int> skip_layers              = std::vector<int>(),
+                 UNetModelRunner::ClockworkParams clockwork_params = UNetModelRunner::ClockworkParams()) {
+        (void)clockwork_params; // Clockwork not implemented for MMDiT
         return mmdit.compute(n_threads, x, timesteps, context, y, output, output_ctx, skip_layers);
     }
-};
+};;
 
 struct FluxModel : public DiffusionModel {
     Flux::FluxRunner flux;
@@ -174,7 +178,9 @@ struct FluxModel : public DiffusionModel {
                  float control_strength                    = 0.f,
                  struct ggml_tensor** output               = NULL,
                  struct ggml_context* output_ctx           = NULL,
-                 std::vector<int> skip_layers              = std::vector<int>()) {
+                 std::vector<int> skip_layers              = std::vector<int>(),
+                 UNetModelRunner::ClockworkParams clockwork_params = UNetModelRunner::ClockworkParams()) {
+        (void)clockwork_params; // Clockwork not implemented for Flux
         return flux.compute(n_threads, x, timesteps, context, c_concat, y, guidance, output, output_ctx, skip_layers);
     }
 };

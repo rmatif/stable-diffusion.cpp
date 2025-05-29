@@ -124,6 +124,7 @@ struct SDParams {
     bool canny_preprocess         = false;
     bool color                    = false;
     int upscale_repeats           = 1;
+    int clockwork_clock           = 0; // 0 means disabled
 
     std::vector<int> skip_layers = {7, 8, 9};
     float slg_scale              = 0.f;
@@ -178,6 +179,9 @@ void print_params(SDParams params) {
     printf("    batch_count:       %d\n", params.batch_count);
     printf("    vae_tiling:        %s\n", params.vae_tiling ? "true" : "false");
     printf("    upscale_repeats:   %d\n", params.upscale_repeats);
+    if (params.clockwork_clock > 0) {
+        printf("    clockwork_clock:   %d\n", params.clockwork_clock);
+    }
 }
 
 void print_usage(int argc, const char* argv[]) {
@@ -244,6 +248,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --control-net-cpu                  keep controlnet in cpu (for low vram)\n");
     printf("  --canny                            apply canny preprocessor (edge detection)\n");
     printf("  --color                            Colors the logging tags according to level\n");
+    printf("  --clockwork CLOCK                  enable Clockwork Diffusion with specified clock (e.g., 4, default: 0, disabled)\n");
     printf("  -v, --verbose                      print extra info\n");
 }
 
@@ -617,6 +622,16 @@ void parse_args(int argc, const char** argv, SDParams& params) {
             if (invalid_arg) {
                 break;
             }
+        } else if (arg == "--clockwork") {
+            if (++i >= argc) {
+                invalid_arg = true;
+                break;
+            }
+            params.clockwork_clock = std::stoi(argv[i]);
+            if (params.clockwork_clock < 0) { // allow 0 for disable
+                fprintf(stderr, "error: clockwork clock must be non-negative\n");
+                exit(1);
+            }
         } else if (arg == "--skip-layer-start") {
             if (++i >= argc) {
                 invalid_arg = true;
@@ -900,7 +915,8 @@ int main(int argc, const char* argv[]) {
                                   params.clip_on_cpu,
                                   params.control_net_cpu,
                                   params.vae_on_cpu,
-                                  params.diffusion_flash_attn);
+                                  params.diffusion_flash_attn,
+                                  params.clockwork_clock);
 
     if (sd_ctx == NULL) {
         printf("new_sd_ctx_t failed\n");

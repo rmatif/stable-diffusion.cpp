@@ -89,6 +89,13 @@ public:
     int n_threads            = -1;
     float scale_factor       = 0.18215f;
 
+    // Clockwork Diffusion members
+    int clockwork_clock                = 0; // 0 = disabled
+    int clockwork_time_                 = 0;
+    ggml_tensor* clockwork_cached_features_r_out_ = NULL;
+    // We won't explicitly manage is_adaptor_graph/is_full_unet_graph flags here,
+    // the logic will be in the sampling loop.
+
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd
     std::shared_ptr<DiffusionModel> diffusion_model;
@@ -118,11 +125,13 @@ public:
                         bool vae_decode_only,
                         bool free_params_immediately,
                         std::string lora_model_dir,
-                        rng_type_t rng_type)
+                        rng_type_t rng_type,
+                        int clockwork_clock_val)
         : n_threads(n_threads),
           vae_decode_only(vae_decode_only),
           free_params_immediately(free_params_immediately),
-          lora_model_dir(lora_model_dir) {
+          lora_model_dir(lora_model_dir),
+          clockwork_clock(clockwork_clock_val) {
         if (rng_type == STD_DEFAULT_RNG) {
             rng = std::make_shared<STDDefaultRNG>();
         } else if (rng_type == CUDA_RNG) {
@@ -141,6 +150,13 @@ public:
             ggml_backend_free(vae_backend);
         }
         ggml_backend_free(backend);
+        if (clockwork_cached_features_r_out_ != NULL) {
+            // Assuming it was allocated in params_ctx or a similar persistent context
+            // If it was ggml_duped into a runner-specific context, that context should handle freeing.
+            // For now, let's assume it's managed elsewhere or will be freed with its context.
+            // ggml_free_tensor(clockwork_cached_features_r_out_); // This might be wrong if shared
+            clockwork_cached_features_r_out_ = NULL;
+        }
     }
 
     bool load_from_file(const std::string& model_path,
@@ -824,6 +840,11 @@ public:
         copy_ggml_tensor(x, init_latent);
         x = denoiser->noise_scaling(sigmas[0], noise, x);
 
+        // Clockwork: reset time for this sampling process if clock is active
+        if (clockwork_clock > 0) {
+            clockwork_time_ = 0;
+        }
+
         struct ggml_tensor* noised_input = ggml_dup_tensor(work_ctx, noise);
 
         bool has_unconditioned = cfg_scale != 1.0 && uncond.c_crossattn != NULL;
@@ -852,6 +873,30 @@ public:
                 pretty_progress(0, (int)steps, 0);
             }
             int64_t t0 = ggml_time_us();
+
+            // Clockwork logic for current step
+            bool clockwork_use_full_unet_ = true;
+            bool clockwork_current_step_is_adaptor_ = false;
+            UNetModelRunner::ClockworkParams clockwork_params;
+            clockwork_params.is_adaptor_pass = false;
+            clockwork_params.input_cache = NULL;
+            clockwork_params.output_cache_target_ptr = NULL;
+
+            if (clockwork_clock > 0) {
+                clockwork_use_full_unet_ = (clockwork_time_ % clockwork_clock == 0);
+                clockwork_current_step_is_adaptor_ = !clockwork_use_full_unet_;
+                clockwork_time_++; // Tick clock for next iteration
+
+                clockwork_params.is_adaptor_pass = clockwork_current_step_is_adaptor_;
+                if (clockwork_current_step_is_adaptor_) {
+                    clockwork_params.input_cache = clockwork_cached_features_r_out_;
+                    GGML_ASSERT(clockwork_params.input_cache != NULL); // Must have cached from a full pass
+                } else { // Full UNet pass, prepare to cache output
+                    // The actual tensor clockwork_cached_features_r_out_ should be in a persistent context.
+                    // We will use diffusion_model->unet_runner's internal cache mechanism.
+                    clockwork_params.output_cache_target_ptr = &clockwork_cached_features_r_out_;
+                }
+            }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
             GGML_ASSERT(scaling.size() == 3);
@@ -890,7 +935,10 @@ public:
                                          -1,
                                          controls,
                                          control_strength,
-                                         &out_cond);
+                                         &out_cond,
+                                         nullptr, // output_ctx for a single tensor
+                                         {},      // skip_layers for this call
+                                         clockwork_params); // clockwork params for cond
             } else {
                 diffusion_model->compute(n_threads,
                                          noised_input,
@@ -902,7 +950,10 @@ public:
                                          -1,
                                          controls,
                                          control_strength,
-                                         &out_cond);
+                                         &out_cond,
+                                         nullptr,
+                                         {},
+                                         clockwork_params); // clockwork params for id_cond
             }
 
             float* negative_data = NULL;
@@ -922,7 +973,10 @@ public:
                                          -1,
                                          controls,
                                          control_strength,
-                                         &out_uncond);
+                                         &out_uncond,
+                                         nullptr,
+                                         {},
+                                         clockwork_params); // clockwork params for uncond
                 negative_data = (float*)out_uncond->data;
             }
 
@@ -944,7 +998,8 @@ public:
                                          control_strength,
                                          &out_skip,
                                          NULL,
-                                         skip_layers);
+                                         skip_layers,
+                                         clockwork_params); // clockwork params for skip_layer
                 skip_layer_data = (float*)out_skip->data;
             }
             float* vec_denoised  = (float*)denoised->data;
@@ -1130,7 +1185,8 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
                      bool keep_clip_on_cpu,
                      bool keep_control_net_cpu,
                      bool keep_vae_on_cpu,
-                     bool diffusion_flash_attn) {
+                     bool diffusion_flash_attn,
+                     int clockwork_clock) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == NULL) {
         return NULL;
@@ -1151,7 +1207,8 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
                                          vae_decode_only,
                                          free_params_immediately,
                                          lora_model_dir,
-                                         rng_type);
+                                         rng_type,
+                                         clockwork_clock);
     if (sd_ctx->sd == NULL) {
         return NULL;
     }

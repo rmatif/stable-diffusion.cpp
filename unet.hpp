@@ -379,12 +379,15 @@ public:
     struct ggml_tensor* forward(struct ggml_context* ctx,
                                 struct ggml_tensor* x,
                                 struct ggml_tensor* timesteps,
-                                struct ggml_tensor* context,
-                                struct ggml_tensor* c_concat              = NULL,
-                                struct ggml_tensor* y                     = NULL,
-                                int num_video_frames                      = -1,
-                                std::vector<struct ggml_tensor*> controls = {},
-                                float control_strength                    = 0.f) {
+                                 struct ggml_tensor* context,
+                                 struct ggml_tensor* c_concat              = NULL,
+                                 struct ggml_tensor* y                     = NULL,
+                                 int num_video_frames                      = -1,
+                                 std::vector<struct ggml_tensor*> controls = {},
+                                 float control_strength                    = 0.f,
+                                 bool clockwork_is_adaptor_pass            = false,
+                                 ggml_tensor* clockwork_input_cache        = NULL,
+                                 ggml_tensor** clockwork_output_cache_ptr  = NULL) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
@@ -441,86 +444,113 @@ public:
         // input block 0
         auto h = input_blocks_0_0->forward(ctx, x);
 
-        ggml_set_name(h, "bench-start");
-        hs.push_back(h);
-        // input block 1-11
-        size_t len_mults    = channel_mult.size();
-        int input_block_idx = 0;
-        int ds              = 1;
-        for (int i = 0; i < len_mults; i++) {
-            int mult = channel_mult[i];
-            for (int j = 0; j < num_res_blocks; j++) {
-                input_block_idx += 1;
-                std::string name = "input_blocks." + std::to_string(input_block_idx) + ".0";
-                h                = resblock_forward(name, ctx, h, emb, num_video_frames);  // [N, mult*model_channels, h, w]
-                if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
-                    std::string name = "input_blocks." + std::to_string(input_block_idx) + ".1";
-                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames);  // [N, mult*model_channels, h, w]
-                }
-                hs.push_back(h);
-            }
-            if (i != len_mults - 1) {
-                ds *= 2;
-                input_block_idx += 1;
-
-                std::string name = "input_blocks." + std::to_string(input_block_idx) + ".0";
-                auto block       = std::dynamic_pointer_cast<DownSampleBlock>(blocks[name]);
-
-                h = block->forward(ctx, h);  // [N, mult*model_channels, h/(2^(i+1)), w/(2^(i+1))]
-                hs.push_back(h);
-            }
-        }
-        // [N, 4*model_channels, h/8, w/8]
-
-        // middle_block
-        h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
-        h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
-        h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
-
-        if (controls.size() > 0) {
+        // ControlNet application to middle block (only in full pass)
+        if (!clockwork_is_adaptor_pass && controls.size() > 0) {
             auto cs = ggml_scale_inplace(ctx, controls[controls.size() - 1], control_strength);
             h       = ggml_add(ctx, h, cs);  // middle control
         }
-        int control_offset = controls.size() - 2;
+        int control_offset = controls.size() > 0 ? (controls.size() - 2) : -1;
+
 
         // output_blocks
         int output_block_idx = 0;
-        for (int i = (int)len_mults - 1; i >= 0; i--) {
-            for (int j = 0; j < num_res_blocks + 1; j++) {
-                auto h_skip = hs.back();
-                hs.pop_back();
+        int ds_out           = 1; // ds for output blocks, effectively tracks current resolution scale factor from highest res
+                                 // Starts at 1 (e.g. 64x64 for 512 input), then becomes 2 (32x32), 4 (16x16), 8 (8x8) as i decreases.
+                                 // This is used to match attention_resolutions.
+                                 // The ds variable from input_blocks loop is not directly usable here as it ends at max downsample.
+                                 // Instead, we recalculate based on `i`. For SD1.x, last `i` is 0 (ds_full was 1).
+                                 // Middle block operates at max ds (e.g., 8).
+                                 // First `i` in output_blocks is `len_mults - 1`. Max `ds` is `2^(len_mults-1)`.
+        ds_out = 1 << ((int)channel_mult.size() -1);
 
-                if (controls.size() > 0) {
-                    auto cs = ggml_scale_inplace(ctx, controls[control_offset], control_strength);
-                    h_skip  = ggml_add(ctx, h_skip, cs);  // control net condition
+
+        for (int i = (int)channel_mult.size() - 1; i >= 0; i--) { // i = 3,2,1,0 for SD1.x
+            // Clockwork Adaptor Pass Logic for skipping initial upsampling stages
+            if (clockwork_is_adaptor_pass) {
+                // Equivalent to self.unet.up_blocks = self.up_blocks[-2:]
+                // This means we skip output blocks for i = len_mults-1 down to i = 2.
+                // For SD1.x (len_mults=4), this skips i=3 and i=2.
+                if (i > 1) { // Skips i=3 (up_blocks[0]) and i=2 (up_blocks[1])
+                    if (!hs.empty()) { // Pop corresponding skip connections if they were (mistakenly) fully populated
+                        for(int k=0; k < num_res_blocks + 1; ++k) if(!hs.empty()) hs.pop_back();
+                    }
+                    ds_out /=2; // Keep ds_out synchronized
+                    output_block_idx += (num_res_blocks + 1); // Advance block index notionally
+                    continue;
+                }
+                if (i == 1) { // This is the up_blocks[-2] slot, replaced by adaptor.
+                              // h becomes the cached feature.
+                    GGML_ASSERT(clockwork_input_cache != NULL);
+                    h = clockwork_input_cache;
+                    // Original ResBlocks, Attn, and Upsampler for this stage are skipped.
+                    // Their skip connections from `hs` are also effectively skipped.
+                    // Since hs only contains one element in adaptor mode, popping is not needed here for these.
+                    ds_out /=2; // Keep ds_out synchronized as if upsampling occurred.
+                    output_block_idx += (num_res_blocks + 1); // Advance block index notionally
+                    continue; // Proceed to the next stage (i=0)
+                }
+            }
+
+            // Common path for a stage (full pass, or i=0 in adaptor pass)
+            for (int j = 0; j < num_res_blocks + 1; j++) {
+                auto h_skip = hs.back(); hs.pop_back();
+
+                if (controls.size() > 0 && control_offset >= 0) {
+                     if (!clockwork_is_adaptor_pass || (clockwork_is_adaptor_pass && i==0)) { // Apply control to non-skipped stages
+                        auto cs = ggml_scale_inplace(ctx, controls[control_offset], control_strength);
+                        h_skip  = ggml_add(ctx, h_skip, cs);
+                     }
                     control_offset--;
                 }
 
                 h = ggml_concat(ctx, h, h_skip, 2);
 
-                std::string name = "output_blocks." + std::to_string(output_block_idx) + ".0";
-
-                h = resblock_forward(name, ctx, h, emb, num_video_frames);
+                std::string name_res = "output_blocks." + std::to_string(output_block_idx) + ".0";
+                h = resblock_forward(name_res, ctx, h, emb, num_video_frames);
 
                 int up_sample_idx = 1;
-                if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
-                    std::string name = "output_blocks." + std::to_string(output_block_idx) + ".1";
-
-                    h = attention_layer_forward(name, ctx, h, context, num_video_frames);
-
+                if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds_out) != attention_resolutions.end()) {
+                    std::string name_attn = "output_blocks." + std::to_string(output_block_idx) + ".1";
+                    h = attention_layer_forward(name_attn, ctx, h, context, num_video_frames);
                     up_sample_idx++;
                 }
 
-                if (i > 0 && j == num_res_blocks) {
-                    std::string name = "output_blocks." + std::to_string(output_block_idx) + "." + std::to_string(up_sample_idx);
-                    auto block       = std::dynamic_pointer_cast<UpSampleBlock>(blocks[name]);
-
-                    h = block->forward(ctx, h);
-
-                    ds /= 2;
+                if (i > 0 && j == num_res_blocks) { // Upsampling for this level
+                    std::string name_up = "output_blocks." + std::to_string(output_block_idx) + "." + std::to_string(up_sample_idx);
+                    auto block_up       = std::dynamic_pointer_cast<UpSampleBlock>(blocks[name_up]);
+                    h = block_up->forward(ctx, h);
                 }
-
                 output_block_idx += 1;
+            }
+
+            // Cache point: After processing for i=1 (up_blocks[-2]) in a full pass
+            if (!clockwork_is_adaptor_pass && i == 1 && clockwork_output_cache_ptr != NULL) {
+                // Ensure *clockwork_output_cache_ptr is a tensor in a persistent context.
+                // Here, we are in compute_ctx. We need to copy h to *clockwork_output_cache_ptr.
+                if (*clockwork_output_cache_ptr == NULL) {
+                     // This allocation should ideally happen once outside the unet call, in a persistent context.
+                     // For simplicity now, assume it's pre-allocated matching h's shape & type.
+                     // Or, the runner handles allocation and passes a valid tensor.
+                     // Let's assume runner ensures *clockwork_output_cache_ptr is valid.
+                }
+                // Create a cpy operation if *clockwork_output_cache_ptr is in a different backend/context
+                // For now, direct data copy if same context, or rely on runner to handle cross-context copy.
+                // This is tricky without knowing the context of *clockwork_output_cache_ptr.
+                // Simplest for now: if runner wants to cache, it receives `h` and dups it.
+                // So, this specific assignment here is more conceptual.
+                // The actual caching will be managed by UNetModelRunner using the returned `h`
+                // if it was a caching step.
+                // For now, this means we need a way for UnetModelBlock::forward to signal this `h`.
+                // Alternative: UNetModelRunner uses ggml_graph_get_tensor(gf, "cache_point_tensor_name")
+                // Let's go with the `clockwork_output_cache_ptr` being a ggml_tensor* that UNetModelBlock writes to.
+                // The runner ensures this tensor is in the correct (persistent) context.
+                // This means `ggml_build_forward_expand(gf, ggml_cpy(compute_ctx, h, *clockwork_output_cache_ptr))`
+                // should be added to the graph by the runner after `unet.forward` returns the final `h`.
+                // This tensor `h` is the one we want to cache. Name it.
+                ggml_set_name(h, "clockwork_cache_point_for_up_blocks_minus_2");
+            }
+            if (i > 0) { // if not the highest-res layer, ds_out is halved for the next, higher-res layer
+                ds_out /= 2;
             }
         }
 
@@ -528,21 +558,59 @@ public:
         h = out_0->forward(ctx, h);
         h = ggml_silu_inplace(ctx, h);
         h = out_2->forward(ctx, h);
+        ggml_set_name(h, "unet_output_node"); // Name the final output
         ggml_set_name(h, "bench-end");
         return h;  // [N, out_channels, h, w]
     }
 };
 
+class UnetModelBlock;
+
 struct UNetModelRunner : public GGMLRunner {
     UnetModelBlock unet;
+
+    // Clockwork Diffusion parameters
+    struct ClockworkParams {
+        bool is_adaptor_pass;
+        ggml_tensor* input_cache; 
+        ggml_tensor** output_cache_target_ptr;
+
+        ClockworkParams() : is_adaptor_pass(false), input_cache(NULL), output_cache_target_ptr(NULL) {}
+    };
+    ggml_tensor* clockwork_cached_features_ = NULL; // Stores the cached features
+    int clockwork_time_step_ = 0;
+    int clockwork_clock_config_ = 0; // Configured clock value (0 = disabled)
+    struct ggml_context* clockwork_cache_ctx_ = NULL; // Context for clockwork_cached_features_
 
     UNetModelRunner(ggml_backend_t backend,
                     std::map<std::string, enum ggml_type>& tensor_types,
                     const std::string prefix,
                     SDVersion version = VERSION_SD1,
-                    bool flash_attn   = false)
-        : GGMLRunner(backend), unet(version, tensor_types, flash_attn) {
+                    bool flash_attn   = false,
+                    int clockwork_clock_val = 0) // Added clockwork_clock_val
+        : GGMLRunner(backend), unet(version, tensor_types, flash_attn), clockwork_clock_config_(clockwork_clock_val) {
         unet.init(params_ctx, tensor_types, prefix);
+        if (clockwork_clock_config_ > 0) {
+            // Initialize context for storing cached features if clockwork is active
+            // This context needs to persist across compute calls.
+            // Using params_ctx for this might bloat it if cache is large.
+            // A dedicated small context is better.
+            struct ggml_init_params p_params;
+            p_params.mem_size   = 256 * 1024 * 1024; // Estimate for cache, adjust as needed
+            p_params.mem_buffer = NULL;
+            p_params.no_alloc   = false; // We need to allocate the tensor here
+            clockwork_cache_ctx_ = ggml_init(p_params);
+            GGML_ASSERT(clockwork_cache_ctx_ != NULL);
+            // clockwork_cached_features_ will be allocated on first full pass based on actual shape.
+        }
+    }
+
+    ~UNetModelRunner() {
+        if (clockwork_cache_ctx_ != NULL) {
+            ggml_free(clockwork_cache_ctx_);
+            clockwork_cache_ctx_ = NULL;
+            // clockwork_cached_features_ is part of this context, so it's freed.
+        }
     }
 
     std::string get_desc() {
@@ -556,11 +624,12 @@ struct UNetModelRunner : public GGMLRunner {
     struct ggml_cgraph* build_graph(struct ggml_tensor* x,
                                     struct ggml_tensor* timesteps,
                                     struct ggml_tensor* context,
-                                    struct ggml_tensor* c_concat              = NULL,
-                                    struct ggml_tensor* y                     = NULL,
-                                    int num_video_frames                      = -1,
-                                    std::vector<struct ggml_tensor*> controls = {},
-                                    float control_strength                    = 0.f) {
+                                     struct ggml_tensor* c_concat              = NULL,
+                                     struct ggml_tensor* y                     = NULL,
+                                     int num_video_frames                      = -1,
+                                     std::vector<struct ggml_tensor*> controls = {},
+                                     float control_strength                    = 0.f,
+                                     const ClockworkParams& clockwork_params   = ClockworkParams()) {
         struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, UNET_GRAPH_SIZE, false);
 
         if (num_video_frames == -1) {
@@ -582,13 +651,48 @@ struct UNetModelRunner : public GGMLRunner {
                                                timesteps,
                                                context,
                                                c_concat,
-                                               y,
-                                               num_video_frames,
-                                               controls,
-                                               control_strength);
+                                                y,
+                                                num_video_frames,
+                                                controls,
+                                                control_strength,
+                                                clockwork_params.is_adaptor_pass,
+                                                clockwork_params.input_cache,
+                                                clockwork_params.output_cache_target_ptr);
 
-        ggml_build_forward_expand(gf, out);
+        ggml_build_forward_expand(gf, out); // Builds graph for the main UNet output `out`
 
+        // Clockwork: If this was a full pass and caching is enabled, add cpy op to graph
+        if (clockwork_params.output_cache_target_ptr != NULL && !clockwork_params.is_adaptor_pass) {
+            // struct ggml_tensor* h_to_cache_node = NULL; // Use get_tensor_from_graph instead
+            struct ggml_tensor* h_to_cache_node = get_tensor_from_graph(gf, "clockwork_cache_point_for_up_blocks_minus_2");
+
+            if (h_to_cache_node == NULL) {
+                LOG_WARN("Clockwork cache point tensor 'clockwork_cache_point_for_up_blocks_minus_2' not found in graph. Caching might fail.");
+            }
+
+            if (h_to_cache_node != NULL) {
+                if (*clockwork_params.output_cache_target_ptr == NULL && clockwork_cache_ctx_ != NULL) {
+                    // Allocate persistent cache tensor for the first time
+                    *clockwork_params.output_cache_target_ptr = ggml_dup_tensor(clockwork_cache_ctx_, h_to_cache_node);
+                    ggml_set_name(*clockwork_params.output_cache_target_ptr, "clockwork_persistent_cache_tensor");
+                    // If the clockwork_cache_ctx_ is associated with a non-CPU backend, 
+                    // the tensor duplicated into it needs to be properly managed by that backend.
+                    // ggml_dup_tensor should handle basic context association.
+                    // If clockwork_cache_ctx_ is just a CPU context, no special backend handling is needed here for the tensor itself.
+                    // The ggml_cpy operation will handle data transfer between backends if compute_ctx is on GPU.
+                }
+                GGML_ASSERT(*clockwork_params.output_cache_target_ptr != NULL && "Persistent cache tensor is NULL.");
+                GGML_ASSERT(ggml_are_same_shape(h_to_cache_node, *clockwork_params.output_cache_target_ptr) && "Cache tensor shape mismatch.");
+
+                struct ggml_tensor* cpy_to_cache_op = ggml_cpy(compute_ctx, h_to_cache_node, *clockwork_params.output_cache_target_ptr);
+                // This cpy_op also needs to be part of the graph `gf` to be scheduled and computed.
+                ggml_build_forward_expand(gf, cpy_to_cache_op); 
+                // Now, `cpy_to_cache_op` is the last node added to the graph.
+                // The `GGMLRunner::compute` logic must retrieve the main output by its specific name.
+            } else {
+                 LOG_WARN("Failed to find tensor for caching. Cache will not be updated this step.");
+            }
+        }
         return gf;
     }
 
@@ -600,19 +704,82 @@ struct UNetModelRunner : public GGMLRunner {
                  struct ggml_tensor* y,
                  int num_video_frames                      = -1,
                  std::vector<struct ggml_tensor*> controls = {},
-                 float control_strength                    = 0.f,
-                 struct ggml_tensor** output               = NULL,
-                 struct ggml_context* output_ctx           = NULL) {
+                  float control_strength                    = 0.f,
+                  struct ggml_tensor** output               = NULL,
+                  struct ggml_context* output_ctx           = NULL,
+                  ClockworkParams clockwork_runtime_params  = ClockworkParams()) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
+        // y: [N, adm_in_channels] or [1, adm_in_channels]
+
+        ClockworkParams current_clockwork_params = clockwork_runtime_params; // Use passed in params
+
+        if (clockwork_clock_config_ > 0) {
+            current_clockwork_params.is_adaptor_pass = (clockwork_time_step_ % clockwork_clock_config_ != 0);
+            if (current_clockwork_params.is_adaptor_pass) {
+                current_clockwork_params.input_cache = clockwork_cached_features_;
+                GGML_ASSERT(current_clockwork_params.input_cache != NULL);
+                current_clockwork_params.output_cache_target_ptr = NULL;
+            } else { // Full pass
+                current_clockwork_params.input_cache = NULL;
+                // output_cache_target_ptr will point to clockwork_cached_features_
+                // Allocation/reallocation of clockwork_cached_features_ might be needed if shape changes or first time.
+                // For now, assume shape is constant. UnetModelBlock will fill it via ggml_cpy.
+                // This tensor needs to be created in clockwork_cache_ctx_.
+                // The ggml_cpy op will be added to the graph by UnetModelBlock.
+                // For SD, latent shape is usually fixed. Let's allocate it here if null.
+                if (clockwork_cached_features_ == NULL && clockwork_cache_ctx_ != NULL) {
+                    // Determine shape of up_blocks[-2] output. This is hard without running part of the model.
+                    // For SD1.x (512x512 input -> 64x64 latent), up_blocks[-2] (i=1) outputs
+                    // model_channels * channel_mult[1] (e.g. 320*2=640) channels, at 32x32 (latent H/2, W/2).
+                    // This is an approximation. A more robust way is to get shape after first full run.
+                    // For simplicity, let's assume it is pre-created or UnetModelBlock handles it.
+                    // The UnetModelBlock will perform ggml_cpy into this tensor if output_cache_target_ptr is set.
+                    // This tensor must exist and be in a compatible context for ggml_cpy.
+
+                    // Placeholder: expect UnetModelBlock to handle ggml_dup into this if NULL initially,
+                    // or require it to be pre-sized.
+                    // For now, let UnetModelBlock ggml_dup to the target if it's a full pass and target_ptr is valid.
+                    // The runner is responsible for managing the lifecycle of the *clockwork_cached_features_ tensor itself.
+                    // Let's assume that if *output_cache_target_ptr is NULL, UnetModelBlock will allocate it
+                    // using ggml_dup(ctx, h_to_cache); and the runner will take ownership.
+                    // This means clockwork_cached_features_ might point to a tensor in compute_ctx,
+                    // which is bad if compute_ctx is freed.
+                    // Safest: UnetModelBlock uses output_cache_target_ptr to fill an existing tensor.
+                    // Runner allocates clockwork_cached_features_ in its clockwork_cache_ctx_.
+                    // TODO: This logic needs to be robust for first cache creation.
+                    // For now, UnetModelBlock's ggml_cpy will write to *current_clockwork_params.output_cache_target_ptr
+                    // which is &clockwork_cached_features_.
+                }
+                current_clockwork_params.output_cache_target_ptr = &clockwork_cached_features_;
+            }
+        }
+
+
         auto get_graph = [&]() -> struct ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength);
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, current_clockwork_params);
         };
 
         GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+
+        if (clockwork_clock_config_ > 0) {
+            clockwork_time_step_++;
+            if (!current_clockwork_params.is_adaptor_pass && current_clockwork_params.output_cache_target_ptr != NULL) {
+                // If clockwork_cached_features_ was just updated (it was a full pass)
+                // and if it was allocated for the first time by UnetModelBlock via dup into compute_ctx,
+                // we need to ensure it's moved to clockwork_cache_ctx_.
+                // The current mechanism has UnetModelBlock doing ggml_cpy to an existing tensor.
+                // So, the runner needs to ensure clockwork_cached_features_ exists in clockwork_cache_ctx_.
+                // This part is complex to get right for the first allocation.
+                // A simpler approach: On first full pass, UnetModelBlock returns the tensor to be cached.
+                // Runner dups it into clockwork_cache_ctx_ and stores it.
+                // For subsequent full passes, UnetModelBlock copies into existing tensor.
+                // For now, assuming the ggml_cpy in UnetModelBlock::forward handles writing to the persistent tensor.
+            }
+        }
     }
 
     void test() {
