@@ -1199,11 +1199,27 @@ static std::vector<float> prepare_sigmas(
     std::vector<float> sigmas_for_generation;
     if (custom_sigmas_count > 0 && custom_sigmas_arr != nullptr) {
         LOG_INFO("Using custom sigmas provided by user for %s.", mode_name);
-        sigmas_for_generation.assign(custom_sigmas_arr, custom_sigmas_arr + custom_sigmas_count);
+        sigmas_for_generation.assign(custom_sigmas_arr, custom_sigmas_arr + custom_sigmas_count - 2); // last 2 values hold operation + operand
+        unsigned u = sigmas_for_generation.size();
         size_t target_len = static_cast<size_t>(sample_steps) + 1;
-        if (sigmas_for_generation.size() < target_len) {
-            LOG_DEBUG("Custom sigmas count (%zu) is less than target steps + 1 (%zu). Padding with 0.0f.", sigmas_for_generation.size(), target_len);
+        if (u < target_len) {
+            unsigned char op = custom_sigmas_arr[u];
+            float last_parsed_sigma = custom_sigmas_arr[u + 1];
+            LOG_DEBUG("Custom sigmas count (%zu) is less than target steps + 1 (%zu). Propagading last operation (%c%f).", u, target_len, op, last_parsed_sigma);
             sigmas_for_generation.resize(target_len, 0.0f);
+            for (; u < target_len - 1; u++) { // last sigma will be zeroed anyway
+                switch(op) {
+                case '+': sigmas_for_generation[u] = sigmas_for_generation[u - 1] + last_parsed_sigma; break;
+                case '-': sigmas_for_generation[u] = sigmas_for_generation[u - 1] - last_parsed_sigma; break;
+                case '*': sigmas_for_generation[u] = sigmas_for_generation[u - 1] * last_parsed_sigma; break;
+                case '/': sigmas_for_generation[u] = sigmas_for_generation[u - 1] / last_parsed_sigma; break;
+                case '^': sigmas_for_generation[u] = std::pow(sigmas_for_generation[u - 1], last_parsed_sigma); break;
+                default:  sigmas_for_generation[u] = last_parsed_sigma;
+                }
+            }
+            for (u = 0; u < target_len; u++) {
+                LOG_DEBUG("sigmas_for_generation[%u] = '%f'.", u, sigmas_for_generation[u]);
+            }
         } else if (sigmas_for_generation.size() > target_len) {
             LOG_DEBUG("Custom sigmas count (%zu) is greater than target steps + 1 (%zu). Truncating.", sigmas_for_generation.size(), target_len);
             sigmas_for_generation.resize(target_len);
