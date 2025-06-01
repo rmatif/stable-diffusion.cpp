@@ -657,12 +657,32 @@ void parse_args(int argc, const char** argv, SDParams& params) {
 
             std::stringstream ss(sigmas_str);
             std::string item;
+            unsigned char op;
+            float last_sigma, parsed_sigma;
             while(std::getline(ss, item, ',')) {
                 item.erase(0, item.find_first_not_of(" \t\n\r\f\v"));
                 item.erase(item.find_last_not_of(" \t\n\r\f\v") + 1);
                 if (!item.empty()) {
                     try {
-                        params.custom_sigmas.push_back(std::stof(item));
+                        op = item[0]; // basic math handling
+                        switch (op) {
+                        case '+': case '-': case '*': case '/': case '^':
+                            item.erase(0, 1); // "* 1.5" => "1.5"
+                            item.erase(0, item.find_first_not_of(" \t\n\r\f\v"));
+                            break;
+                        default:
+                            op = 0; // simply a value, or ignore unknown ops
+                        }
+                        parsed_sigma = (!item.empty()) ? std::stof(item) : 0.f;
+                        switch (op) {
+                        case '+': last_sigma += parsed_sigma; break;
+                        case '-': last_sigma -= parsed_sigma; break;
+                        case '*': last_sigma *= parsed_sigma; break;
+                        case '/': last_sigma /= parsed_sigma; break;
+                        case '^': last_sigma = std::pow(last_sigma, parsed_sigma); break;
+                        default:  last_sigma = parsed_sigma; // set as is
+                        }
+                        params.custom_sigmas.push_back(last_sigma);
                     } catch (const std::invalid_argument& e) {
                         fprintf(stderr, "error: invalid float value '%s' in --sigmas\n", item.c_str());
                         invalid_arg = true;
@@ -680,6 +700,9 @@ void parse_args(int argc, const char** argv, SDParams& params) {
                  invalid_arg = true;
                  break;
             }
+            // use last 2 values as last op holder
+            params.custom_sigmas.push_back((float)op);
+            params.custom_sigmas.push_back(parsed_sigma);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv);
