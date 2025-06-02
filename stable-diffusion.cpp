@@ -1205,7 +1205,7 @@ static std::vector<float> prepare_sigmas(
         if (u < target_len) {
             unsigned char op = custom_sigmas_arr[u];
             float last_parsed_sigma = custom_sigmas_arr[u + 1];
-            LOG_DEBUG("Custom sigmas count (%zu) is less than target steps + 1 (%zu). Propagading last operation (%c%f).", u, target_len, op, last_parsed_sigma);
+            LOG_DEBUG("Custom sigmas count (%zu) is less than target steps + 1 (%zu). Propagating last operation (%c%f).", u, target_len, op, last_parsed_sigma);
             sigmas_for_generation.resize(target_len, 0.0f);
             for (; u < target_len - 1; u++) { // last sigma will be zeroed anyway
                 switch(op) {
