@@ -179,6 +179,14 @@ public:
             LOG_WARN("Failed to initialize Vulkan backend");
         }
 #endif
+#ifdef SD_USE_OPENCL
+        LOG_DEBUG("Using OpenCL backend");
+        // ggml_log_set(ggml_log_callback_default, nullptr); // Optional ggml logs
+        backend = ggml_backend_opencl_init();
+        if (!backend) {
+            LOG_WARN("Failed to initialize OpenCL backend");
+        }
+#endif
 #ifdef SD_USE_SYCL
         LOG_DEBUG("Using SYCL backend");
         backend = ggml_backend_sycl_init(0);
@@ -314,7 +322,12 @@ public:
             clip_backend   = backend;
             bool use_t5xxl = false;
             if (sd_version_is_dit(version)) {
-                use_t5xxl = true;
+                for (auto pair : model_loader.tensor_storages_types) {
+                    if (pair.first.find("text_encoders.t5xxl") != std::string::npos) {
+                        use_t5xxl = true;
+                        break;
+                    }
+                }
             }
             if (!ggml_backend_is_cpu(backend) && use_t5xxl && conditioner_wtype != GGML_TYPE_F32) {
                 clip_on_cpu = true;

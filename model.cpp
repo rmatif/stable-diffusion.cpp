@@ -26,6 +26,10 @@
 #include "ggml-vulkan.h"
 #endif
 
+#ifdef SD_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
+
 #define ST_HEADER_SIZE_LEN 8
 
 uint64_t read_u64(uint8_t* buffer) {
@@ -1861,7 +1865,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, ggml_backend
                 }
             }
             int64_t t2 = ggml_time_ms();
-            pretty_progress(++tensor_count, processed_tensor_storages.size(), (t2 - t1) / 1000.0f);
+            //pretty_progress(++tensor_count, processed_tensor_storages.size(), (t2 - t1) / 1000.0f);
             t1 = t2;
         }
 
