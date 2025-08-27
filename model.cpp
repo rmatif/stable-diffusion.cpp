@@ -17,6 +17,7 @@
 #include "ggml.h"
 
 #include "stable-diffusion.h"
+#include "sd-mmap.h"
 
 #ifdef SD_USE_METAL
 #include "ggml-metal.h"
@@ -1023,8 +1024,18 @@ bool ModelLoader::init_from_file(const std::string& file_path, const std::string
 
 /*================================================= GGUFModelLoader ==================================================*/
 
+ModelLoader::ModelLoader() {
+    use_mmap_ = sd_mmap::SUPPORTED;
+}
+
 bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::string& prefix) {
     LOG_DEBUG("init from '%s'", file_path.c_str());
+    if (use_mmap_) {
+        LOG_DEBUG("mmap is supported");
+        auto file = std::make_unique<sd_file>(file_path.c_str(), "rb");
+        mmaps_[file_path] = std::make_unique<sd_mmap>(file.get());
+        files_[file_path] = std::move(file);
+    }
     file_paths_.push_back(file_path);
     size_t file_index = file_paths_.size() - 1;
 
@@ -1890,10 +1901,15 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, ggml_backend
         std::string file_path = file_paths_[file_index];
         LOG_DEBUG("loading tensors from %s", file_path.c_str());
 
-        std::ifstream file(file_path, std::ios::binary);
-        if (!file.is_open()) {
-            LOG_ERROR("failed to open '%s'", file_path.c_str());
-            return false;
+        bool use_mmap_for_this_file = use_mmap_ && mmaps_.count(file_path) > 0;
+
+        std::ifstream file;
+        if (!use_mmap_for_this_file) {
+            file.open(file_path, std::ios::binary);
+            if (!file.is_open()) {
+                LOG_ERROR("failed to open '%s'", file_path.c_str());
+                return false;
+            }
         }
 
         bool is_zip = false;
@@ -1932,11 +1948,15 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, ggml_backend
                 }
                 zip_entry_close(zip);
             } else {
-                file.seekg(tensor_storage.offset);
-                file.read(buf, n);
-                if (!file) {
-                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
-                    return false;
+                if (use_mmap_for_this_file) {
+                    memcpy(buf, (char*)mmaps_.at(file_path)->addr() + tensor_storage.offset, n);
+                } else {
+                    file.seekg(tensor_storage.offset);
+                    file.read(buf, n);
+                    if (!file) {
+                        LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                        return false;
+                    }
                 }
             }
             return true;

@@ -15,6 +15,7 @@
 #include "gguf.h"
 #include "json.hpp"
 #include "zip.h"
+#include "sd-mmap.h"
 
 #define SD_MAX_DIMS 5
 
@@ -210,8 +211,14 @@ typedef std::function<bool(const TensorStorage&, ggml_tensor**)> on_new_tensor_c
 typedef std::map<std::string, enum ggml_type> String2GGMLType;
 
 class ModelLoader {
+public:
+    ModelLoader();
+
 protected:
     std::vector<std::string> file_paths_;
+    std::map<std::string, std::unique_ptr<sd_file>> files_;
+    std::map<std::string, std::unique_ptr<sd_mmap>> mmaps_;
+    bool use_mmap_ = false;
     std::vector<TensorStorage> tensor_storages;
 
     bool parse_data_pkl(uint8_t* buffer,
