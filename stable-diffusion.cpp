@@ -246,21 +246,21 @@ public:
 
         if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
             LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
-            if (!model_loader.init_from_file(sd_ctx_params->model_path)) {
+            if (!model_loader.init_from_file(sd_ctx_params->model_path, "", n_threads)) {
                 LOG_ERROR("init model loader from file failed: '%s'", sd_ctx_params->model_path);
             }
         }
 
         if (strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) > 0) {
             LOG_INFO("loading diffusion model from '%s'", sd_ctx_params->diffusion_model_path);
-            if (!model_loader.init_from_file(sd_ctx_params->diffusion_model_path, "model.diffusion_model.")) {
+            if (!model_loader.init_from_file(sd_ctx_params->diffusion_model_path, "model.diffusion_model.", n_threads)) {
                 LOG_WARN("loading diffusion model from '%s' failed", sd_ctx_params->diffusion_model_path);
             }
         }
 
         if (strlen(SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path)) > 0) {
             LOG_INFO("loading high noise diffusion model from '%s'", sd_ctx_params->high_noise_diffusion_model_path);
-            if (!model_loader.init_from_file(sd_ctx_params->high_noise_diffusion_model_path, "model.high_noise_diffusion_model.")) {
+            if (!model_loader.init_from_file(sd_ctx_params->high_noise_diffusion_model_path, "model.high_noise_diffusion_model.", n_threads)) {
                 LOG_WARN("loading diffusion model from '%s' failed", sd_ctx_params->high_noise_diffusion_model_path);
             }
         }
@@ -270,7 +270,7 @@ public:
         if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
             LOG_INFO("loading clip_l from '%s'", sd_ctx_params->clip_l_path);
             std::string prefix = is_unet ? "cond_stage_model.transformer." : "text_encoders.clip_l.transformer.";
-            if (!model_loader.init_from_file(sd_ctx_params->clip_l_path, prefix)) {
+            if (!model_loader.init_from_file(sd_ctx_params->clip_l_path, prefix, n_threads)) {
                 LOG_WARN("loading clip_l from '%s' failed", sd_ctx_params->clip_l_path);
             }
         }
@@ -278,7 +278,7 @@ public:
         if (strlen(SAFE_STR(sd_ctx_params->clip_g_path)) > 0) {
             LOG_INFO("loading clip_g from '%s'", sd_ctx_params->clip_g_path);
             std::string prefix = is_unet ? "cond_stage_model.1.transformer." : "text_encoders.clip_g.transformer.";
-            if (!model_loader.init_from_file(sd_ctx_params->clip_g_path, prefix)) {
+            if (!model_loader.init_from_file(sd_ctx_params->clip_g_path, prefix, n_threads)) {
                 LOG_WARN("loading clip_g from '%s' failed", sd_ctx_params->clip_g_path);
             }
         }
@@ -286,14 +286,14 @@ public:
         if (strlen(SAFE_STR(sd_ctx_params->clip_vision_path)) > 0) {
             LOG_INFO("loading clip_vision from '%s'", sd_ctx_params->clip_vision_path);
             std::string prefix = "cond_stage_model.transformer.";
-            if (!model_loader.init_from_file(sd_ctx_params->clip_vision_path, prefix)) {
+            if (!model_loader.init_from_file(sd_ctx_params->clip_vision_path, prefix, n_threads)) {
                 LOG_WARN("loading clip_vision from '%s' failed", sd_ctx_params->clip_vision_path);
             }
         }
 
         if (strlen(SAFE_STR(sd_ctx_params->t5xxl_path)) > 0) {
             LOG_INFO("loading t5xxl from '%s'", sd_ctx_params->t5xxl_path);
-            if (!model_loader.init_from_file(sd_ctx_params->t5xxl_path, "text_encoders.t5xxl.transformer.")) {
+            if (!model_loader.init_from_file(sd_ctx_params->t5xxl_path, "text_encoders.t5xxl.transformer.", n_threads)) {
                 LOG_WARN("loading t5xxl from '%s' failed", sd_ctx_params->t5xxl_path);
             }
         }
@@ -314,7 +314,7 @@ public:
 
         if (strlen(SAFE_STR(sd_ctx_params->vae_path)) > 0) {
             LOG_INFO("loading vae from '%s'", sd_ctx_params->vae_path);
-            if (!model_loader.init_from_file(sd_ctx_params->vae_path, "vae.")) {
+            if (!model_loader.init_from_file(sd_ctx_params->vae_path, "vae.", n_threads)) {
                 LOG_WARN("loading vae from '%s' failed", sd_ctx_params->vae_path);
             }
         }
@@ -698,7 +698,10 @@ public:
                     return false;
                 }
                 LOG_INFO("loading stacked ID embedding (PHOTOMAKER) model file from '%s'", sd_ctx_params->photo_maker_path);
-                if (!model_loader.init_from_file_and_convert_name(sd_ctx_params->photo_maker_path, "pmid.")) {
+                if (!model_loader.init_from_file_and_convert_name(sd_ctx_params->photo_maker_path,
+                                                                  "pmid.",
+                                                                  VERSION_COUNT,
+                                                                  n_threads)) {
                     LOG_WARN("loading stacked ID embedding from '%s' failed", sd_ctx_params->photo_maker_path);
                 } else {
                     use_pmid = true;
