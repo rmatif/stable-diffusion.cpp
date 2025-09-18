@@ -297,15 +297,20 @@ protected:
 
     bool init_from_gguf_file(const std::string& file_path, const std::string& prefix = "");
     bool init_from_safetensors_file(const std::string& file_path, const std::string& prefix = "");
+    bool init_from_safetensors_file(const std::string& file_path, const std::string& prefix, int n_threads);
     bool init_from_ckpt_file(const std::string& file_path, const std::string& prefix = "");
     bool init_from_diffusers_file(const std::string& file_path, const std::string& prefix = "");
+    bool init_from_diffusers_file(const std::string& file_path, const std::string& prefix, int n_threads);
 
 public:
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
+    bool init_from_file(const std::string& file_path, const std::string& prefix, int n_threads);
+    bool model_is_unet();
     void convert_tensors_name();
     bool init_from_file_and_convert_name(const std::string& file_path,
                                          const std::string& prefix = "",
-                                         SDVersion version         = VERSION_COUNT);
+                                         SDVersion version         = VERSION_COUNT,
+                                         int n_threads             = 0);
     SDVersion get_sd_version();
     std::map<ggml_type, uint32_t> get_wtype_stat();
     std::map<ggml_type, uint32_t> get_conditioner_wtype_stat();
