@@ -56,7 +56,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> text_model2;
 
     std::string trigger_word = "img";  // should be user settable
-    std::map<std::string, std::string> embedding_map;
+    std::string embd_dir;
     int32_t num_custom_embeddings   = 0;
     int32_t num_custom_embeddings_2 = 0;
     std::vector<uint8_t> token_embed_custom;
@@ -65,17 +65,11 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
                                       bool offload_params_to_cpu,
                                       const String2TensorStorage& tensor_storage_map,
-                                      const std::map<std::string, std::string>& orig_embedding_map,
+                                      const std::string& embd_dir,
                                       SDVersion version = VERSION_SD1,
                                       PMVersion pv      = PM_VERSION_1)
-        : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407) {
-        for (const auto& kv : orig_embedding_map) {
-            std::string name = kv.first;
-            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
-            embedding_map[name] = kv.second;
-            tokenizer.add_special_token(name);
-        }
-        bool force_clip_f32 = !embedding_map.empty();
+        : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407), embd_dir(embd_dir) {
+        bool force_clip_f32 = true;
         if (sd_version_is_sd1(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
         } else if (sd_version_is_sd2(version)) {
@@ -84,6 +78,29 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             text_model  = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, force_clip_f32);
             text_model2 = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.1.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false, force_clip_f32);
         }
+    }
+
+    std::string resolve_embedding_path(const std::string& embd_name) {
+        bool is_path = contains(embd_name, "/") || contains(embd_name, "\\");
+        if (is_path) {
+            if (file_exists(embd_name)) {
+                return embd_name;
+            } else if (file_exists(embd_name + ".safetensors")) {
+                return embd_name + ".safetensors";
+            } else if (file_exists(embd_name + ".pt")) {
+                return embd_name + ".pt";
+            } else if (file_exists(embd_name + ".ckpt")) {
+                return embd_name + ".ckpt";
+            }
+        } else {
+            std::string path = get_full_path(embd_dir, embd_name + ".pt");
+            if (path.size() > 0) return path;
+            path = get_full_path(embd_dir, embd_name + ".ckpt");
+            if (path.size() > 0) return path;
+            path = get_full_path(embd_dir, embd_name + ".safetensors");
+            if (path.size() > 0) return path;
+        }
+        return "";
     }
 
     void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors) override {
@@ -209,13 +226,62 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     }
 
     std::vector<int> convert_token_to_id(std::string text) {
+        size_t search_pos = 0;
         auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
-            auto iter = embedding_map.find(str);
-            if (iter == embedding_map.end()) {
-                return false;
+            std::string token_str;
+            size_t consumed_len = 0;
+            bool is_embed_tag = false;
+
+            std::string trimmed_str = trim(str);
+            size_t leading_spaces = str.length() - trimmed_str.length();
+
+            if (starts_with(trimmed_str, "<embed:")) {
+                size_t tag_end = trimmed_str.find(">");
+                if (tag_end == std::string::npos) {
+                    return false;
+                }
+                std::string lower_tag = trimmed_str.substr(0, tag_end + 1);
+                token_str = lower_tag;
+                if (text.length() >= lower_tag.length()) {
+                    for (size_t i = search_pos; i <= text.length() - lower_tag.length(); ++i) {
+                        bool match = true;
+                        for (size_t j = 0; j < lower_tag.length(); ++j) {
+                            if (std::tolower(text[i + j]) != lower_tag[j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            token_str = text.substr(i, lower_tag.length());
+                            search_pos = i + token_str.length();
+                            break;
+                        }
+                    }
+                }
+                consumed_len = leading_spaces + token_str.length();
+                is_embed_tag = true;
+            } else {
+                size_t first_delim = trimmed_str.find_first_of(" ,");
+                token_str = (first_delim == std::string::npos) ? trimmed_str : trimmed_str.substr(0, first_delim);
+                consumed_len = leading_spaces + token_str.length();
             }
-            std::string embedding_path = iter->second;
-            if (load_embedding(str, embedding_path, bpe_tokens)) {
+
+            std::string embd_name = trim(token_str);
+            if (is_embed_tag) {
+                embd_name = embd_name.substr(strlen("<embed:"), embd_name.length() - strlen("<embed:") - 1);
+            }
+
+            std::string embd_path = resolve_embedding_path(embd_name);
+            if (embd_path.size() > 0) {
+                if (load_embedding(embd_name, embd_path, bpe_tokens)) {
+                    str = str.substr(consumed_len);
+                    return true;
+                }
+            }
+
+            if (is_embed_tag) {
+                LOG_WARN("could not load embedding '%s'", embd_name.c_str());
+                str = str.substr(consumed_len);
                 return true;
             }
             return false;
@@ -246,18 +312,6 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             LOG_DEBUG("parse '%s' to %s", text.c_str(), ss.str().c_str());
         }
 
-        auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
-            auto iter = embedding_map.find(str);
-            if (iter == embedding_map.end()) {
-                return false;
-            }
-            std::string embedding_path = iter->second;
-            if (load_embedding(str, embedding_path, bpe_tokens)) {
-                return true;
-            }
-            return false;
-        };
-
         std::vector<int> tokens;
         std::vector<float> weights;
         std::vector<bool> class_token_mask;
@@ -267,7 +321,68 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             std::vector<int> clean_input_ids;
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
-            // printf(" %s: %f \n", curr_text.c_str(), curr_weight);
+            size_t search_pos = 0;
+
+            auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
+                std::string token_str;
+                size_t consumed_len = 0;
+                bool is_embed_tag = false;
+
+                std::string trimmed_str = trim(str);
+                size_t leading_spaces = str.length() - trimmed_str.length();
+
+                if (starts_with(trimmed_str, "<embed:")) {
+                    size_t tag_end = trimmed_str.find(">");
+                    if (tag_end == std::string::npos) {
+                        return false;
+                    }
+                    std::string lower_tag = trimmed_str.substr(0, tag_end + 1);
+                    token_str = lower_tag;
+                    if (curr_text.length() >= lower_tag.length()) {
+                        for (size_t i = search_pos; i <= curr_text.length() - lower_tag.length(); ++i) {
+                            bool match = true;
+                            for (size_t j = 0; j < lower_tag.length(); ++j) {
+                                if (std::tolower(curr_text[i + j]) != lower_tag[j]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                token_str = curr_text.substr(i, lower_tag.length());
+                                search_pos = i + token_str.length();
+                                break;
+                            }
+                        }
+                    }
+                    consumed_len = leading_spaces + token_str.length();
+                    is_embed_tag = true;
+                } else {
+                    size_t first_delim = trimmed_str.find_first_of(" ,");
+                    token_str = (first_delim == std::string::npos) ? trimmed_str : trimmed_str.substr(0, first_delim);
+                    consumed_len = leading_spaces + token_str.length();
+                }
+
+                std::string embd_name = trim(token_str);
+                if (is_embed_tag) {
+                    embd_name = embd_name.substr(strlen("<embed:"), embd_name.length() - strlen("<embed:") - 1);
+                }
+
+                std::string embd_path = resolve_embedding_path(embd_name);
+                if (embd_path.size() > 0) {
+                    if (load_embedding(embd_name, embd_path, bpe_tokens)) {
+                        str = str.substr(consumed_len);
+                        return true;
+                    }
+                }
+
+                if (is_embed_tag) {
+                    LOG_WARN("could not load embedding '%s'", embd_name.c_str());
+                    str = str.substr(consumed_len);
+                    return true;
+                }
+                return false;
+            };
+
             int32_t clean_index = 0;
             if (curr_text == "BREAK" && curr_weight == -1.0f) {
                 // Pad token array up to chunk size at this point.
@@ -365,37 +480,82 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             LOG_DEBUG("parse '%s' to %s", text.c_str(), ss.str().c_str());
         }
 
-        auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
-            auto iter = embedding_map.find(str);
-            if (iter == embedding_map.end()) {
-                return false;
-            }
-            std::string embedding_path = iter->second;
-            if (load_embedding(str, embedding_path, bpe_tokens)) {
-                return true;
-            }
-            return false;
-        };
-
         std::vector<int> tokens;
         std::vector<float> weights;
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
+            size_t search_pos = 0;
+
+            auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
+                std::string token_str;
+                size_t consumed_len = 0;
+                bool is_embed_tag = false;
+
+                std::string trimmed_str = trim(str);
+                size_t leading_spaces = str.length() - trimmed_str.length();
+
+                if (starts_with(trimmed_str, "<embed:")) {
+                    size_t tag_end = trimmed_str.find(">");
+                    if (tag_end == std::string::npos) {
+                        return false;
+                    }
+                    std::string lower_tag = trimmed_str.substr(0, tag_end + 1);
+                    token_str = lower_tag;
+                    if (curr_text.length() >= lower_tag.length()) {
+                        for (size_t i = search_pos; i <= curr_text.length() - lower_tag.length(); ++i) {
+                            bool match = true;
+                            for (size_t j = 0; j < lower_tag.length(); ++j) {
+                                if (std::tolower(curr_text[i + j]) != lower_tag[j]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                token_str = curr_text.substr(i, lower_tag.length());
+                                search_pos = i + token_str.length();
+                                break;
+                            }
+                        }
+                    }
+                    consumed_len = leading_spaces + token_str.length();
+                    is_embed_tag = true;
+                } else {
+                    size_t first_delim = trimmed_str.find_first_of(" ,");
+                    token_str = (first_delim == std::string::npos) ? trimmed_str : trimmed_str.substr(0, first_delim);
+                    consumed_len = leading_spaces + token_str.length();
+                }
+
+                std::string embd_name = trim(token_str);
+                if (is_embed_tag) {
+                    embd_name = embd_name.substr(strlen("<embed:"), embd_name.length() - strlen("<embed:") - 1);
+                }
+
+                std::string embd_path = resolve_embedding_path(embd_name);
+                if (embd_path.size() > 0) {
+                    if (load_embedding(embd_name, embd_path, bpe_tokens)) {
+                        str = str.substr(consumed_len);
+                        return true;
+                    }
+                }
+
+                if (is_embed_tag) {
+                    LOG_WARN("could not load embedding '%s'", embd_name.c_str());
+                    str = str.substr(consumed_len);
+                    return true;
+                }
+                return false;
+            };
 
             if (curr_text == "BREAK" && curr_weight == -1.0f) {
-                // Pad token array up to chunk size at this point.
-                // TODO: This is a hardcoded chunk_len, like in stable-diffusion.cpp, make it a parameter for the future?
-                // Also, this is 75 instead of 77 to leave room for BOS and EOS tokens.
                 size_t current_size = tokens.size();
-                size_t padding_size = (75 - (current_size % 75)) % 75;  // Ensure no negative padding
-
+                size_t padding_size = (75 - (current_size % 75)) % 75;
                 if (padding_size > 0) {
                     LOG_DEBUG("BREAK token encountered, padding current chunk by %zu tokens.", padding_size);
                     tokens.insert(tokens.end(), padding_size, tokenizer.EOS_TOKEN_ID);
                     weights.insert(weights.end(), padding_size, 1.0f);
                 }
-                continue;  // Skip to the next item after handling BREAK
+                continue;
             }
 
             std::vector<int> curr_tokens = tokenizer.encode(curr_text, on_new_token_cb);

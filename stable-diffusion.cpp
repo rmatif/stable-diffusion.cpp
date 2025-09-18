@@ -994,17 +994,44 @@ public:
                                                          float multiplier,
                                                          ggml_backend_t backend,
                                                          LoraModel::filter_t lora_tensor_filter = nullptr) {
-        std::string lora_path             = lora_id;
+        std::string lora_name             = lora_id;
         static std::string high_noise_tag = "|high_noise|";
         bool is_high_noise                = false;
-        if (starts_with(lora_path, high_noise_tag)) {
-            lora_path     = lora_path.substr(high_noise_tag.size());
+        if (starts_with(lora_name, high_noise_tag)) {
+            lora_name     = lora_name.substr(high_noise_tag.size());
             is_high_noise = true;
-            LOG_DEBUG("high noise lora: %s", lora_path.c_str());
+            LOG_DEBUG("high noise lora: %s", lora_name.c_str());
         }
-        auto lora = std::make_shared<LoraModel>(lora_id, backend, lora_path, is_high_noise ? "model.high_noise_" : "", version);
+        std::string st_file_path;
+        std::string ckpt_file_path;
+        std::string file_path;
+        bool is_path = contains(lora_name, "/") || contains(lora_name, "\\");
+
+        if (is_path) {
+            st_file_path   = lora_name + ".safetensors";
+            ckpt_file_path = lora_name + ".ckpt";
+        } else {
+            st_file_path   = path_join(lora_model_dir, lora_name + ".safetensors");
+            ckpt_file_path = path_join(lora_model_dir, lora_name + ".ckpt");
+        }
+
+        if (is_path && file_exists(lora_name)) {
+            file_path = lora_name;
+        } else if (file_exists(st_file_path)) {
+            file_path = st_file_path;
+        } else if (file_exists(ckpt_file_path)) {
+            file_path = ckpt_file_path;
+        } else {
+            if (is_path) {
+                LOG_WARN("can not find lora file %s, %s or %s", lora_name.c_str(), st_file_path.c_str(), ckpt_file_path.c_str());
+            } else {
+                LOG_WARN("can not find %s or %s for lora %s", st_file_path.c_str(), ckpt_file_path.c_str(), lora_name.c_str());
+            }
+            return nullptr;
+        }
+        auto lora = std::make_shared<LoraModel>(lora_id, backend, file_path, is_high_noise ? "model.high_noise_" : "", version);
         if (!lora->load_from_file(n_threads, lora_tensor_filter)) {
-            LOG_WARN("load lora tensors from %s failed", lora_path.c_str());
+            LOG_WARN("load lora tensors from %s failed", file_path.c_str());
             return nullptr;
         }
 
