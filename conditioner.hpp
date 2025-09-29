@@ -192,8 +192,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         int pos_start = num_custom_embeddings;
         if (embd) {
             int64_t hidden_size = text_model->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
+            token_embed_custom_1.resize(token_embed_custom_1.size() + ggml_nbytes(embd));
+            memcpy((void*)(token_embed_custom_1.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
                    embd->data,
                    ggml_nbytes(embd));
             for (int i = 0; i < embd->ne[1]; i++) {
@@ -205,8 +205,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         }
         if (embd2) {
             int64_t hidden_size = text_model2->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd2));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
+            token_embed_custom_2.resize(token_embed_custom_2.size() + ggml_nbytes(embd2));
+            memcpy((void*)(token_embed_custom_2.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
                    embd2->data,
                    ggml_nbytes(embd2));
             for (int i = 0; i < embd2->ne[1]; i++) {
@@ -633,7 +633,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                 text_model->compute(n_threads,
                                     input_ids,
                                     num_custom_embeddings,
-                                    token_embed_custom.data(),
+                                    token_embed_custom_1.data(),
                                     max_token_idx,
                                     false,
                                     clip_skip,
@@ -643,7 +643,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                     text_model2->compute(n_threads,
                                          input_ids2,
                                          num_custom_embeddings,
-                                         token_embed_custom.data(),
+                                         token_embed_custom_2.data(),
                                          max_token_idx,
                                          false,
                                          clip_skip,
@@ -655,7 +655,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                         text_model2->compute(n_threads,
                                              input_ids2,
                                              num_custom_embeddings,
-                                             token_embed_custom.data(),
+                                             token_embed_custom_2.data(),
                                              max_token_idx,
                                              true,
                                              clip_skip,
