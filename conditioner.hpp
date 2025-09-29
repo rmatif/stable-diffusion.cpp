@@ -53,7 +53,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::string embd_dir;
     int32_t num_custom_embeddings   = 0;
     int32_t num_custom_embeddings_2 = 0;
-    std::vector<uint8_t> token_embed_custom;
+    std::vector<uint8_t> token_embed_custom_1;
+    std::vector<uint8_t> token_embed_custom_2;    
     std::vector<std::string> readed_embeddings;
 
     FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
@@ -63,7 +64,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                       SDVersion version = VERSION_SD1,
                                       PMVersion pv      = PM_VERSION_1)
         : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407), embd_dir(embd_dir) {
-        bool force_clip_f32 = embd_dir.size() > 0;
+        bool force_clip_f32 = true;
         if (sd_version_is_sd1(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_types, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
         } else if (sd_version_is_sd2(version)) {
@@ -145,8 +146,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         readed_embeddings.push_back(embd_name);
         if (embd) {
             int64_t hidden_size = text_model->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
+            token_embed_custom_1.resize(token_embed_custom_1.size() + ggml_nbytes(embd));
+            memcpy((void*)(token_embed_custom_1.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
                    embd->data,
                    ggml_nbytes(embd));
             for (int i = 0; i < embd->ne[1]; i++) {
@@ -158,8 +159,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         }
         if (embd2) {
             int64_t hidden_size = text_model2->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd2));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
+            token_embed_custom_2.resize(token_embed_custom_2.size() + ggml_nbytes(embd2));
+            memcpy((void*)(token_embed_custom_2.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
                    embd2->data,
                    ggml_nbytes(embd2));
             for (int i = 0; i < embd2->ne[1]; i++) {
@@ -631,7 +632,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                 text_model->compute(n_threads,
                                     input_ids,
                                     num_custom_embeddings,
-                                    token_embed_custom.data(),
+                                    token_embed_custom_1.data(),
                                     max_token_idx,
                                     false,
                                     clip_skip,
@@ -641,7 +642,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                     text_model2->compute(n_threads,
                                          input_ids2,
                                          num_custom_embeddings,
-                                         token_embed_custom.data(),
+                                         token_embed_custom_2.data(),
                                          max_token_idx,
                                          false,
                                          clip_skip,
@@ -653,7 +654,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                         text_model2->compute(n_threads,
                                              input_ids2,
                                              num_custom_embeddings,
-                                             token_embed_custom.data(),
+                                             token_embed_custom_2.data(),
                                              max_token_idx,
                                              true,
                                              clip_skip,
