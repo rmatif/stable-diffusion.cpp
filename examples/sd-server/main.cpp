@@ -394,9 +394,9 @@ struct GenerationRequest {
     scheduler_t scheduler = DEFAULT;
     int batch_count = 1;
     int64_t seed = -1;
-    bool normalize_input = false;
     float eta = 0.0f;
     bool has_eta = false;
+    int shifted_timestep = 0;
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0.0f, 0.0f};
     bool has_vae_tiling_override = false;
 };
@@ -700,6 +700,25 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         request.has_eta = true;
     }
 
+    auto shift_it = body.find("timestep_shift");
+    const char* shift_field_name = "timestep_shift";
+    if (shift_it == body.end()) {
+        shift_it = body.find("shifted_timestep");
+        shift_field_name = "shifted_timestep";
+    }
+    if (shift_it != body.end()) {
+        if (!shift_it->is_number_integer()) {
+            error = std::string("field '") + shift_field_name + "' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(shift_it->get<int64_t>());
+        if (value < 0 || value > 1000) {
+            error = std::string("field '") + shift_field_name + "' must be between 0 and 1000";
+            return false;
+        }
+        request.shifted_timestep = value;
+    }
+
     auto batch_it = body.find("batch_count");
     if (batch_it != body.end()) {
         if (!batch_it->is_number_integer()) {
@@ -720,15 +739,6 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         request.seed = seed_it->get<int64_t>();
-    }
-
-    auto norm_it = body.find("normalize_input");
-    if (norm_it != body.end()) {
-        if (!norm_it->is_boolean()) {
-            error = "field 'normalize_input' must be a boolean";
-            return false;
-        }
-        request.normalize_input = norm_it->get<bool>();
     }
 
     auto method_it = body.find("sample_method");
@@ -1056,7 +1066,6 @@ int main(int argc, char** argv) {
         img_params.height           = request_params.height;
         img_params.batch_count      = request_params.batch_count;
         img_params.seed             = effective_seed;
-        img_params.normalize_input  = request_params.normalize_input;
         if (request_params.has_vae_tiling_override) {
             img_params.vae_tiling_params = request_params.vae_tiling_params;
         }
@@ -1082,6 +1091,7 @@ int main(int argc, char** argv) {
         if (request_params.has_eta) {
             sample_params.eta = request_params.eta;
         }
+        sample_params.shifted_timestep = request_params.shifted_timestep;
 
         auto start_time = std::chrono::steady_clock::now();
         sd_image_t* results = generate_image(state.ctx, &img_params);
