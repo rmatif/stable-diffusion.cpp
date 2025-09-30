@@ -940,13 +940,30 @@ public:
 
             auto comp_vis_denoiser = std::dynamic_pointer_cast<CompVisDenoiser>(denoiser);
             if (comp_vis_denoiser) {
+                float* alphas_ptr = (float*)alphas_cumprod_tensor->data;
+                bool needs_regen  = false;
+
+                for (int i = 0; i < TIMESTEPS; ++i) {
+                    float alpha = alphas_ptr[i];
+                    if (!std::isfinite(alpha) || alpha <= 0.0f || alpha >= 1.0f) {
+                        needs_regen = true;
+                        break;
+                    }
+                }
+
+                if (needs_regen) {
+                    calculate_alphas_cumprod(alphas_ptr);
+                }
+
                 for (int i = 0; i < TIMESTEPS; i++) {
-                    comp_vis_denoiser->sigmas[i]     = std::sqrt((1 - ((float*)alphas_cumprod_tensor->data)[i]) / ((float*)alphas_cumprod_tensor->data)[i]);
+                    float alpha = std::min(std::max(alphas_ptr[i], 1e-12f), 1.0f - 1e-12f);
+                    comp_vis_denoiser->sigmas[i]     = std::sqrt((1.0f - alpha) / alpha);
                     comp_vis_denoiser->log_sigmas[i] = std::log(comp_vis_denoiser->sigmas[i]);
                 }
             }
         }
 
+        LOG_DEBUG("finished loaded file");
         ggml_free(ctx);
         use_tiny_autoencoder = use_tiny_autoencoder && !sd_ctx_params->tae_preview_only;
         return true;
