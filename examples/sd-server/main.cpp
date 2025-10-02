@@ -4,10 +4,17 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -851,6 +858,721 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
 
     return true;
 }
+
+std::optional<double> parse_duration_token_ms(const std::string& text) {
+    std::size_t i = 0;
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) {
+        ++i;
+    }
+    std::size_t start = i;
+    bool has_digit = false;
+    while (i < text.size() && (std::isdigit(static_cast<unsigned char>(text[i])) || text[i] == '.')) {
+        has_digit = true;
+        ++i;
+    }
+    if (!has_digit) {
+        return std::nullopt;
+    }
+    double value = std::stod(text.substr(start, i - start));
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) {
+        ++i;
+    }
+    if (i >= text.size()) {
+        return std::nullopt;
+    }
+    if (text.compare(i, 2, "ms") == 0) {
+        return value;
+    }
+    if (text[i] == 's') {
+        return value * 1000.0;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> extract_duration_ms(const std::string& message) {
+    const std::string taking_marker = "taking ";
+    auto taking_pos = message.find(taking_marker);
+    if (taking_pos != std::string::npos) {
+        auto value = parse_duration_token_ms(message.substr(taking_pos + taking_marker.size()));
+        if (value) {
+            return value;
+        }
+    }
+    const std::string completed_in_marker = "completed in ";
+    auto completed_in_pos = message.find(completed_in_marker);
+    if (completed_in_pos != std::string::npos) {
+        auto value = parse_duration_token_ms(message.substr(completed_in_pos + completed_in_marker.size()));
+        if (value) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, double> extract_duration_breakdown_ms(const std::string& message) {
+    std::map<std::string, double> breakdown;
+    auto open = message.find('(');
+    auto close = message.find(')', open);
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+        return breakdown;
+    }
+    std::string inside = message.substr(open + 1, close - open - 1);
+    std::stringstream ss(inside);
+    std::string part;
+    while (std::getline(ss, part, ',')) {
+        part = trim_copy(part);
+        if (part.empty()) {
+            continue;
+        }
+        auto colon = part.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        std::string key = trim_copy(part.substr(0, colon));
+        std::string value_text = trim_copy(part.substr(colon + 1));
+        auto value = parse_duration_token_ms(value_text);
+        if (value) {
+            breakdown[key] = *value;
+        }
+    }
+    return breakdown;
+}
+
+std::string normalize_path_for_compare(const std::string& path) {
+    std::string normalized = to_lower_copy(path);
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    return normalized;
+}
+
+std::string path_stem(const std::string& path) {
+    std::size_t pos = path.find_last_of("/\\");
+    std::string basename = (pos == std::string::npos) ? path : path.substr(pos + 1);
+    std::size_t dot = basename.find_last_of('.');
+    if (dot == std::string::npos) {
+        return basename;
+    }
+    return basename.substr(0, dot);
+}
+
+json breakdown_to_json(const std::map<std::string, double>& breakdown) {
+    json result = json::object();
+    for (const auto& kv : breakdown) {
+        result[kv.first + "_ms"] = kv.second;
+    }
+    return result;
+}
+
+json make_telemetry(const LogCollector& collector,
+                    const GenerationRequest& request,
+                    const CtxConfig& config,
+                    int64_t elapsed_ms,
+                    int64_t effective_seed) {
+    struct LoraData {
+        std::string primary_path;
+        std::vector<std::string> load_paths;
+        std::vector<double> load_ms;
+        std::vector<std::map<std::string, double>> breakdowns;
+        double applied_ms = 0.0;
+        bool applied_recorded = false;
+    };
+
+    struct EmbeddingData {
+        std::string primary_path;
+        std::vector<std::string> load_paths;
+        std::vector<double> load_ms;
+        std::vector<std::map<std::string, double>> breakdowns;
+        int custom_embedding_count = -1;
+    };
+
+    std::map<std::string, LoraData> lora_map;
+    std::vector<std::string> lora_order;
+    std::map<std::string, EmbeddingData> embedding_map;
+    std::vector<std::string> embedding_order;
+    std::set<std::string> embedding_paths;
+    std::set<std::string> embedding_compare_paths;
+    std::deque<std::string> pending_tensor_sources;
+    std::optional<json> model_summary;
+
+    std::vector<double> condition_graph_ms;
+    std::vector<double> learned_condition_ms;
+    std::vector<double> sampling_ms;
+    struct VaeTiming {
+        int latent_index = 0;
+        double duration_ms = 0.0;
+    };
+    std::vector<VaeTiming> vae_timings;
+    std::optional<double> generate_image_ms;
+
+    struct SpanRecord {
+        std::string span_id;
+        std::string parent_span_id;
+        std::string name;
+        std::string kind;
+        double duration_ms = 0.0;
+        json attributes;
+        std::vector<SpanRecord> subspans;
+    };
+
+    const std::string root_span_id = "span-0";
+    int span_counter = 1;
+    SpanRecord root_span;
+    root_span.span_id = root_span_id;
+    root_span.kind = "INTERNAL";
+    root_span.duration_ms = static_cast<double>(elapsed_ms);
+
+    auto next_span_id = [&]() {
+        return "span-" + std::to_string(span_counter++);
+    };
+
+    auto add_subspan = [&](SpanRecord& parent, const std::string& name, const std::optional<double>& duration, json attributes) -> SpanRecord* {
+        if (!duration) {
+            return nullptr;
+        }
+        SpanRecord record;
+        record.span_id = next_span_id();
+        record.parent_span_id = parent.span_id;
+        record.name = name;
+        record.kind = "INTERNAL";
+        record.duration_ms = *duration;
+        record.attributes = std::move(attributes);
+        parent.subspans.push_back(std::move(record));
+        return &parent.subspans.back();
+    };
+
+    const std::string model_compare_path = config.model_path.empty() ? std::string() : normalize_path_for_compare(config.model_path);
+
+    for (const auto& entry : collector.entries) {
+        const std::string& message = entry.message;
+
+        const std::string embed_tag = "<embed:";
+        std::size_t embed_search_pos = 0;
+        while (true) {
+            std::size_t tag_pos = message.find(embed_tag, embed_search_pos);
+            if (tag_pos == std::string::npos) {
+                break;
+            }
+            std::size_t path_start = tag_pos + embed_tag.size();
+            std::size_t path_end = message.find(">", path_start);
+            if (path_end == std::string::npos) {
+                break;
+            }
+            std::string embed_token = trim_copy(message.substr(path_start, path_end - path_start));
+            if (!embed_token.empty()) {
+                std::size_t weight_sep = embed_token.find(":");
+                if (weight_sep != std::string::npos) {
+                    std::string tail = embed_token.substr(weight_sep + 1);
+                    if (tail.find('/') == std::string::npos && tail.find('\\') == std::string::npos) {
+                        embed_token = embed_token.substr(0, weight_sep);
+                    }
+                }
+                bool looks_like_path = embed_token.find('/') != std::string::npos || embed_token.find('\\') != std::string::npos;
+                if (looks_like_path) {
+                    std::string normalized_embed = normalize_path_for_compare(embed_token);
+                    if (!normalized_embed.empty()) {
+                        embedding_compare_paths.insert(normalized_embed);
+                    }
+                    embedding_paths.insert(embed_token);
+                }
+            }
+            embed_search_pos = path_end + 1;
+        }
+
+        const std::string loading_from_marker = "loading tensors from ";
+        auto from_pos = message.find(loading_from_marker);
+        if (from_pos != std::string::npos) {
+            std::string path = trim_copy(message.substr(from_pos + loading_from_marker.size()));
+            if (!path.empty()) {
+                pending_tensor_sources.push_back(path);
+            }
+            continue;
+        }
+
+        if (message.find("loading tensors completed") != std::string::npos) {
+            auto duration = extract_duration_ms(message);
+            std::string path;
+            if (!pending_tensor_sources.empty()) {
+                path = pending_tensor_sources.front();
+                pending_tensor_sources.pop_front();
+            }
+            auto breakdown = extract_duration_breakdown_ms(message);
+
+            std::string normalized_path;
+            bool is_model = false;
+            bool is_lora = false;
+            bool is_embedding = false;
+            if (!path.empty()) {
+                normalized_path = normalize_path_for_compare(path);
+                if (!model_compare_path.empty() && normalized_path == model_compare_path) {
+                    is_model = true;
+                }
+                if (!normalized_path.empty() && embedding_compare_paths.find(normalized_path) != embedding_compare_paths.end()) {
+                    is_embedding = true;
+                }
+                if (!is_embedding && embedding_paths.find(path) != embedding_paths.end()) {
+                    is_embedding = true;
+                }
+                std::string lowered_path = to_lower_copy(path);
+                if (lowered_path.find("lora") != std::string::npos) {
+                    is_lora = true;
+                }
+                if (is_embedding) {
+                    is_lora = false;
+                }
+            }
+
+            json attributes = json::object();
+            if (duration) {
+                attributes["duration.ms"] = *duration;
+            }
+            if (!path.empty()) {
+                attributes["gen_ai.artifact.path"] = path;
+            }
+
+            std::string span_name = "gen_ai.artifact.load";
+            if (is_lora) {
+                std::string lora_id = path_stem(path);
+                auto it = lora_map.find(lora_id);
+                if (it == lora_map.end()) {
+                    lora_order.push_back(lora_id);
+                }
+                LoraData& data = lora_map[lora_id];
+                if (data.primary_path.empty()) {
+                    data.primary_path = path;
+                }
+                data.load_paths.push_back(path);
+                data.load_ms.push_back(duration.value_or(0.0));
+                data.breakdowns.push_back(breakdown);
+
+                attributes["gen_ai.artifact.id"] = lora_id;
+                attributes["gen_ai.artifact.type"] = "lora";
+                attributes["gen_ai.operation.stage"] = "lora.load";
+                attributes["sdcpp.lora.phase_index"] = static_cast<int>(data.load_ms.size()) - 1;
+                if (data.load_ms.size() == 1) {
+                    attributes["sdcpp.lora.phase"] = "prefetch";
+                } else if (data.load_ms.size() == 2) {
+                    attributes["sdcpp.lora.phase"] = "load";
+                } else {
+                    attributes["sdcpp.lora.phase"] = "load_extra";
+                }
+                span_name = "gen_ai.artifact.lora.load";
+            } else if (is_embedding) {
+                std::string embedding_id = path_stem(path);
+                auto it = embedding_map.find(embedding_id);
+                if (it == embedding_map.end()) {
+                    embedding_order.push_back(embedding_id);
+                }
+                EmbeddingData& data = embedding_map[embedding_id];
+                if (data.primary_path.empty()) {
+                    data.primary_path = path;
+                }
+                data.load_paths.push_back(path);
+                data.load_ms.push_back(duration.value_or(0.0));
+                data.breakdowns.push_back(breakdown);
+                if (!normalized_path.empty()) {
+                    embedding_compare_paths.insert(normalized_path);
+                }
+                if (!path.empty()) {
+                    embedding_paths.insert(path);
+                }
+
+                attributes["gen_ai.artifact.id"] = embedding_id;
+                attributes["gen_ai.artifact.type"] = "embedding";
+                attributes["gen_ai.operation.stage"] = "embedding.load";
+                attributes["sdcpp.embedding.phase_index"] = static_cast<int>(data.load_ms.size()) - 1;
+                attributes["sdcpp.embedding.phase"] = "load";
+                span_name = "gen_ai.artifact.embedding.load";
+            } else if (is_model) {
+                attributes["gen_ai.operation.stage"] = "model.load";
+                span_name = "gen_ai.model.load";
+                if (duration) {
+                    json model = json::object();
+                    model["path"] = path;
+                    model["duration_ms"] = *duration;
+                    json breakdown_json = breakdown_to_json(breakdown);
+                    if (!breakdown_json.empty()) {
+                        model["breakdown_ms"] = breakdown_json;
+                    }
+                    model_summary = model;
+                }
+            } else {
+                attributes["gen_ai.operation.stage"] = "artifact.load";
+            }
+
+            json breakdown_json = breakdown_to_json(breakdown);
+            if (!breakdown_json.empty()) {
+                attributes["sdcpp.stage.breakdown_ms"] = breakdown_json;
+            }
+
+            add_subspan(root_span, span_name, duration, std::move(attributes));
+            continue;
+        }
+        const std::string lora_marker = "lora '";
+        auto lora_pos = message.find(lora_marker);
+        if (lora_pos != std::string::npos && message.find(" applied") != std::string::npos) {
+            std::size_t id_start = lora_pos + lora_marker.size();
+            std::size_t id_end = message.find("'", id_start);
+            if (id_end != std::string::npos) {
+                std::string lora_id = message.substr(id_start, id_end - id_start);
+                auto duration = extract_duration_ms(message);
+                if (duration) {
+                    auto it = lora_map.find(lora_id);
+                    if (it == lora_map.end()) {
+                        lora_order.push_back(lora_id);
+                    }
+                    LoraData& data = lora_map[lora_id];
+                    data.applied_ms = *duration;
+                    data.applied_recorded = true;
+
+                    double load_total = std::accumulate(data.load_ms.begin(), data.load_ms.end(), 0.0);
+                    double compute_ms = *duration - load_total;
+
+                    json attributes = json::object();
+                    attributes["gen_ai.artifact.id"] = lora_id;
+                    attributes["gen_ai.artifact.type"] = "lora";
+                    attributes["duration.ms"] = *duration;
+                    attributes["gen_ai.operation.stage"] = "lora.apply";
+                    attributes["sdcpp.lora.load_total_ms"] = load_total;
+                    attributes["sdcpp.lora.compute_ms"] = compute_ms;
+                    if (!data.primary_path.empty()) {
+                        attributes["gen_ai.artifact.path"] = data.primary_path;
+                    }
+
+                    add_subspan(root_span, "gen_ai.artifact.lora.apply", duration, std::move(attributes));
+                }
+            }
+            continue;
+        }
+
+        const std::string embedding_marker = "embedding '";
+        auto embedding_pos = message.find(embedding_marker);
+        if (embedding_pos != std::string::npos && message.find(" applied") != std::string::npos) {
+            std::size_t path_start = embedding_pos + embedding_marker.size();
+            std::size_t path_end = message.find("'", path_start);
+            if (path_end != std::string::npos) {
+                std::string embedding_path = message.substr(path_start, path_end - path_start);
+                std::string normalized_embedding = normalize_path_for_compare(embedding_path);
+                if (!embedding_path.empty()) {
+                    embedding_paths.insert(embedding_path);
+                }
+                if (!normalized_embedding.empty()) {
+                    embedding_compare_paths.insert(normalized_embedding);
+                }
+                std::string embedding_id = path_stem(embedding_path);
+                auto it = embedding_map.find(embedding_id);
+                if (it == embedding_map.end()) {
+                    embedding_order.push_back(embedding_id);
+                }
+                EmbeddingData& data = embedding_map[embedding_id];
+                if (data.primary_path.empty()) {
+                    data.primary_path = embedding_path;
+                }
+                const std::string custom_marker = "custom embeddings:";
+                auto custom_pos = message.find(custom_marker, path_end);
+                if (custom_pos != std::string::npos) {
+                    std::string count_text = trim_copy(message.substr(custom_pos + custom_marker.size()));
+                    try {
+                        data.custom_embedding_count = std::stoi(count_text);
+                    } catch (const std::exception&) {
+                        // ignore parse errors
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (message.find("computing condition graph completed") != std::string::npos) {
+            auto duration = extract_duration_ms(message);
+            if (duration) {
+                condition_graph_ms.push_back(*duration);
+                json attributes = json::object();
+                attributes["duration.ms"] = *duration;
+                attributes["gen_ai.operation.stage"] = "conditioning.graph";
+                add_subspan(root_span, "gen_ai.conditioner.graph", duration, std::move(attributes));
+            }
+            continue;
+        }
+
+        if (message.find("get_learned_condition completed") != std::string::npos) {
+            auto duration = extract_duration_ms(message);
+            if (duration) {
+                learned_condition_ms.push_back(*duration);
+                json attributes = json::object();
+                attributes["duration.ms"] = *duration;
+                attributes["gen_ai.operation.stage"] = "conditioning.get_learned_condition";
+                add_subspan(root_span, "gen_ai.conditioner.get_learned_condition", duration, std::move(attributes));
+            }
+            continue;
+        }
+
+        if (message.find("sampling completed") != std::string::npos) {
+            auto duration = extract_duration_ms(message);
+            if (duration) {
+                sampling_ms.push_back(*duration);
+                json attributes = json::object();
+                attributes["duration.ms"] = *duration;
+                attributes["gen_ai.operation.stage"] = "sampling";
+                add_subspan(root_span, "gen_ai.sampling", duration, std::move(attributes));
+            }
+            continue;
+        }
+
+        auto latent_pos = message.find("latent ");
+        auto decoded_pos = message.find(" decoded");
+        if (latent_pos != std::string::npos && decoded_pos != std::string::npos && latent_pos < decoded_pos) {
+            const std::size_t latent_prefix_len = 7;
+            std::size_t idx_start = latent_pos + latent_prefix_len;
+            std::size_t idx_end = idx_start;
+            while (idx_end < message.size() && std::isdigit(static_cast<unsigned char>(message[idx_end]))) {
+                ++idx_end;
+            }
+            if (idx_end > idx_start) {
+                int latent_index = std::stoi(message.substr(idx_start, idx_end - idx_start));
+                auto duration = extract_duration_ms(message);
+                if (duration) {
+                    vae_timings.push_back({latent_index, *duration});
+                    json attributes = json::object();
+                    attributes["duration.ms"] = *duration;
+                    attributes["gen_ai.operation.stage"] = "vae.decode";
+                    attributes["sdcpp.latent.index"] = latent_index;
+                    add_subspan(root_span, "gen_ai.vae.decode", duration, std::move(attributes));
+                }
+            }
+            continue;
+        }
+
+        if (message.find("generate_image completed") != std::string::npos) {
+            auto duration = extract_duration_ms(message);
+            if (duration) {
+                generate_image_ms = *duration;
+                json attributes = json::object();
+                attributes["duration.ms"] = *duration;
+                attributes["gen_ai.operation.stage"] = "inference.complete";
+                add_subspan(root_span, "gen_ai.generate_image", duration, std::move(attributes));
+            }
+            continue;
+        }
+    }
+
+    json summary = json::object();
+    summary["elapsed_ms"] = elapsed_ms;
+    if (model_summary) {
+        summary["model_load"] = *model_summary;
+    }
+
+    json lora_summary = json::array();
+    for (const auto& id : lora_order) {
+        auto it = lora_map.find(id);
+        if (it == lora_map.end()) {
+            continue;
+        }
+        const LoraData& data = it->second;
+        json entry = json::object();
+        entry["id"] = id;
+        if (!data.primary_path.empty()) {
+            entry["path"] = data.primary_path;
+        }
+        if (!data.load_ms.empty()) {
+            double load_total = std::accumulate(data.load_ms.begin(), data.load_ms.end(), 0.0);
+            entry["load_total_ms"] = load_total;
+            json phases = json::array();
+            for (std::size_t i = 0; i < data.load_ms.size(); ++i) {
+                json phase = json::object();
+                phase["duration_ms"] = data.load_ms[i];
+                phase["phase_index"] = static_cast<int>(i);
+                if (i == 0) {
+                    phase["phase"] = "prefetch";
+                } else if (i == 1) {
+                    phase["phase"] = "load";
+                } else {
+                    phase["phase"] = "load_extra";
+                }
+                if (i < data.load_paths.size() && !data.load_paths[i].empty()) {
+                    phase["path"] = data.load_paths[i];
+                }
+                json breakdown_json = breakdown_to_json(data.breakdowns[i]);
+                if (!breakdown_json.empty()) {
+                    phase["breakdown_ms"] = breakdown_json;
+                }
+                phases.push_back(std::move(phase));
+            }
+            entry["load_phases"] = std::move(phases);
+            if (data.applied_recorded) {
+                double compute_ms = data.applied_ms - load_total;
+                entry["apply_ms"] = data.applied_ms;
+                entry["compute_ms"] = compute_ms;
+            }
+        } else {
+            entry["load_total_ms"] = 0.0;
+            if (data.applied_recorded) {
+                entry["apply_ms"] = data.applied_ms;
+                entry["compute_ms"] = data.applied_ms;
+            }
+        }
+        lora_summary.push_back(std::move(entry));
+    }
+    if (!lora_summary.empty()) {
+        summary["loras"] = std::move(lora_summary);
+    }
+
+    json embedding_summary = json::array();
+    for (const auto& id : embedding_order) {
+        auto it = embedding_map.find(id);
+        if (it == embedding_map.end()) {
+            continue;
+        }
+        const EmbeddingData& data = it->second;
+        json entry = json::object();
+        entry["id"] = id;
+        if (!data.primary_path.empty()) {
+            entry["path"] = data.primary_path;
+        }
+        if (!data.load_ms.empty()) {
+            double load_total = std::accumulate(data.load_ms.begin(), data.load_ms.end(), 0.0);
+            entry["load_total_ms"] = load_total;
+            json phases = json::array();
+            for (std::size_t i = 0; i < data.load_ms.size(); ++i) {
+                json phase = json::object();
+                phase["duration_ms"] = data.load_ms[i];
+                phase["phase_index"] = static_cast<int>(i);
+                phase["phase"] = "load";
+                if (i < data.load_paths.size() && !data.load_paths[i].empty()) {
+                    phase["path"] = data.load_paths[i];
+                }
+                json breakdown_json = breakdown_to_json(data.breakdowns[i]);
+                if (!breakdown_json.empty()) {
+                    phase["breakdown_ms"] = breakdown_json;
+                }
+                phases.push_back(std::move(phase));
+            }
+            entry["load_phases"] = std::move(phases);
+        } else {
+            entry["load_total_ms"] = 0.0;
+        }
+        if (data.custom_embedding_count >= 0) {
+            entry["custom_embeddings"] = data.custom_embedding_count;
+        }
+        embedding_summary.push_back(std::move(entry));
+    }
+    if (!embedding_summary.empty()) {
+        summary["embeddings"] = std::move(embedding_summary);
+    }
+
+    auto vector_to_json_array = [](const std::vector<double>& values) {
+        json arr = json::array();
+        for (double value : values) {
+            arr.push_back(value);
+        }
+        return arr;
+    };
+
+    if (!condition_graph_ms.empty() || !learned_condition_ms.empty()) {
+        json conditioning = json::object();
+        if (!condition_graph_ms.empty()) {
+            json compute_graph = json::object();
+            compute_graph["durations_ms"] = vector_to_json_array(condition_graph_ms);
+            compute_graph["total_ms"] = std::accumulate(condition_graph_ms.begin(), condition_graph_ms.end(), 0.0);
+            conditioning["compute_graph"] = std::move(compute_graph);
+        }
+        if (!learned_condition_ms.empty()) {
+            json learned = json::object();
+            learned["durations_ms"] = vector_to_json_array(learned_condition_ms);
+            learned["total_ms"] = std::accumulate(learned_condition_ms.begin(), learned_condition_ms.end(), 0.0);
+            conditioning["get_learned_condition"] = std::move(learned);
+        }
+        summary["conditioning"] = std::move(conditioning);
+    }
+
+    if (!sampling_ms.empty()) {
+        json sampling = json::object();
+        sampling["durations_ms"] = vector_to_json_array(sampling_ms);
+        sampling["total_ms"] = std::accumulate(sampling_ms.begin(), sampling_ms.end(), 0.0);
+        summary["sampling"] = std::move(sampling);
+    }
+
+    if (!vae_timings.empty()) {
+        json latents = json::array();
+        double total = 0.0;
+        for (const auto& timing : vae_timings) {
+            total += timing.duration_ms;
+            json latent_entry = json::object();
+            latent_entry["latent_index"] = timing.latent_index;
+            latent_entry["duration_ms"] = timing.duration_ms;
+            latents.push_back(std::move(latent_entry));
+        }
+        json vae = json::object();
+        vae["latents"] = std::move(latents);
+        vae["total_ms"] = total;
+        summary["vae_decode"] = std::move(vae);
+    }
+
+    if (generate_image_ms) {
+        json generate = json::object();
+        generate["duration_ms"] = *generate_image_ms;
+        summary["generate_image"] = std::move(generate);
+    }
+
+    json span_attributes = json::object();
+    span_attributes["gen_ai.operation.name"] = "image_generation";
+    span_attributes["gen_ai.output.type"] = "image";
+    span_attributes["gen_ai.provider.name"] = "stable_diffusion_cpp";
+    if (!config.model_path.empty()) {
+        span_attributes["gen_ai.request.model"] = path_stem(config.model_path);
+        span_attributes["sdcpp.model.path"] = config.model_path;
+    }
+    if (effective_seed >= 0) {
+        span_attributes["gen_ai.request.seed"] = effective_seed;
+    }
+    if (request.seed >= 0 && request.seed != effective_seed) {
+        span_attributes["sdcpp.request.seed_requested"] = request.seed;
+    }
+    if (request.seed < 0) {
+        span_attributes["sdcpp.request.random_seed"] = true;
+    }
+    span_attributes["sdcpp.request.batch_count"] = request.batch_count;
+    span_attributes["sdcpp.request.width"] = request.width;
+    span_attributes["sdcpp.request.height"] = request.height;
+    span_attributes["sdcpp.request.sample_steps"] = request.sample_steps;
+    span_attributes["sdcpp.request.cfg_scale"] = request.cfg_scale;
+    if (request.has_img_cfg_scale) {
+        span_attributes["sdcpp.request.img_cfg_scale"] = request.img_cfg_scale;
+    }
+    span_attributes["gen_ai.response.latency_ms"] = elapsed_ms;
+
+    root_span.name = "gen_ai.inference.image_generation";
+    root_span.duration_ms = static_cast<double>(elapsed_ms);
+    root_span.attributes = span_attributes;
+
+    std::function<json(const SpanRecord&)> span_to_json;
+    span_to_json = [&](const SpanRecord& record) {
+        json span = json::object();
+        span["name"] = record.name;
+        span["span_id"] = record.span_id;
+        span["kind"] = record.kind;
+        span["duration_ms"] = record.duration_ms;
+        if (!record.parent_span_id.empty()) {
+            span["parent_span_id"] = record.parent_span_id;
+        }
+        if (!record.attributes.empty()) {
+            span["attributes"] = record.attributes;
+        }
+        if (!record.subspans.empty()) {
+            json subspans = json::array();
+            for (const auto& child : record.subspans) {
+                subspans.push_back(span_to_json(child));
+            }
+            span["subspans"] = std::move(subspans);
+        }
+        return span;
+    };
+
+    json telemetry = json::object();
+    telemetry["summary"] = std::move(summary);
+    json spans = json::array();
+    spans.push_back(span_to_json(root_span));
+    telemetry["spans"] = std::move(spans);
+
+    return telemetry;
+}
 json logs_to_json(const LogCollector& collector) {
     json entries = json::array();
     for (const auto& entry : collector.entries) {
@@ -934,7 +1656,8 @@ json make_success_response(const json& images,
                            int64_t elapsed_ms,
                            const GenerationRequest& request,
                            const CtxConfig& config,
-                           const LogCollector& collector) {
+                           const LogCollector& collector,
+                           int64_t effective_seed) {
     json response;
     response["success"] = true;
     response["logs"] = logs_to_json(collector);
@@ -942,6 +1665,7 @@ json make_success_response(const json& images,
     response["batch_count"] = static_cast<int>(images.size());
     response["requested_seed"] = request.seed;
     response["elapsed_ms"] = elapsed_ms;
+    response["telemetry"] = make_telemetry(collector, request, config, elapsed_ms, effective_seed);
     response["images"] = images;
     return response;
 }
@@ -1140,7 +1864,7 @@ int main(int argc, char** argv) {
         auto end_time = std::chrono::steady_clock::now();
         int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
-        auto response = make_success_response(images, elapsed_ms, request_params, state.ctx_config, collector);
+        auto response = make_success_response(images, elapsed_ms, request_params, state.ctx_config, collector, effective_seed);
         response["applied_seed"] = effective_seed;
         response["random_seed_requested"] = random_seed_requested;
         res.status = 200;
