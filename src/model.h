@@ -186,6 +186,7 @@ struct TensorStorage {
     bool is_f8_e5m2         = false;
     bool is_f64             = false;
     bool is_i64             = false;
+    bool name_is_canonical  = false;
     int64_t ne[SD_MAX_DIMS] = {1, 1, 1, 1, 1};
     int n_dims              = 0;
 
@@ -195,8 +196,14 @@ struct TensorStorage {
 
     TensorStorage() = default;
 
-    TensorStorage(std::string name, ggml_type type, const int64_t* ne, int n_dims, size_t file_index, size_t offset = 0)
-        : name(std::move(name)), type(type), n_dims(n_dims), file_index(file_index), offset(offset) {
+    TensorStorage(std::string name,
+                  ggml_type type,
+                  const int64_t* ne,
+                  int n_dims,
+                  size_t file_index,
+                  size_t offset = 0,
+                  bool name_is_canonical = false)
+        : name(std::move(name)), type(type), name_is_canonical(name_is_canonical), n_dims(n_dims), file_index(file_index), offset(offset) {
         for (int i = 0; i < n_dims; i++) {
             this->ne[i] = ne[i];
         }
