@@ -10,9 +10,10 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <vector>
-
+#include <numeric>
 #include "gguf_reader.hpp"
 #include "model.h"
 #include "stable-diffusion.h"
@@ -569,6 +570,15 @@ std::string convert_diffusers_name_to_compvis(std::string key, char seq) {
 }
 
 std::string convert_tensor_name(std::string name) {
+    static thread_local std::unordered_map<std::string, std::string> cache;
+
+    auto cached = cache.find(name);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+
+    const std::string original = name;
+
     if (starts_with(name, "diffusion_model")) {
         name = "model." + name;
     }
@@ -670,33 +680,58 @@ std::string convert_tensor_name(std::string name) {
     // if (new_name != name) {
     //     LOG_DEBUG("%s => %s", name.c_str(), new_name.c_str());
     // }
-    return new_name;
+
+    auto result = cache.emplace(original, new_name);
+    return result.first->second;
 }
 
-void add_preprocess_tensor_storage_types(String2GGMLType& tensor_storages_types, std::string name, enum ggml_type type) {
-    std::string new_name = convert_tensor_name(name);
+template <typename InserterT>
+static void for_each_preprocess_tensor_storage_type(const std::string& name,
+                                                    enum ggml_type type,
+                                                    InserterT&& insert,
+                                                    bool name_is_canonical = false) {
+    std::string new_name = name_is_canonical ? name : convert_tensor_name(name);
 
     if (new_name.find("cond_stage_model") != std::string::npos && ends_with(new_name, "attn.in_proj_weight")) {
-        size_t prefix_size                                        = new_name.find("attn.in_proj_weight");
-        std::string prefix                                        = new_name.substr(0, prefix_size);
-        tensor_storages_types[prefix + "self_attn.q_proj.weight"] = type;
-        tensor_storages_types[prefix + "self_attn.k_proj.weight"] = type;
-        tensor_storages_types[prefix + "self_attn.v_proj.weight"] = type;
+        size_t prefix_size = new_name.find("attn.in_proj_weight");
+        std::string prefix = new_name.substr(0, prefix_size);
+        insert(prefix + "self_attn.q_proj.weight", type);
+        insert(prefix + "self_attn.k_proj.weight", type);
+        insert(prefix + "self_attn.v_proj.weight", type);
     } else if (new_name.find("cond_stage_model") != std::string::npos && ends_with(new_name, "attn.in_proj_bias")) {
-        size_t prefix_size                                      = new_name.find("attn.in_proj_bias");
-        std::string prefix                                      = new_name.substr(0, prefix_size);
-        tensor_storages_types[prefix + "self_attn.q_proj.bias"] = type;
-        tensor_storages_types[prefix + "self_attn.k_proj.bias"] = type;
-        tensor_storages_types[prefix + "self_attn.v_proj.bias"] = type;
+        size_t prefix_size = new_name.find("attn.in_proj_bias");
+        std::string prefix = new_name.substr(0, prefix_size);
+        insert(prefix + "self_attn.q_proj.bias", type);
+        insert(prefix + "self_attn.k_proj.bias", type);
+        insert(prefix + "self_attn.v_proj.bias", type);
     } else {
-        tensor_storages_types[new_name] = type;
+        insert(std::move(new_name), type);
     }
+}
+
+void add_preprocess_tensor_storage_types(String2GGMLType& tensor_storages_types,
+                                              const std::string& name,
+                                              enum ggml_type type,
+                                              bool name_is_canonical) {
+    for_each_preprocess_tensor_storage_type(name, type, [&](std::string key, ggml_type value) {
+        tensor_storages_types.insert_or_assign(std::move(key), value);
+    }, name_is_canonical);
+}
+
+void add_preprocess_tensor_storage_types(String2GGMLType& tensor_storages_types, const std::string& name, enum ggml_type type) {
+    add_preprocess_tensor_storage_types(tensor_storages_types, name, type, false);
 }
 
 void preprocess_tensor(TensorStorage tensor_storage,
                        std::vector<TensorStorage>& processed_tensor_storages) {
     std::vector<TensorStorage> result;
-    std::string new_name = convert_tensor_name(tensor_storage.name);
+    std::string new_name;
+    if (tensor_storage.name_is_canonical) {
+        new_name = tensor_storage.name;
+    } else {
+        new_name = convert_tensor_name(tensor_storage.name);
+        tensor_storage.name_is_canonical = true;
+    }
 
     // convert unet transformer linear to conv2d 1x1
     if (starts_with(new_name, "model.diffusion_model.") &&
@@ -717,6 +752,7 @@ void preprocess_tensor(TensorStorage tensor_storage,
     }
 
     tensor_storage.name = new_name;
+    tensor_storage.name_is_canonical = true;
 
     if (new_name.find("cond_stage_model") != std::string::npos &&
         ends_with(new_name, "attn.in_proj_weight")) {
@@ -725,11 +761,13 @@ void preprocess_tensor(TensorStorage tensor_storage,
 
         std::vector<TensorStorage> chunks = tensor_storage.chunk(3);
         chunks[0].name                    = prefix + "self_attn.q_proj.weight";
+        chunks[0].name_is_canonical       = true;
         chunks[1].name                    = prefix + "self_attn.k_proj.weight";
+        chunks[1].name_is_canonical       = true;
         chunks[2].name                    = prefix + "self_attn.v_proj.weight";
+        chunks[2].name_is_canonical       = true;
 
         processed_tensor_storages.insert(processed_tensor_storages.end(), chunks.begin(), chunks.end());
-
     } else if (new_name.find("cond_stage_model") != std::string::npos &&
                ends_with(new_name, "attn.in_proj_bias")) {
         size_t prefix_size = new_name.find("attn.in_proj_bias");
@@ -737,8 +775,11 @@ void preprocess_tensor(TensorStorage tensor_storage,
 
         std::vector<TensorStorage> chunks = tensor_storage.chunk(3);
         chunks[0].name                    = prefix + "self_attn.q_proj.bias";
+        chunks[0].name_is_canonical       = true;
         chunks[1].name                    = prefix + "self_attn.k_proj.bias";
+        chunks[1].name_is_canonical       = true;
         chunks[2].name                    = prefix + "self_attn.v_proj.bias";
+        chunks[2].name_is_canonical       = true;
 
         processed_tensor_storages.insert(processed_tensor_storages.end(), chunks.begin(), chunks.end());
     } else {
@@ -1221,6 +1262,7 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         bool is_f8_e5m2 = false;
         bool is_f64 = false;
         bool is_i64 = false;
+        bool name_is_canonical = false;
     };
 
     std::vector<SafetensorTask> tasks;
@@ -1244,7 +1286,6 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         if (dtype == "U8") {
             continue;
         }
-
         size_t begin = tensor_info["data_offsets"][0].get<size_t>();
         size_t end = tensor_info["data_offsets"][1].get<size_t>();
 
@@ -1283,9 +1324,9 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         if (!starts_with(full_name, prefix)) {
             full_name = prefix + full_name;
         }
-
         SafetensorTask task;
         task.name = std::move(full_name);
+        task.name_is_canonical = false;
         task.type = type;
         task.ne = ne;
         task.n_dims = n_dims;
@@ -1313,24 +1354,50 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         n_threads = 1;
     }
 
-    std::vector<TensorStorage> processed(tasks.size());
+    const size_t prior_size = tensor_storages.size();
+    tensor_storages.resize(prior_size + tasks.size());
 
+    std::vector<size_t> read_order(tasks.size());
+    std::iota(read_order.begin(), read_order.end(), 0);
+    std::sort(read_order.begin(), read_order.end(), [&](size_t a, size_t b) {
+        return tasks[a].offset < tasks[b].offset;
+    });
+
+    std::vector<std::vector<std::pair<std::string, ggml_type>>> local_types(n_threads);
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
 
-    for (int i = 0; i < n_threads; ++i) {
-        workers.emplace_back([&, thread_id = i]() {
-            for (size_t idx = thread_id; idx < tasks.size(); idx += n_threads) {
+    const size_t chunk_size = (read_order.size() + n_threads - 1) / n_threads;
+    for (int thread_id = 0; thread_id < n_threads; ++thread_id) {
+        size_t begin = static_cast<size_t>(thread_id) * chunk_size;
+        if (begin >= read_order.size()) {
+            continue;
+        }
+        size_t end = std::min(begin + chunk_size, read_order.size());
+
+        workers.emplace_back([&, thread_id, begin, end, prior_size]() {
+            auto& assignments = local_types[thread_id];
+            size_t expected   = end - begin;
+            if (expected > 0) {
+                assignments.reserve(expected * 3);
+            }
+
+            for (size_t ord_idx = begin; ord_idx < end; ++ord_idx) {
+                size_t idx       = read_order[ord_idx];
                 const auto& task = tasks[idx];
 
-                TensorStorage tensor_storage(task.name, task.type, task.ne.data(), task.n_dims, file_index, task.offset);
+                TensorStorage tensor_storage(task.name, task.type, task.ne.data(), task.n_dims, file_index, task.offset, task.name_is_canonical);
                 tensor_storage.reverse_ne();
+                if (!tensor_storage.name_is_canonical) {
+                    tensor_storage.name = convert_tensor_name(tensor_storage.name);
+                    tensor_storage.name_is_canonical = true;
+                }
 
-                tensor_storage.is_bf16 = task.is_bf16;
+                tensor_storage.is_bf16    = task.is_bf16;
                 tensor_storage.is_f8_e4m3 = task.is_f8_e4m3;
                 tensor_storage.is_f8_e5m2 = task.is_f8_e5m2;
-                tensor_storage.is_f64 = task.is_f64;
-                tensor_storage.is_i64 = task.is_i64;
+                tensor_storage.is_f64     = task.is_f64;
+                tensor_storage.is_i64     = task.is_i64;
 
                 size_t tensor_data_size = task.tensor_data_size;
 
@@ -1348,7 +1415,16 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
                     GGML_ASSERT(tensor_storage.nbytes() == tensor_data_size);
                 }
 
-                processed[idx] = std::move(tensor_storage);
+                size_t target_index = prior_size + idx;
+                tensor_storages[target_index] = std::move(tensor_storage);
+
+                for_each_preprocess_tensor_storage_type(
+                    tensor_storages[target_index].name,
+                    tensor_storages[target_index].type,
+                    [&](std::string key, ggml_type value) {
+                        assignments.emplace_back(std::move(key), value);
+                    },
+                    tensor_storages[target_index].name_is_canonical);
             }
         });
     }
@@ -1357,44 +1433,11 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         worker.join();
     }
 
-
-    const size_t prior_size = tensor_storages.size();
-    tensor_storages.resize(prior_size + processed.size());
-
-    int append_threads = std::min(num_threads_to_use, (int)processed.size());
-    if (append_threads < 1) {
-        append_threads = 1;
-    }
-
-    std::vector<String2GGMLType> local_types(append_threads);
-    std::vector<std::thread> append_workers;
-    append_workers.reserve(append_threads);
-
-    for (int thread_id = 0; thread_id < append_threads; ++thread_id) {
-        append_workers.emplace_back([&, thread_id]() {
-            auto& local_map = local_types[thread_id];
-            for (size_t idx = thread_id; idx < processed.size(); idx += append_threads) {
-                size_t target_index           = prior_size + idx;
-                tensor_storages[target_index] = std::move(processed[idx]);
-                add_preprocess_tensor_storage_types(local_map,
-                                                    tensor_storages[target_index].name,
-                                                    tensor_storages[target_index].type);
-            }
-        });
-    }
-
-    for (auto& worker : append_workers) {
-        worker.join();
-    }
-
-    for (auto& local_map : local_types) {
-        for (auto& kv : local_map) {
-            tensor_storages_types[kv.first] = kv.second;
+    for (auto& assignments : local_types) {
+        for (auto& kv : assignments) {
+            tensor_storages_types.insert_or_assign(std::move(kv.first), kv.second);
         }
     }
-
-    processed.clear();
-    processed.shrink_to_fit();
 
     return true;
 }
@@ -1426,8 +1469,9 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
                 }
                 if (pos != std::string::npos) {
                     tensor_storage.name = "model.diffusion_model.output_blocks.2.2.conv" + tensor_storage.name.substr(len);
+                    tensor_storage.name_is_canonical = true;
                     LOG_DEBUG("NEW NAME: %s", tensor_storage.name.c_str());
-                    add_preprocess_tensor_storage_types(tensor_storages_types, tensor_storage.name, tensor_storage.type);
+                    add_preprocess_tensor_storage_types(tensor_storages_types, tensor_storage.name, tensor_storage.type, true);
                 }
             }
             break;
