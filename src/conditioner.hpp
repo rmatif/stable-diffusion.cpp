@@ -621,7 +621,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             if (sd_version_is_sdxl(version)) {
                 auto it = std::find(chunk_tokens.begin(), chunk_tokens.end(), tokenizer.EOS_TOKEN_ID);
                 if (it != chunk_tokens.end()) {
-                    std::fill(std::next(it), chunk_tokens.end(), 0);
+                    std::fill(std::next(it), chunk_tokens.end(), tokenizer.PAD_TOKEN_ID);
                 }
 
                 max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
