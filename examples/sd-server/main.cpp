@@ -1758,6 +1758,11 @@ int main(int argc, char** argv) {
             desired_config = state.default_config;
         }
 
+        const bool has_vae_override = body.find("vae_path") != body.end();
+        if (!has_vae_override) {
+            desired_config.vae_path = state.default_config.vae_path;
+        }
+
         std::string context_error;
         if (!apply_context_overrides(body, desired_config, context_error)) {
             auto response = make_error_response(context_error, collector);
