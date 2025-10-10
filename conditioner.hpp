@@ -305,6 +305,9 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             std::vector<int> clean_input_ids;
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                continue;
+            }
             size_t search_pos            = 0;
             auto on_new_token_cb         = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
                 std::string token_str;
@@ -478,6 +481,9 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                continue;
+            }
             size_t search_pos            = 0;
             auto on_new_token_cb         = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
                 std::string token_str;
@@ -615,7 +621,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             if (sd_version_is_sdxl(version)) {
                 auto it = std::find(chunk_tokens.begin(), chunk_tokens.end(), tokenizer.EOS_TOKEN_ID);
                 if (it != chunk_tokens.end()) {
-                    std::fill(std::next(it), chunk_tokens.end(), tokenizer.PAD_TOKEN_ID);
+                    std::fill(std::next(it), chunk_tokens.end(), tokenizer.BOS_TOKEN_ID);
                 }
 
                 max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
@@ -909,26 +915,80 @@ struct SD3CLIPEmbedder : public Conditioner {
         std::vector<float> clip_g_weights;
         std::vector<int> t5_tokens;
         std::vector<float> t5_weights;
+
+        std::vector<int> seg_clip_l_tokens;
+        std::vector<float> seg_clip_l_weights;
+        std::vector<int> seg_clip_g_tokens;
+        std::vector<float> seg_clip_g_weights;
+        std::vector<int> seg_t5_tokens;
+        std::vector<float> seg_t5_weights;
+
+        auto flush_segment = [&](bool force_chunk) {
+            bool has_tokens = !seg_clip_l_tokens.empty() || !seg_clip_g_tokens.empty() || !seg_t5_tokens.empty();
+            if (!has_tokens && !force_chunk) {
+                return;
+            }
+
+            if (padding) {
+                std::vector<int> chunk_clip_l = seg_clip_l_tokens;
+                std::vector<float> chunk_clip_l_weights = seg_clip_l_weights;
+                clip_l_tokenizer.pad_tokens(chunk_clip_l, chunk_clip_l_weights, max_length, padding);
+                clip_l_tokens.insert(clip_l_tokens.end(), chunk_clip_l.begin(), chunk_clip_l.end());
+                clip_l_weights.insert(clip_l_weights.end(), chunk_clip_l_weights.begin(), chunk_clip_l_weights.end());
+
+                std::vector<int> chunk_clip_g = seg_clip_g_tokens;
+                std::vector<float> chunk_clip_g_weights = seg_clip_g_weights;
+                clip_g_tokenizer.pad_tokens(chunk_clip_g, chunk_clip_g_weights, max_length, padding);
+                clip_g_tokens.insert(clip_g_tokens.end(), chunk_clip_g.begin(), chunk_clip_g.end());
+                clip_g_weights.insert(clip_g_weights.end(), chunk_clip_g_weights.begin(), chunk_clip_g_weights.end());
+
+                std::vector<int> chunk_t5 = seg_t5_tokens;
+                std::vector<float> chunk_t5_weights = seg_t5_weights;
+                t5_tokenizer.pad_tokens(chunk_t5, chunk_t5_weights, NULL, max_length, padding);
+                t5_tokens.insert(t5_tokens.end(), chunk_t5.begin(), chunk_t5.end());
+                t5_weights.insert(t5_weights.end(), chunk_t5_weights.begin(), chunk_t5_weights.end());
+            } else {
+                clip_l_tokens.insert(clip_l_tokens.end(), seg_clip_l_tokens.begin(), seg_clip_l_tokens.end());
+                clip_l_weights.insert(clip_l_weights.end(), seg_clip_l_weights.begin(), seg_clip_l_weights.end());
+
+                clip_g_tokens.insert(clip_g_tokens.end(), seg_clip_g_tokens.begin(), seg_clip_g_tokens.end());
+                clip_g_weights.insert(clip_g_weights.end(), seg_clip_g_weights.begin(), seg_clip_g_weights.end());
+
+                t5_tokens.insert(t5_tokens.end(), seg_t5_tokens.begin(), seg_t5_tokens.end());
+                t5_weights.insert(t5_weights.end(), seg_t5_weights.begin(), seg_t5_weights.end());
+            }
+
+            seg_clip_l_tokens.clear();
+            seg_clip_l_weights.clear();
+            seg_clip_g_tokens.clear();
+            seg_clip_g_weights.clear();
+            seg_t5_tokens.clear();
+            seg_t5_weights.clear();
+        };
+
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
 
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                flush_segment(padding);
+                continue;
+            }
+
             std::vector<int> curr_tokens = clip_l_tokenizer.encode(curr_text, on_new_token_cb);
-            clip_l_tokens.insert(clip_l_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            clip_l_weights.insert(clip_l_weights.end(), curr_tokens.size(), curr_weight);
+            seg_clip_l_tokens.insert(seg_clip_l_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_clip_l_weights.insert(seg_clip_l_weights.end(), curr_tokens.size(), curr_weight);
 
             curr_tokens = clip_g_tokenizer.encode(curr_text, on_new_token_cb);
-            clip_g_tokens.insert(clip_g_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            clip_g_weights.insert(clip_g_weights.end(), curr_tokens.size(), curr_weight);
+            seg_clip_g_tokens.insert(seg_clip_g_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_clip_g_weights.insert(seg_clip_g_weights.end(), curr_tokens.size(), curr_weight);
 
-            curr_tokens = t5_tokenizer.Encode(curr_text, true);
-            t5_tokens.insert(t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            t5_weights.insert(t5_weights.end(), curr_tokens.size(), curr_weight);
+            curr_tokens = t5_tokenizer.Encode(curr_text, false);
+            seg_t5_tokens.insert(seg_t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_t5_weights.insert(seg_t5_weights.end(), curr_tokens.size(), curr_weight);
         }
 
-        clip_l_tokenizer.pad_tokens(clip_l_tokens, clip_l_weights, max_length, padding);
-        clip_g_tokenizer.pad_tokens(clip_g_tokens, clip_g_weights, max_length, padding);
-        t5_tokenizer.pad_tokens(t5_tokens, t5_weights, NULL, max_length, padding);
+        flush_segment(padding || clip_l_tokens.empty());
 
         // for (int i = 0; i < clip_l_tokens.size(); i++) {
         //     std::cout << clip_l_tokens[i] << ":" << clip_l_weights[i] << ", ";
@@ -1246,21 +1306,63 @@ struct FluxCLIPEmbedder : public Conditioner {
         std::vector<float> clip_l_weights;
         std::vector<int> t5_tokens;
         std::vector<float> t5_weights;
+
+        std::vector<int> seg_clip_l_tokens;
+        std::vector<float> seg_clip_l_weights;
+        std::vector<int> seg_t5_tokens;
+        std::vector<float> seg_t5_weights;
+
+        auto flush_segment = [&](bool force_chunk) {
+            bool has_tokens = !seg_clip_l_tokens.empty() || !seg_t5_tokens.empty();
+            if (!has_tokens && !force_chunk) {
+                return;
+            }
+
+            if (padding) {
+                std::vector<int> chunk_clip_l = seg_clip_l_tokens;
+                std::vector<float> chunk_clip_l_weights = seg_clip_l_weights;
+                clip_l_tokenizer.pad_tokens(chunk_clip_l, chunk_clip_l_weights, 77, padding);
+                clip_l_tokens.insert(clip_l_tokens.end(), chunk_clip_l.begin(), chunk_clip_l.end());
+                clip_l_weights.insert(clip_l_weights.end(), chunk_clip_l_weights.begin(), chunk_clip_l_weights.end());
+
+                std::vector<int> chunk_t5 = seg_t5_tokens;
+                std::vector<float> chunk_t5_weights = seg_t5_weights;
+                t5_tokenizer.pad_tokens(chunk_t5, chunk_t5_weights, NULL, max_length, padding);
+                t5_tokens.insert(t5_tokens.end(), chunk_t5.begin(), chunk_t5.end());
+                t5_weights.insert(t5_weights.end(), chunk_t5_weights.begin(), chunk_t5_weights.end());
+            } else {
+                clip_l_tokens.insert(clip_l_tokens.end(), seg_clip_l_tokens.begin(), seg_clip_l_tokens.end());
+                clip_l_weights.insert(clip_l_weights.end(), seg_clip_l_weights.begin(), seg_clip_l_weights.end());
+
+                t5_tokens.insert(t5_tokens.end(), seg_t5_tokens.begin(), seg_t5_tokens.end());
+                t5_weights.insert(t5_weights.end(), seg_t5_weights.begin(), seg_t5_weights.end());
+            }
+
+            seg_clip_l_tokens.clear();
+            seg_clip_l_weights.clear();
+            seg_t5_tokens.clear();
+            seg_t5_weights.clear();
+        };
+
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
 
-            std::vector<int> curr_tokens = clip_l_tokenizer.encode(curr_text, on_new_token_cb);
-            clip_l_tokens.insert(clip_l_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            clip_l_weights.insert(clip_l_weights.end(), curr_tokens.size(), curr_weight);
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                flush_segment(padding);
+                continue;
+            }
 
-            curr_tokens = t5_tokenizer.Encode(curr_text, true);
-            t5_tokens.insert(t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            t5_weights.insert(t5_weights.end(), curr_tokens.size(), curr_weight);
+            std::vector<int> curr_tokens = clip_l_tokenizer.encode(curr_text, on_new_token_cb);
+            seg_clip_l_tokens.insert(seg_clip_l_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_clip_l_weights.insert(seg_clip_l_weights.end(), curr_tokens.size(), curr_weight);
+
+            curr_tokens = t5_tokenizer.Encode(curr_text, false);
+            seg_t5_tokens.insert(seg_t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_t5_weights.insert(seg_t5_weights.end(), curr_tokens.size(), curr_weight);
         }
 
-        clip_l_tokenizer.pad_tokens(clip_l_tokens, clip_l_weights, 77, padding);
-        t5_tokenizer.pad_tokens(t5_tokens, t5_weights, NULL, max_length, padding);
+        flush_segment(padding || clip_l_tokens.empty());
 
         // for (int i = 0; i < clip_l_tokens.size(); i++) {
         //     std::cout << clip_l_tokens[i] << ":" << clip_l_weights[i] << ", ";
@@ -1465,16 +1567,49 @@ struct T5CLIPEmbedder : public Conditioner {
         std::vector<int> t5_tokens;
         std::vector<float> t5_weights;
         std::vector<float> t5_mask;
+
+        std::vector<int> seg_t5_tokens;
+        std::vector<float> seg_t5_weights;
+
+        auto flush_segment = [&](bool force_chunk) {
+            bool has_tokens = !seg_t5_tokens.empty();
+            if (!has_tokens && !force_chunk) {
+                return;
+            }
+
+            if (padding) {
+                std::vector<int> chunk_tokens = seg_t5_tokens;
+                std::vector<float> chunk_weights = seg_t5_weights;
+                std::vector<float> chunk_mask;
+                t5_tokenizer.pad_tokens(chunk_tokens, chunk_weights, &chunk_mask, max_length, padding);
+
+                t5_tokens.insert(t5_tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
+                t5_weights.insert(t5_weights.end(), chunk_weights.begin(), chunk_weights.end());
+                t5_mask.insert(t5_mask.end(), chunk_mask.begin(), chunk_mask.end());
+            } else {
+                t5_tokens.insert(t5_tokens.end(), seg_t5_tokens.begin(), seg_t5_tokens.end());
+                t5_weights.insert(t5_weights.end(), seg_t5_weights.begin(), seg_t5_weights.end());
+            }
+
+            seg_t5_tokens.clear();
+            seg_t5_weights.clear();
+        };
+
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
 
-            std::vector<int> curr_tokens = t5_tokenizer.Encode(curr_text, true);
-            t5_tokens.insert(t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
-            t5_weights.insert(t5_weights.end(), curr_tokens.size(), curr_weight);
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                flush_segment(padding);
+                continue;
+            }
+
+            std::vector<int> curr_tokens = t5_tokenizer.Encode(curr_text, false);
+            seg_t5_tokens.insert(seg_t5_tokens.end(), curr_tokens.begin(), curr_tokens.end());
+            seg_t5_weights.insert(seg_t5_weights.end(), curr_tokens.size(), curr_weight);
         }
 
-        t5_tokenizer.pad_tokens(t5_tokens, t5_weights, &t5_mask, max_length, padding);
+        flush_segment(padding || t5_tokens.empty());
 
         return {t5_tokens, t5_weights, t5_mask};
     }

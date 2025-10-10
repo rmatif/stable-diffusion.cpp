@@ -576,7 +576,24 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
         } else if (text == "\\(") {
             res.push_back({text.substr(1), 1.0f});
         } else {
-            res.push_back({text, 1.0f});
+            std::sregex_token_iterator split_it(text.begin(), text.end(), re_break, -1);
+            std::sregex_token_iterator split_end;
+            int part_idx = 0;
+
+            for (; split_it != split_end; ++split_it, ++part_idx) {
+                if (part_idx > 0) {
+                    res.push_back({"BREAK", -1.0f});
+                }
+
+                const std::string& piece = split_it->str();
+                if (!piece.empty()) {
+                    res.push_back({piece, 1.0f});
+                }
+            }
+
+            if (part_idx == 0) {
+                res.push_back({text, 1.0f});
+            }
         }
 
         remaining_text = m.suffix();
