@@ -827,6 +827,21 @@ struct LoraModel : public GGMLRunner {
 
                     updown = ggml_merge_lora(compute_ctx, lora_down, lora_up, lora_mid);
                 }
+                if (updown == NULL) {
+                    continue;
+                }
+
+                const int64_t model_elems = ggml_nelements(model_tensor);
+                const int64_t lora_elems  = ggml_nelements(updown);
+                if (model_elems != lora_elems) {
+                    LOG_WARN("LoRA '%s' tensor '%s' is unsupported: element count mismatch (LoRA=%lld, model=%lld); skipping",
+                             file_path.c_str(),
+                             model_tensor_name.c_str(),
+                             (long long) lora_elems,
+                             (long long) model_elems);
+                    continue;
+                }
+
                 scale_value *= multiplier;
                 ggml_tensor* original_tensor = model_tensor;
                 if (!ggml_backend_is_cpu(runtime_backend) && ggml_backend_buffer_is_host(original_tensor->buffer)) {
