@@ -41,13 +41,15 @@ const char* modes_str[] = {
     "img_gen",
     "vid_gen",
     "convert",
+    "upscale",
 };
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert"
+#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale"
 
 enum SDMode {
     IMG_GEN,
     VID_GEN,
     CONVERT,
+    UPSCALE,
     MODE_COUNT
 };
 
@@ -59,6 +61,8 @@ struct SDParams {
     std::string clip_g_path;
     std::string clip_vision_path;
     std::string t5xxl_path;
+    std::string qwen2vl_path;
+    std::string qwen2vl_vision_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string vae_path;
@@ -144,6 +148,8 @@ void print_params(SDParams params) {
     printf("    clip_g_path:                       %s\n", params.clip_g_path.c_str());
     printf("    clip_vision_path:                  %s\n", params.clip_vision_path.c_str());
     printf("    t5xxl_path:                        %s\n", params.t5xxl_path.c_str());
+    printf("    qwen2vl_path:                      %s\n", params.qwen2vl_path.c_str());
+    printf("    qwen2vl_vision_path:               %s\n", params.qwen2vl_vision_path.c_str());
     printf("    diffusion_model_path:              %s\n", params.diffusion_model_path.c_str());
     printf("    high_noise_diffusion_model_path:   %s\n", params.high_noise_diffusion_model_path.c_str());
     printf("    vae_path:                          %s\n", params.vae_path.c_str());
@@ -204,7 +210,7 @@ void print_usage(int argc, const char* argv[]) {
     printf("\n");
     printf("arguments:\n");
     printf("  -h, --help                         show this help message and exit\n");
-    printf("  -M, --mode [MODE]                  run mode, one of: [img_gen, vid_gen, convert], default: img_gen\n");
+    printf("  -M, --mode [MODE]                  run mode, one of: [img_gen, vid_gen, upscale, convert], default: img_gen\n");
     printf("  -t, --threads N                    number of threads to use during computation (default: -1)\n");
     printf("                                     If threads <= 0, then threads will be set to the number of CPU physical cores\n");
     printf("  --offload-to-cpu                   place the weights in RAM to save VRAM, and automatically load them into VRAM when needed\n");
@@ -215,11 +221,13 @@ void print_usage(int argc, const char* argv[]) {
     printf("  --clip_g                           path to the clip-g text encoder\n");
     printf("  --clip_vision                      path to the clip-vision encoder\n");
     printf("  --t5xxl                            path to the t5xxl text encoder\n");
+    printf("  --qwen2vl                          path to the qwen2vl text encoder\n");
+    printf("  --qwen2vl_vision                   path to the qwen2vl vit\n");
     printf("  --vae [VAE]                        path to vae\n");
     printf("  --taesd [TAESD_PATH]               path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)\n");
     printf("  --control-net [CONTROL_PATH]       path to control net model\n");
     printf("  --embd-dir [EMBEDDING_PATH]        path to embeddings\n");
-    printf("  --upscale-model [ESRGAN_PATH]      path to esrgan model. Upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now\n");
+    printf("  --upscale-model [ESRGAN_PATH]      path to esrgan model. For img_gen mode, upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now\n");
     printf("  --upscale-repeats                  Run the ESRGAN upscaler this many times (default 1)\n");
     printf("  --type [TYPE]                      weight type (examples: f32, f16, q4_0, q4_1, q5_0, q5_1, q8_0, q2_K, q3_K, q4_K)\n");
     printf("                                     If not specified, the default is the type of the weight file\n");
@@ -484,6 +492,8 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         {"", "--clip_g", "", &params.clip_g_path},
         {"", "--clip_vision", "", &params.clip_vision_path},
         {"", "--t5xxl", "", &params.t5xxl_path},
+        {"", "--qwen2vl", "", &params.qwen2vl_path},
+        {"", "--qwen2vl_vision", "", &params.qwen2vl_vision_path},
         {"", "--diffusion-model", "", &params.diffusion_model_path},
         {"", "--high-noise-diffusion-model", "", &params.high_noise_diffusion_model_path},
         {"", "--vae", "", &params.vae_path},
@@ -817,13 +827,13 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         params.n_threads = get_num_physical_cores();
     }
 
-    if (params.mode != CONVERT && params.mode != VID_GEN && params.prompt.length() == 0) {
+    if ((params.mode == IMG_GEN || params.mode == VID_GEN) && params.prompt.length() == 0) {
         fprintf(stderr, "error: the following arguments are required: prompt\n");
         print_usage(argc, argv);
         exit(1);
     }
 
-    if (params.model_path.length() == 0 && params.diffusion_model_path.length() == 0) {
+    if (params.mode != UPSCALE && params.model_path.length() == 0 && params.diffusion_model_path.length() == 0) {
         fprintf(stderr, "error: the following arguments are required: model_path/diffusion_model\n");
         print_usage(argc, argv);
         exit(1);
@@ -883,6 +893,17 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         exit(1);
     }
 
+    if (params.mode == UPSCALE) {
+        if (params.esrgan_path.length() == 0) {
+            fprintf(stderr, "error: upscale mode needs an upscaler model (--upscale-model)\n");
+            exit(1);
+        }
+        if (params.init_image_path.length() == 0) {
+            fprintf(stderr, "error: upscale mode needs an init image (--init-img)\n");
+            exit(1);
+        }
+    }
+
     if (params.seed < 0) {
         srand((int)time(NULL));
         params.seed = rand();
@@ -892,14 +913,6 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         if (params.output_path == "output.png") {
             params.output_path = "output.gguf";
         }
-    }
-
-    if (!isfinite(params.sample_params.guidance.img_cfg)) {
-        params.sample_params.guidance.img_cfg = params.sample_params.guidance.txt_cfg;
-    }
-
-    if (!isfinite(params.high_noise_sample_params.guidance.img_cfg)) {
-        params.high_noise_sample_params.guidance.img_cfg = params.high_noise_sample_params.guidance.txt_cfg;
     }
 }
 
@@ -943,7 +956,7 @@ std::string get_image_params(SDParams params, int64_t seed) {
         parameter_string += " " + std::string(sd_schedule_name(params.sample_params.scheduler));
     }
     parameter_string += ", ";
-    for (const auto& te : {params.clip_l_path, params.clip_g_path, params.t5xxl_path}) {
+    for (const auto& te : {params.clip_l_path, params.clip_g_path, params.t5xxl_path, params.qwen2vl_path, params.qwen2vl_vision_path}) {
         if (!te.empty()) {
             parameter_string += "TE: " + sd_basename(te) + ", ";
         }
@@ -1103,10 +1116,19 @@ bool load_images_from_dir(const std::string dir,
         return false;
     }
 
+    std::vector<fs::directory_entry> entries;
     for (const auto& entry : fs::directory_iterator(dir)) {
-        if (!entry.is_regular_file())
-            continue;
+        if (entry.is_regular_file()) {
+            entries.push_back(entry);
+        }
+    }
 
+    std::sort(entries.begin(), entries.end(),
+              [](const fs::directory_entry& a, const fs::directory_entry& b) {
+                  return a.path().filename().string() < b.path().filename().string();
+              });
+
+    for (const auto& entry : entries) {
         std::string path = entry.path().string();
         std::string ext  = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -1246,7 +1268,7 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    if (params.control_net_path.size() > 0 && params.control_image_path.size() > 0) {
+    if (params.control_image_path.size() > 0) {
         int width          = 0;
         int height         = 0;
         control_image.data = load_image(params.control_image_path.c_str(), width, height, params.width, params.height);
@@ -1317,6 +1339,8 @@ int main(int argc, const char* argv[]) {
         params.clip_g_path.c_str(),
         params.clip_vision_path.c_str(),
         params.t5xxl_path.c_str(),
+        params.qwen2vl_path.c_str(),
+        params.qwen2vl_vision_path.c_str(),
         params.diffusion_model_path.c_str(),
         params.high_noise_diffusion_model_path.c_str(),
         params.vae_path.c_str(),
@@ -1343,76 +1367,92 @@ int main(int argc, const char* argv[]) {
         params.flow_shift,
     };
 
-    sd_ctx_t* sd_ctx = new_sd_ctx(&sd_ctx_params);
+    sd_image_t* results = nullptr;
+    int num_results     = 0;
 
-    if (sd_ctx == NULL) {
-        printf("new_sd_ctx_t failed\n");
-        release_all_resources();
-        return 1;
-    }
+    if (params.mode == UPSCALE) {
+        num_results = 1;
+        results     = (sd_image_t*)calloc(num_results, sizeof(sd_image_t));
+        if (results == NULL) {
+            printf("failed to allocate results array\n");
+            release_all_resources();
+            return 1;
+        }
 
-    if (params.sample_params.sample_method == SAMPLE_METHOD_DEFAULT) {
-        params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
-    }
+        results[0]      = init_image;
+        init_image.data = NULL;
+    } else {
+        sd_ctx_t* sd_ctx = new_sd_ctx(&sd_ctx_params);
 
-    sd_image_t* results;
-    int num_results = 1;
-    if (params.mode == IMG_GEN) {
-        sd_img_gen_params_t img_gen_params = {
-            params.prompt.c_str(),
-            params.negative_prompt.c_str(),
-            params.clip_skip,
-            init_image,
-            ref_images.data(),
-            (int)ref_images.size(),
-            params.increase_ref_index,
-            mask_image,
-            params.width,
-            params.height,
-            params.sample_params,
-            params.strength,
-            params.seed,
-            params.batch_count,
-            control_image,
-            params.control_strength,
-            {
-                pmid_images.data(),
-                (int)pmid_images.size(),
-                params.pm_id_embed_path.c_str(),
-                params.pm_style_strength,
-            },  // pm_params
-            params.vae_tiling_params,
-        };
+        if (sd_ctx == NULL) {
+            printf("new_sd_ctx_t failed\n");
+            release_all_resources();
+            return 1;
+        }
 
-        results     = generate_image(sd_ctx, &img_gen_params);
-        num_results = params.batch_count;
-    } else if (params.mode == VID_GEN) {
-        sd_vid_gen_params_t vid_gen_params = {
-            params.prompt.c_str(),
-            params.negative_prompt.c_str(),
-            params.clip_skip,
-            init_image,
-            end_image,
-            control_frames.data(),
-            (int)control_frames.size(),
-            params.width,
-            params.height,
-            params.sample_params,
-            params.high_noise_sample_params,
-            params.moe_boundary,
-            params.strength,
-            params.seed,
-            params.video_frames,
-            params.vace_strength,
-        };
+        if (params.sample_params.sample_method == SAMPLE_METHOD_DEFAULT) {
+            params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+        }
 
-        results = generate_video(sd_ctx, &vid_gen_params, &num_results);
-    }
+        if (params.mode == IMG_GEN) {
+            sd_img_gen_params_t img_gen_params = {
+                params.prompt.c_str(),
+                params.negative_prompt.c_str(),
+                params.clip_skip,
+                init_image,
+                ref_images.data(),
+                (int)ref_images.size(),
+                params.increase_ref_index,
+                mask_image,
+                params.width,
+                params.height,
+                params.sample_params,
+                params.strength,
+                params.seed,
+                params.batch_count,
+                control_image,
+                params.control_strength,
+                {
+                    pmid_images.data(),
+                    (int)pmid_images.size(),
+                    params.pm_id_embed_path.c_str(),
+                    params.pm_style_strength,
+                },  // pm_params
+                params.vae_tiling_params,
+            };
 
-    if (results == NULL) {
-        printf("generate failed\n");
+            results     = generate_image(sd_ctx, &img_gen_params);
+            num_results = params.batch_count;
+        } else if (params.mode == VID_GEN) {
+            sd_vid_gen_params_t vid_gen_params = {
+                params.prompt.c_str(),
+                params.negative_prompt.c_str(),
+                params.clip_skip,
+                init_image,
+                end_image,
+                control_frames.data(),
+                (int)control_frames.size(),
+                params.width,
+                params.height,
+                params.sample_params,
+                params.high_noise_sample_params,
+                params.moe_boundary,
+                params.strength,
+                params.seed,
+                params.video_frames,
+                params.vace_strength,
+            };
+
+            results = generate_video(sd_ctx, &vid_gen_params, &num_results);
+        }
+
+        if (results == NULL) {
+            printf("generate failed\n");
+            free_sd_ctx(sd_ctx);
+            return 1;
+        }
+
         free_sd_ctx(sd_ctx);
-        return 1;
     }
 
     int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth
@@ -1425,7 +1465,7 @@ int main(int argc, const char* argv[]) {
         if (upscaler_ctx == NULL) {
             printf("new_upscaler_ctx failed\n");
         } else {
-            for (int i = 0; i < params.batch_count; i++) {
+            for (int i = 0; i < num_results; i++) {
                 if (results[i].data == NULL) {
                     continue;
                 }
@@ -1511,7 +1551,6 @@ int main(int argc, const char* argv[]) {
         results[i].data = NULL;
     }
     free(results);
-    free_sd_ctx(sd_ctx);
 
     release_all_resources();
 

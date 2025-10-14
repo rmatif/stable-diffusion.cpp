@@ -1333,7 +1333,7 @@ namespace WAN {
             k = ggml_reshape_4d(ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             v = ggml_reshape_4d(ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
 
-            x = Flux::attention(ctx, backend, q, k, v, pe, mask, flash_attn);  // [N, n_token, dim]
+            x = Rope::attention(ctx, backend, q, k, v, pe, mask, flash_attn);  // [N, n_token, dim]
 
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
@@ -1833,7 +1833,7 @@ namespace WAN {
                                               struct ggml_tensor* x) {
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
-            int64_t T = x->ne[1];
+            int64_t T = x->ne[2];
 
             int pad_t = (std::get<0>(params.patch_size) - T % std::get<0>(params.patch_size)) % std::get<0>(params.patch_size);
             int pad_h = (std::get<1>(params.patch_size) - H % std::get<1>(params.patch_size)) % std::get<1>(params.patch_size);

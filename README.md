@@ -21,8 +21,10 @@ API and command-line option may change frequently.***
     - [SD3/SD3.5](./docs/sd3.md)
     - [Flux-dev/Flux-schnell](./docs/flux.md)
     - [Chroma](./docs/chroma.md)
+    - [Qwen Image](./docs/qwen_image.md)
   - Image Edit Models
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
+    - [Qwen Image Edit/Qwen Image Edit 2509](./docs/qwen_image_edit.md)
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
   - [PhotoMaker](https://github.com/TencentARC/PhotoMaker) support.
@@ -285,7 +287,7 @@ usage: ./bin/sd [arguments]
 
 arguments:
   -h, --help                         show this help message and exit
-  -M, --mode [MODE]                  run mode, one of: [img_gen, vid_gen, convert], default: img_gen
+  -M, --mode [MODE]                  run mode, one of: [img_gen, vid_gen, upscale, convert], default: img_gen
   -t, --threads N                    number of threads to use during computation (default: -1)
                                      If threads <= 0, then threads will be set to the number of CPU physical cores
   --offload-to-cpu                   place the weights in RAM to save VRAM, and automatically load them into VRAM when needed
@@ -296,11 +298,13 @@ arguments:
   --clip_g                           path to the clip-g text encoder
   --clip_vision                      path to the clip-vision encoder
   --t5xxl                            path to the t5xxl text encoder
+  --qwen2vl                          path to the qwen2vl text encoder
+  --qwen2vl_vision                   path to the qwen2vl vit
   --vae [VAE]                        path to vae
   --taesd [TAESD_PATH]               path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)
   --control-net [CONTROL_PATH]       path to control net model
   --embd-dir [EMBEDDING_PATH]        path to embeddings
-  --upscale-model [ESRGAN_PATH]      path to esrgan model. Upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now
+  --upscale-model [ESRGAN_PATH]      path to esrgan model. For img_gen mode, upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now
   --upscale-repeats                  Run the ESRGAN upscaler this many times (default 1)
   --type [TYPE]                      weight type (examples: f32, f16, q4_0, q4_1, q5_0, q5_1, q8_0, q2_K, q3_K, q4_K)
                                      If not specified, the default is the type of the weight file
@@ -449,6 +453,7 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 - [Local Diffusion](https://github.com/rmatif/Local-Diffusion)
 - [sd.cpp-webui](https://github.com/daniandtheweb/sd.cpp-webui)
 - [LocalAI](https://github.com/mudler/LocalAI)
+- [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
 
 ## Contributors
 
@@ -463,6 +468,7 @@ Thank you to all the people who have already contributed to stable-diffusion.cpp
 ## References
 
 - [ggml](https://github.com/ggerganov/ggml)
+- [diffusers](https://github.com/huggingface/diffusers)
 - [stable-diffusion](https://github.com/CompVis/stable-diffusion)
 - [sd3-ref](https://github.com/Stability-AI/sd3-ref)
 - [stable-diffusion-stability-ai](https://github.com/Stability-AI/stablediffusion)

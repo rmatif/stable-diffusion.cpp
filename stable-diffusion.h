@@ -131,6 +131,8 @@ typedef struct {
     const char* clip_g_path;
     const char* clip_vision_path;
     const char* t5xxl_path;
+    const char* qwen2vl_path;
+    const char* qwen2vl_vision_path;
     const char* diffusion_model_path;
     const char* high_noise_diffusion_model_path;
     const char* vae_path;
@@ -282,6 +284,8 @@ SD_API void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx);
 SD_API sd_image_t upscale(upscaler_ctx_t* upscaler_ctx,
                           sd_image_t input_image,
                           uint32_t upscale_factor);
+
+SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
