@@ -156,6 +156,91 @@ std::string base64_encode(const unsigned char* data, size_t length) {
 
     return encoded;
 }
+
+struct Utf8SplitResult {
+    std::string valid;
+    std::string remainder;
+};
+
+Utf8SplitResult extract_complete_utf8(const std::string& input) {
+    Utf8SplitResult result;
+    result.valid.reserve(input.size());
+
+    const std::size_t size = input.size();
+    std::size_t i = 0;
+    while (i < size) {
+        unsigned char c = static_cast<unsigned char>(input[i]);
+        if (c < 0x80) {
+            result.valid.push_back(static_cast<char>(c));
+            ++i;
+            continue;
+        }
+
+        std::size_t expected = 0;
+        if (c >= 0xC2 && c <= 0xDF) {
+            expected = 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            expected = 3;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            expected = 4;
+        } else {
+            result.valid.push_back('?');
+            ++i;
+            continue;
+        }
+
+        if (i + expected > size) {
+            result.remainder = input.substr(i);
+            return result;
+        }
+
+        bool valid_sequence = true;
+        for (std::size_t j = 1; j < expected; ++j) {
+            unsigned char continuation = static_cast<unsigned char>(input[i + j]);
+            if ((continuation & 0xC0) != 0x80) {
+                valid_sequence = false;
+                break;
+            }
+        }
+        if (!valid_sequence) {
+            result.valid.push_back('?');
+            ++i;
+            continue;
+        }
+
+        if (expected == 3) {
+            unsigned char b1 = static_cast<unsigned char>(input[i + 1]);
+            if (c == 0xE0 && b1 < 0xA0) {
+                result.valid.push_back('?');
+                ++i;
+                continue;
+            }
+            if (c == 0xED && b1 >= 0xA0) {
+                result.valid.push_back('?');
+                ++i;
+                continue;
+            }
+        } else if (expected == 4) {
+            unsigned char b1 = static_cast<unsigned char>(input[i + 1]);
+            if (c == 0xF0 && b1 < 0x90) {
+                result.valid.push_back('?');
+                ++i;
+                continue;
+            }
+            if (c == 0xF4 && b1 >= 0x90) {
+                result.valid.push_back('?');
+                ++i;
+                continue;
+            }
+        }
+
+        result.valid.append(input, i, expected);
+        i += expected;
+    }
+
+    return result;
+}
+
 struct CLIOptions {
     std::string model_path;
     int port = 8000;
@@ -361,6 +446,7 @@ struct ServerState {
     CtxConfig ctx_config;
     CtxConfig default_config;
     LogCollector* active_collector = nullptr;
+    std::string pending_log_fragment;
     bool verbose = false;
 };
 
@@ -1622,13 +1708,28 @@ void sd_server_log_callback(sd_log_level_t level, const char* text, void* user_d
     }
 
     ServerState* state = static_cast<ServerState*>(user_data);
-    std::string message(text);
-    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
-        message.pop_back();
-    }
+    std::string message;
+    bool only_partial = false;
 
     {
         std::lock_guard<std::mutex> guard(state->log_mutex);
+
+        std::string combined = state->pending_log_fragment;
+        combined.append(text);
+
+        Utf8SplitResult sanitized = extract_complete_utf8(combined);
+        state->pending_log_fragment = std::move(sanitized.remainder);
+
+        message = std::move(sanitized.valid);
+        while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
+            message.pop_back();
+        }
+
+        only_partial = message.empty() && !state->pending_log_fragment.empty();
+        if (only_partial) {
+            return;
+        }
+
         if (state->active_collector != nullptr) {
             state->active_collector->add(level, message);
             return;
