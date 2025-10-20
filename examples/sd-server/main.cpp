@@ -2197,119 +2197,26 @@ int main(int argc, char** argv) {
             effective_seed = generate_random_seed();
         }
 
-        const bool enable_streaming = request_params.batch_count > 1;
-        if (enable_streaming) {
-            GenerationRequest streaming_request = std::move(request_params);
-            CtxConfig active_config = state.ctx_config;
-            auto streaming_responder = std::make_shared<StreamingImageResponder>(state,
-                                                                                  std::move(lock),
-                                                                                  std::move(capture_scope),
-                                                                                  collector_ptr,
-                                                                                  std::move(streaming_request),
-                                                                                  std::move(active_config),
-                                                                                  random_seed_requested,
-                                                                                  effective_seed);
-            res.status = 200;
-            res.set_chunked_content_provider(
-                "application/json",
-                [streaming_responder](size_t, httplib::DataSink& sink) {
-                    return streaming_responder->next(sink);
-                },
-                [streaming_responder](bool) {
-                    streaming_responder->cancel();
-                });
-            return;
-        }
-
-        sd_img_gen_params_t img_params;
-        sd_img_gen_params_init(&img_params);
-
-        img_params.prompt           = request_params.prompt.c_str();
-        img_params.negative_prompt  = request_params.negative_prompt.c_str();
-        img_params.clip_skip        = request_params.clip_skip;
-        img_params.width            = request_params.width;
-        img_params.height           = request_params.height;
-        img_params.batch_count      = request_params.batch_count;
-        img_params.seed             = effective_seed;
-        if (request_params.has_vae_tiling_override) {
-            img_params.vae_tiling_params = request_params.vae_tiling_params;
-        }
-
-        sd_sample_params_t& sample_params = img_params.sample_params;
-        sample_params.sample_steps = request_params.sample_steps;
-        sample_params.guidance.txt_cfg = request_params.cfg_scale;
-        if (request_params.has_img_cfg_scale) {
-            sample_params.guidance.img_cfg = request_params.img_cfg_scale;
-        }
-        if (!std::isfinite(sample_params.guidance.img_cfg)) {
-            sample_params.guidance.img_cfg = sample_params.guidance.txt_cfg;
-        }
-        if (request_params.override_sample_method) {
-            sample_params.sample_method = request_params.sample_method;
-        }
-        if (sample_params.sample_method == SAMPLE_METHOD_DEFAULT) {
-            sample_params.sample_method = sd_get_default_sample_method(state.ctx);
-        }
-        if (request_params.override_scheduler) {
-            sample_params.scheduler = request_params.scheduler;
-        }
-        if (request_params.has_eta) {
-            sample_params.eta = request_params.eta;
-        }
-        sample_params.shifted_timestep = request_params.shifted_timestep;
-
-        auto start_time = std::chrono::steady_clock::now();
-        sd_image_t* results = generate_image(state.ctx, &img_params);
-        if (results == nullptr) {
-            auto response = make_error_response("image generation failed", collector);
-            res.status = 500;
-            res.set_content(response.dump(), "application/json");
-            return;
-        }
-
-        ImageResultGuard guard{results, img_params.batch_count};
-
-        json images = json::array();
-        for (int i = 0; i < img_params.batch_count; ++i) {
-            sd_image_t& image = results[i];
-            if (image.data == nullptr) {
-                auto response = make_error_response("image data is empty", collector);
-                res.status = 500;
-                res.set_content(response.dump(), "application/json");
-                return;
-            }
-            int png_size = 0;
-            unsigned char* png_data = stbi_write_png_to_mem(image.data, 0, image.width, image.height, image.channel, &png_size, nullptr);
-            if (png_data == nullptr) {
-                auto response = make_error_response("failed to encode PNG", collector);
-                res.status = 500;
-                res.set_content(response.dump(), "application/json");
-                return;
-            }
-            std::string encoded = base64_encode(png_data, static_cast<size_t>(png_size));
-            STBIW_FREE(png_data);
-
-            // Preserve the legacy -1 seed while still reporting the concrete seed that was used.
-            int64_t actual_seed = random_seed_requested ? (effective_seed + i) : (request_params.seed + i);
-            int64_t reported_seed = random_seed_requested ? -1 : actual_seed;
-            images.push_back({{"index", i},
-                              {"seed", reported_seed},
-                              {"actual_seed", actual_seed},
-                              {"width", image.width},
-                              {"height", image.height},
-                              {"format", "png"},
-                              {"mime_type", "image/png"},
-                              {"data", std::move(encoded)}});
-        }
-
-        auto end_time = std::chrono::steady_clock::now();
-        int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-        auto response = make_success_response(images, elapsed_ms, request_params, state.ctx_config, collector, effective_seed);
-        response["applied_seed"] = effective_seed;
-        response["random_seed_requested"] = random_seed_requested;
+        GenerationRequest streaming_request = std::move(request_params);
+        CtxConfig active_config = state.ctx_config;
+        auto streaming_responder = std::make_shared<StreamingImageResponder>(state,
+                                                                              std::move(lock),
+                                                                              std::move(capture_scope),
+                                                                              collector_ptr,
+                                                                              std::move(streaming_request),
+                                                                              std::move(active_config),
+                                                                              random_seed_requested,
+                                                                              effective_seed);
         res.status = 200;
-        res.set_content(response.dump(), "application/json");
+        res.set_chunked_content_provider(
+            "application/json",
+            [streaming_responder](size_t, httplib::DataSink& sink) {
+                return streaming_responder->next(sink);
+            },
+            [streaming_responder](bool) {
+                streaming_responder->cancel();
+            });
+        return;
     });
 
     server.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
