@@ -25,6 +25,17 @@
 #include "latent-preview.h"
 #include "name_conversion.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#include "stb_image.h"
+#include <cstring>
+#include <algorithm>
+#include <unordered_map>
+
+// #define STB_IMAGE_WRITE_IMPLEMENTATION
+// #define STB_IMAGE_WRITE_STATIC
+// #include "stb_image_write.h"
+
 const char* model_version_to_str[] = {
     "SD 1.x",
     "SD 1.x Inpaint",
@@ -72,6 +83,10 @@ const char* sampling_methods_str[] = {
     "TCD",
     "Res Multistep",
     "Res 2s",
+};
+struct WeightedConditionRef {
+    size_t cond_index;
+    float weight;
 };
 
 /*================================================== Helper Functions ================================================*/
@@ -2038,6 +2053,8 @@ public:
                         bool inverse_noise_scaling,
                         ggml_tensor* init_latent,
                         ggml_tensor* noise,
+                        const std::vector<SDCondition>& composable_conds,
+                        const std::vector<WeightedConditionRef>& weighted_conds,
                         SDCondition cond,
                         SDCondition uncond,
                         SDCondition img_cond,
@@ -2228,10 +2245,9 @@ public:
                 } else {
                     LOG_ERROR("controlnet compute failed");
                 }
-                // print_ggml_tensor(controls[12]);
-                // GGML_ASSERT(0);
             }
 
+            DiffusionParams diffusion_params;
             diffusion_params.x                  = noised_input;
             diffusion_params.timesteps          = timesteps;
             diffusion_params.guidance           = guidance_tensor;
@@ -2258,43 +2274,34 @@ public:
                 return true;
             };
 
-            const SDCondition* active_condition = nullptr;
-            ggml_tensor** active_output         = &out_cond;
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                // cond
-                diffusion_params.context  = cond.c_crossattn;
-                diffusion_params.c_concat = cond.c_concat;
-                diffusion_params.y        = cond.c_vector;
-                active_condition          = &cond;
-            } else {
-                diffusion_params.context  = id_cond.c_crossattn;
-                diffusion_params.c_concat = cond.c_concat;
-                diffusion_params.y        = id_cond.c_vector;
-                active_condition          = &id_cond;
-            }
+            bool current_step_skipped = false;
 
-            if (!run_diffusion_condition(active_condition, active_output)) {
-                return nullptr;
-            }
-
-            bool current_step_skipped = step_cache.is_step_skipped();
-
-            float* negative_data = nullptr;
-            if (has_unconditioned) {
-                // uncond
-                if (!current_step_skipped && control_hint != nullptr && control_net != nullptr) {
-                    if (control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector)) {
+            auto apply_condition = [&](const SDCondition& condition,
+                                       ggml_tensor** output,
+                                       bool run_control_net) -> bool {
+                current_step_skipped = step_cache.is_step_skipped();
+                if (run_control_net && !current_step_skipped && control_hint != nullptr && control_net != nullptr) {
+                    if (control_net->compute(n_threads, noised_input, control_hint, timesteps, condition.c_crossattn, condition.c_vector)) {
                         controls = control_net->controls;
                     } else {
                         LOG_ERROR("controlnet compute failed");
+                        return false;
                     }
                 }
                 current_step_skipped      = step_cache.is_step_skipped();
                 diffusion_params.controls = controls;
-                diffusion_params.context  = uncond.c_crossattn;
-                diffusion_params.c_concat = uncond.c_concat;
-                diffusion_params.y        = uncond.c_vector;
-                if (!run_diffusion_condition(&uncond, &out_uncond)) {
+                diffusion_params.context  = condition.c_crossattn;
+                diffusion_params.c_concat = condition.c_concat;
+                diffusion_params.y        = condition.c_vector;
+                if (!run_diffusion_condition(&condition, output)) {
+                    return false;
+                }
+                return true;
+            };
+
+            float* negative_data = nullptr;
+            if (has_unconditioned) {
+                if (!apply_condition(uncond, &out_uncond, true)) {
                     return nullptr;
                 }
                 negative_data = (float*)out_uncond->data;
@@ -2302,13 +2309,67 @@ public:
 
             float* img_cond_data = nullptr;
             if (has_img_cond) {
-                diffusion_params.context  = img_cond.c_crossattn;
-                diffusion_params.c_concat = img_cond.c_concat;
-                diffusion_params.y        = img_cond.c_vector;
-                if (!run_diffusion_condition(&img_cond, &out_img_cond)) {
+                if (!apply_condition(img_cond, &out_img_cond, false)) {
                     return nullptr;
                 }
                 img_cond_data = (float*)out_img_cond->data;
+            }
+
+            bool use_multi_cond = !weighted_conds.empty() && !composable_conds.empty() && (start_merge_step == -1 || step <= start_merge_step);
+            const float* base_data = nullptr;
+            if (use_multi_cond) {
+                if (img_cond_data != nullptr) {
+                    base_data = img_cond_data;
+                } else if (negative_data != nullptr) {
+                    base_data = negative_data;
+                }
+            }
+
+            std::vector<float> combined_buffer;
+            float* positive_data = nullptr;
+
+            if (use_multi_cond) {
+                int cond_elements = (int)ggml_nelements(out_cond);
+                combined_buffer.resize(cond_elements);
+
+                if (base_data != nullptr) {
+                    std::memcpy(combined_buffer.data(), base_data, cond_elements * sizeof(float));
+                } else {
+                    std::fill(combined_buffer.begin(), combined_buffer.end(), 0.0f);
+                }
+
+                for (const auto& wc : weighted_conds) {
+                    const SDCondition& component = composable_conds[wc.cond_index];
+                    if (!apply_condition(component, &out_cond, true)) {
+                        return nullptr;
+                    }
+                    float* component_data = (float*)out_cond->data;
+
+                    if (base_data != nullptr) {
+                        for (int i = 0; i < cond_elements; ++i) {
+                            combined_buffer[i] += wc.weight * (component_data[i] - base_data[i]);
+                        }
+                    } else {
+                        for (int i = 0; i < cond_elements; ++i) {
+                            combined_buffer[i] += wc.weight * component_data[i];
+                        }
+                    }
+                }
+
+                std::memcpy(out_cond->data, combined_buffer.data(), combined_buffer.size() * sizeof(float));
+                positive_data = (float*)out_cond->data;
+            } else {
+                if (start_merge_step == -1 || step <= start_merge_step) {
+                    if (!apply_condition(cond, &out_cond, true)) {
+                        return nullptr;
+                    }
+                } else {
+                    bool should_run_control = control_hint != nullptr && control_net != nullptr;
+                    if (!apply_condition(id_cond, &out_cond, should_run_control)) {
+                        return nullptr;
+                    }
+                }
+                positive_data = (float*)out_cond->data;
             }
 
             int step_count         = static_cast<int>(sigmas.size());
@@ -2333,7 +2394,6 @@ public:
             }
             float* vec_denoised  = (float*)denoised->data;
             float* vec_input     = (float*)input->data;
-            float* positive_data = (float*)out_cond->data;
             int ne_elements      = (int)ggml_nelements(denoised);
 
             if (shifted_timestep > 0 && sd_version_is_sdxl(version)) {
@@ -3069,6 +3129,54 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     SDCondition cond                 = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
                                                                                            sd_ctx->sd->n_threads,
                                                                                            condition_params);
+    std::vector<SDCondition> composable_conds_storage;
+    std::vector<WeightedConditionRef> weighted_cond_refs;
+    {
+        auto and_parts = split_prompt_by_AND(prompt);
+        bool enable_composable = false;
+        if (and_parts.size() > 1) {
+            enable_composable = true;
+        } else if (!and_parts.empty() && and_parts[0].second != 1.0f) {
+            enable_composable = true;
+        }
+
+        if (!(sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sd2(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version))) {
+            enable_composable = false;
+        }
+
+        if (enable_composable) {
+            std::unordered_map<std::string, size_t> cond_cache;
+            cond_cache.reserve(and_parts.size());
+            composable_conds_storage.reserve(and_parts.size());
+
+            for (const auto& part : and_parts) {
+                const std::string& part_text = part.first;
+                float part_weight            = part.second;
+
+                size_t cond_index;
+                auto cache_it = cond_cache.find(part_text);
+                if (cache_it == cond_cache.end()) {
+                    condition_params.text = part_text;
+                    SDCondition component_cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                                                     sd_ctx->sd->n_threads,
+                                                                                                     condition_params);
+                    composable_conds_storage.push_back(component_cond);
+                    cond_index = composable_conds_storage.size() - 1;
+                    cond_cache.emplace(part_text, cond_index);
+                } else {
+                    cond_index = cache_it->second;
+                }
+
+                weighted_cond_refs.push_back({cond_index, part_weight});
+            }
+        }
+    }
+    condition_params.text = prompt;
+    auto sync_composable_concat = [&]() {
+        for (auto& component : composable_conds_storage) {
+            component.c_concat = cond.c_concat;
+        }
+    };
 
     SDCondition uncond;
     if (guidance.txt_cfg != 1.0 ||
@@ -3166,6 +3274,7 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
             concat_latent = empty_latent;
         }
         cond.c_concat   = concat_latent;
+        sync_composable_concat();
         uncond.c_concat = empty_latent;
         denoise_mask    = nullptr;
     } else if (sd_version_is_unet_edit(sd_ctx->sd->version)) {
@@ -3173,8 +3282,10 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         ggml_set_f32(empty_latent, 0);
         uncond.c_concat = empty_latent;
         cond.c_concat   = ref_latents[0];
+        sync_composable_concat();
         if (cond.c_concat == nullptr) {
             cond.c_concat = empty_latent;
+            sync_composable_concat();
         }
     } else if (sd_version_is_control(sd_ctx->sd->version)) {
         auto empty_latent = ggml_dup_tensor(work_ctx, init_latent);
@@ -3182,9 +3293,11 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         uncond.c_concat = empty_latent;
         if (sd_ctx->sd->control_net == nullptr) {
             cond.c_concat = control_latent;
+            sync_composable_concat();
         }
         if (cond.c_concat == nullptr) {
             cond.c_concat = empty_latent;
+            sync_composable_concat();
         }
     }
     SDCondition img_cond;
@@ -3211,29 +3324,31 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
             LOG_INFO("PHOTOMAKER: start_merge_step: %d", start_merge_step);
         }
 
-        ggml_tensor* x_0     = sd_ctx->sd->sample(work_ctx,
-                                                  sd_ctx->sd->diffusion_model,
-                                                  true,
-                                                  x_t,
-                                                  noise,
-                                                  cond,
-                                                  uncond,
-                                                  img_cond,
-                                                  image_hint,
-                                                  control_strength,
-                                                  guidance,
-                                                  eta,
-                                                  shifted_timestep,
-                                                  sample_method,
-                                                  sigmas,
-                                                  start_merge_step,
-                                                  id_cond,
-                                                  ref_latents,
-                                                  increase_ref_index,
-                                                  denoise_mask,
-                                                  nullptr,
-                                                  1.0f,
-                                                  cache_params);
+        ggml_tensor* x_0 = sd_ctx->sd->sample(work_ctx,
+                                              sd_ctx->sd->diffusion_model,
+                                              true,
+                                              x_t,
+                                              noise,
+                                              composable_conds_storage,
+                                              weighted_cond_refs,
+                                              cond,
+                                              uncond,
+                                              img_cond,
+                                              image_hint,
+                                              control_strength,
+                                              guidance,
+                                              eta,
+                                              shifted_timestep,
+                                              sample_method,
+                                              sigmas,
+                                              start_merge_step,
+                                              id_cond,
+                                              ref_latents,
+                                              increase_ref_index,
+                                              denoise_mask,
+                                              nullptr,
+                                              1.0f,
+                                              cache_params);
         int64_t sampling_end = ggml_time_ms();
         if (x_0 != nullptr) {
             // print_ggml_tensor(x_0);
@@ -3968,6 +4083,8 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                  false,
                                  x_t,
                                  noise,
+                                 std::vector<SDCondition>{},
+                                 std::vector<WeightedConditionRef>{},
                                  cond,
                                  uncond,
                                  {},
@@ -4005,6 +4122,8 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                           true,
                                           x_t,
                                           noise,
+                                          std::vector<SDCondition>{},
+                                          std::vector<WeightedConditionRef>{},
                                           cond,
                                           uncond,
                                           {},

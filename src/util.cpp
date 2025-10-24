@@ -674,14 +674,14 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     std::vector<int> round_brackets;
     std::vector<int> square_brackets;
 
-    float round_bracket_multiplier  = 1.1f;
-    float square_bracket_multiplier = 1 / 1.1f;
+    const float round_bracket_multiplier  = 1.1f;
+    const float square_bracket_multiplier = 1.0f / 1.1f;
 
     std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]+|:|\bB)");
     std::regex re_break(R"(\s*\bBREAK\b\s*)");
 
     auto multiply_range = [&](int start_position, float multiplier) {
-        for (int p = start_position; p < res.size(); ++p) {
+        for (int p = start_position; p < static_cast<int>(res.size()); ++p) {
             res[p].second *= multiplier;
         }
     };
@@ -690,30 +690,35 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     std::string remaining_text = text;
 
     while (std::regex_search(remaining_text, m, re_attention)) {
-        std::string text   = m[0];
-        std::string weight = m[1];
+        std::string token      = m[0];
+        std::string weight_str = m[1];
 
-        if (text == "(") {
-            round_brackets.push_back((int)res.size());
-        } else if (text == "[") {
-            square_brackets.push_back((int)res.size());
-        } else if (!weight.empty()) {
-            if (!round_brackets.empty()) {
-                multiply_range(round_brackets.back(), std::stof(weight));
-                round_brackets.pop_back();
-            }
-        } else if (text == ")" && !round_brackets.empty()) {
+        if (!token.empty() && token[0] == '\\') {
+            res.push_back({token.substr(1), 1.0f});
+        } else if (token == "(") {
+            round_brackets.push_back(static_cast<int>(res.size()));
+        } else if (token == "[") {
+            square_brackets.push_back(static_cast<int>(res.size()));
+        } else if (!weight_str.empty() && !round_brackets.empty()) {
+            multiply_range(round_brackets.back(), std::stof(weight_str));
+            round_brackets.pop_back();
+        } else if (token == ")" && !round_brackets.empty()) {
             multiply_range(round_brackets.back(), round_bracket_multiplier);
             round_brackets.pop_back();
-        } else if (text == "]" && !square_brackets.empty()) {
+        } else if (token == "]" && !square_brackets.empty()) {
             multiply_range(square_brackets.back(), square_bracket_multiplier);
             square_brackets.pop_back();
-        } else if (text == "\\(") {
-            res.push_back({text.substr(1), 1.0f});
-        } else if (std::regex_search(text, m2, re_break)) {
-            res.push_back({"BREAK", -1.0f});
         } else {
-            res.push_back({text, 1.0f});
+            std::string::const_iterator search_start = token.cbegin();
+            std::smatch break_match;
+            while (std::regex_search(search_start, token.cend(), break_match, re_break)) {
+                std::string segment(search_start, break_match[0].first);
+                res.push_back({segment, 1.0f});
+                res.push_back({"BREAK", -1.0f});
+                search_start = break_match[0].second;
+            }
+            std::string tail(search_start, token.cend());
+            res.push_back({tail, 1.0f});
         }
 
         remaining_text = m.suffix();
@@ -732,7 +737,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     }
 
     int i = 0;
-    while (i + 1 < res.size()) {
+    while (i + 1 < static_cast<int>(res.size())) {
         if (res[i].second == res[i + 1].second) {
             res[i].first += res[i + 1].first;
             res.erase(res.begin() + i + 1);
@@ -742,4 +747,36 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     }
 
     return res;
+}
+
+std::vector<std::pair<std::string, float>> split_prompt_by_AND(const std::string& prompt) {
+    static const std::regex re_and(R"(\bAND\b)");
+    static const std::regex re_weight(R"(^((?:\s|.)*?)(?:\s*:\s*([-+]?(?:\d+\.?|\d*\.\d+)))?\s*$)");
+
+    std::vector<std::pair<std::string, float>> result;
+    std::sregex_token_iterator iter(prompt.begin(), prompt.end(), re_and, -1);
+    std::sregex_token_iterator end;
+
+    for (; iter != end; ++iter) {
+        std::string subprompt = iter->str();
+        std::smatch match;
+        float weight = 1.0f;
+        std::string text = subprompt;
+
+        if (std::regex_match(subprompt, match, re_weight)) {
+            text = match[1].str();
+            std::string weight_group = match[2].str();
+            if (!weight_group.empty()) {
+                weight = std::stof(weight_group);
+            }
+        }
+
+        result.emplace_back(text, weight);
+    }
+
+    if (result.empty()) {
+        result.emplace_back("", 1.0f);
+    }
+
+    return result;
 }
