@@ -293,47 +293,97 @@ public:
 
     void pad_tokens(std::vector<int>& tokens,
                     std::vector<float>& weights,
-                    size_t max_length = 0,
-                    bool padding      = false) {
-        if (max_length > 0 && padding) {
-            size_t n = static_cast<size_t>(std::ceil(tokens.size() * 1.0 / (max_length - 2)));
-            if (n == 0) {
-                n = 1;
+                    size_t max_length                          = 0,
+                    bool padding                               = false,
+                    const std::vector<size_t>* breakpoints     = nullptr,
+                    std::vector<size_t>* index_mapping         = nullptr) {
+        if (!padding || max_length <= 2) {
+            if (index_mapping) {
+                index_mapping->resize(tokens.size());
+                for (size_t i = 0; i < tokens.size(); ++i) {
+                    (*index_mapping)[i] = i;
+                }
             }
-            size_t length = max_length * n;
-            LOG_DEBUG("token length: %llu", length);
-            std::vector<int> new_tokens;
-            std::vector<float> new_weights;
+            return;
+        }
+
+        const size_t original_token_count = tokens.size();
+        const size_t chunk_body           = max_length - 2;
+
+        if (index_mapping) {
+            index_mapping->assign(original_token_count, 0);
+        }
+        std::vector<size_t> segments;
+        segments.reserve((breakpoints ? breakpoints->size() : 0) + 2);
+        segments.push_back(0);
+        if (breakpoints) {
+            segments.insert(segments.end(), breakpoints->begin(), breakpoints->end());
+        }
+        segments.push_back(tokens.size());
+
+        std::vector<int> new_tokens;
+        std::vector<float> new_weights;
+        new_tokens.reserve(max_length * segments.size());
+        new_weights.reserve(max_length * segments.size());
+
+        size_t chunk_body_count = 0;
+        size_t original_tok_idx = 0;
+
+        auto start_new_chunk = [&]() {
             new_tokens.push_back(BOS_TOKEN_ID);
-            new_weights.push_back(1.0);
-            int token_idx = 0;
-            for (int i = 1; i < length; i++) {
-                if (token_idx >= tokens.size()) {
-                    break;
-                }
-                if (i % max_length == 0) {
-                    new_tokens.push_back(BOS_TOKEN_ID);
-                    new_weights.push_back(1.0);
-                } else if (i % max_length == max_length - 1) {
-                    new_tokens.push_back(EOS_TOKEN_ID);
-                    new_weights.push_back(1.0);
-                } else {
-                    new_tokens.push_back(tokens[token_idx]);
-                    new_weights.push_back(weights[token_idx]);
-                    token_idx++;
-                }
+            new_weights.push_back(1.0f);
+            chunk_body_count = 0;
+        };
+
+        auto finalize_current_chunk = [&]() {
+            while (chunk_body_count < chunk_body) {
+                new_tokens.push_back(PAD_TOKEN_ID);
+                new_weights.push_back(1.0f);
+                ++chunk_body_count;
+            }
+            new_tokens.push_back(EOS_TOKEN_ID);
+            new_weights.push_back(1.0f);
+            chunk_body_count = 0;
+        };
+
+        auto append_token = [&](int token, float weight) {
+            if (chunk_body_count == chunk_body) {
+                finalize_current_chunk();
+                start_new_chunk();
             }
 
-            new_tokens.push_back(EOS_TOKEN_ID);
-            new_weights.push_back(1.0);
-            tokens  = new_tokens;
-            weights = new_weights;
+            if (index_mapping && original_tok_idx < index_mapping->size()) {
+                (*index_mapping)[original_tok_idx] = new_tokens.size();
+            }
+            new_tokens.push_back(token);
+            new_weights.push_back(weight);
+            ++chunk_body_count;
+            ++original_tok_idx;
+        };
 
-            if (padding) {
-                tokens.insert(tokens.end(), length - tokens.size(), PAD_TOKEN_ID);
-                weights.insert(weights.end(), length - weights.size(), 1.0);
+        start_new_chunk();
+
+        for (size_t seg = 0; seg + 1 < segments.size(); ++seg) {
+            size_t start = std::min(segments[seg], tokens.size());
+            size_t end   = std::min(segments[seg + 1], tokens.size());
+
+            if (start > end) {
+                std::swap(start, end);
+            }
+
+            for (size_t idx = start; idx < end; ++idx) {
+                append_token(tokens[idx], weights[idx]);
+            }
+
+            finalize_current_chunk();
+
+            if (seg + 1 < segments.size() - 1) {
+                start_new_chunk();
             }
         }
+
+        tokens.swap(new_tokens);
+        weights.swap(new_weights);
     }
 
     std::string clean_up_tokenization(std::string& text) {
