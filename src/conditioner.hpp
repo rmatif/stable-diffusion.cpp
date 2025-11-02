@@ -325,18 +325,23 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             LOG_DEBUG("parse '%s' to %s", text.c_str(), ss.str().c_str());
         }
 
+        std::vector<size_t> breakpoints;
         std::vector<int> tokens;
         std::vector<float> weights;
         std::vector<bool> class_token_mask;
         int32_t class_idx = -1, tokens_acc = 0;
         for (const auto& item : parsed_attention) {
-            std::vector<int> class_token_index;
-            std::vector<int> clean_input_ids;
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
-            size_t search_pos = 0;
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                breakpoints.push_back(tokens.size());
+                continue;
+            }
 
-            auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
+            std::vector<int> class_token_index;
+            std::vector<int> clean_input_ids;
+            size_t search_pos            = 0;
+            auto on_new_token_cb         = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
                 std::string token_str;
                 size_t consumed_len = 0;
                 bool is_embed_tag = false;
@@ -448,15 +453,32 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         // tokens.insert(tokens.begin(), tokenizer.BOS_TOKEN_ID);
         // weights.insert(weights.begin(), 1.0);
 
-        tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        const bool has_tokens = !tokens.empty();
+        std::vector<size_t> index_mapping;
+        tokenizer.pad_tokens(tokens,
+                             weights,
+                             max_length,
+                             padding,
+                             &breakpoints,
+                             (padding && has_tokens) ? &index_mapping : nullptr);
         int offset = pm_version == PM_VERSION_2 ? 2 * num_input_imgs : num_input_imgs;
-        for (int i = 0; i < tokens.size(); i++) {
-            // if (class_idx + 1 <= i && i < class_idx + 1 + 2*num_input_imgs) // photomaker V2 has num_tokens(=2)*num_input_imgs
-            if (class_idx + 1 <= i && i < class_idx + 1 + offset)  // photomaker V2 has num_tokens(=2)*num_input_imgs
-                                                                   // hardcode for now
-                class_token_mask.push_back(true);
-            else
-                class_token_mask.push_back(false);
+        int mask_start = -1;
+        if (class_idx >= 0) {
+            if (padding && has_tokens && class_idx < static_cast<int>(index_mapping.size())) {
+                mask_start = static_cast<int>(index_mapping[class_idx]) + 1;
+            } else {
+                mask_start = class_idx + 1;
+            }
+        }
+        int mask_end = (mask_start >= 0) ? mask_start + offset : -1;
+
+        class_token_mask.reserve(tokens.size());
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            bool mask = false;
+            if (mask_start >= 0) {
+                mask = (mask_start <= static_cast<int>(i) && static_cast<int>(i) < mask_end);
+            }
+            class_token_mask.push_back(mask);
         }
 
         // printf("[");
@@ -493,14 +515,18 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             LOG_DEBUG("parse '%s' to %s", text.c_str(), ss.str().c_str());
         }
 
+        std::vector<size_t> breakpoints;
         std::vector<int> tokens;
         std::vector<float> weights;
         for (const auto& item : parsed_attention) {
             const std::string& curr_text = item.first;
             float curr_weight            = item.second;
-            size_t search_pos = 0;
-
-            auto on_new_token_cb = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
+            if (curr_text == "BREAK" && curr_weight == -1.0f) {
+                breakpoints.push_back(tokens.size());
+                continue;
+            }
+            size_t search_pos            = 0;
+            auto on_new_token_cb         = [&](std::string& str, std::vector<int32_t>& bpe_tokens) -> bool {
                 std::string token_str;
                 size_t consumed_len = 0;
                 bool is_embed_tag = false;
@@ -576,7 +602,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             weights.insert(weights.end(), curr_tokens.size(), curr_weight);
         }
 
-        tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        tokenizer.pad_tokens(tokens, weights, max_length, padding, &breakpoints, nullptr);
 
         // for (int i = 0; i < tokens.size(); i++) {
         //     std::cout << tokens[i] << ":" << weights[i] << ", ";
