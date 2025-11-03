@@ -286,14 +286,18 @@ struct TensorStorage {
 typedef std::function<bool(const TensorStorage&, ggml_tensor**)> on_new_tensor_cb_t;
 
 typedef OrderedMap<std::string, TensorStorage> String2TensorStorage;
+typedef std::map<std::string, enum ggml_type> String2GGMLType;
+typedef std::map<std::string, enum ggml_type> String2GGMLType;
 
 class ModelLoader {
 protected:
     SDVersion version_ = VERSION_COUNT;
     std::vector<std::string> file_paths_;
     String2TensorStorage tensor_storage_map;
+    std::vector<TensorStorage> tensor_storages;
 
     void add_tensor_storage(const TensorStorage& tensor_storage);
+    void rebuild_tensor_storage_map();
 
     bool parse_data_pkl(uint8_t* buffer,
                         size_t buffer_size,
@@ -310,6 +314,8 @@ protected:
     bool init_from_diffusers_file(const std::string& file_path, const std::string& prefix, int n_threads);
 
 public:
+    String2GGMLType tensor_storages_types;
+
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
     bool init_from_file(const std::string& file_path, const std::string& prefix, int n_threads);
     bool model_is_unet();
@@ -333,8 +339,9 @@ public:
 
     std::vector<std::string> get_tensor_names() const {
         std::vector<std::string> names;
-        for (const auto& [name, tensor_storage] : tensor_storage_map) {
-            names.push_back(name);
+        names.reserve(tensor_storages.size());
+        for (const auto& tensor_storage : tensor_storages) {
+            names.push_back(tensor_storage.name);
         }
         return names;
     }
