@@ -1027,7 +1027,33 @@ void convert_tensor(void* src,
 /*================================================= ModelLoader ==================================================*/
 
 void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
-    tensor_storage_map[tensor_storage.name] = tensor_storage;
+    TensorStorage copy = tensor_storage;
+    if (!copy.name_is_canonical) {
+        copy.name              = convert_tensor_name(copy.name);
+        copy.name_is_canonical = true;
+    }
+
+    bool updated = false;
+    for (auto& existing : tensor_storages) {
+        if (existing.name == copy.name) {
+            existing = copy;
+            updated  = true;
+            break;
+        }
+    }
+    if (!updated) {
+        tensor_storages.push_back(copy);
+    }
+
+    tensor_storage_map[copy.name] = copy;
+    add_preprocess_tensor_storage_types(tensor_storages_types, copy.name, copy.type, true);
+}
+
+void ModelLoader::rebuild_tensor_storage_map() {
+    tensor_storage_map.clear();
+    for (const auto& tensor_storage : tensor_storages) {
+        tensor_storage_map[tensor_storage.name] = tensor_storage;
+    }
 }
 
 bool is_zip_file(const std::string& file_path) {
@@ -1492,6 +1518,8 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         }
     }
 
+    rebuild_tensor_storage_map();
+
     return true;
 }
 /*================================================= DiffusersModelLoader ==================================================*/
@@ -1530,6 +1558,8 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
             break;
         }
     }
+
+    rebuild_tensor_storage_map();
 
     if (!init_from_safetensors_file(vae_path, "vae.", n_threads)) {
         LOG_WARN("Couldn't find working VAE in %s", file_path.c_str());
