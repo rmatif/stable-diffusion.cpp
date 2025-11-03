@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -17,6 +19,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -25,11 +28,20 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#include "stb_image.h"
+
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#define STB_IMAGE_RESIZE_STATIC
+#include "stb_image_resize.h"
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -242,20 +254,257 @@ Utf8SplitResult extract_complete_utf8(const std::string& input) {
     return result;
 }
 
+struct OwnedImage {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t channel = 0;
+    std::vector<uint8_t> data;
+
+    bool valid() const {
+        return width > 0 && height > 0 && !data.empty() && channel > 0;
+    }
+
+    sd_image_t as_sd_image() const {
+        sd_image_t image;
+        image.width = width;
+        image.height = height;
+        image.channel = channel;
+        image.data = data.empty() ? nullptr : const_cast<uint8_t*>(data.data());
+        return image;
+    }
+};
+
+bool load_image_file(const std::string& path,
+                     int expected_width,
+                     int expected_height,
+                     int expected_channel,
+                     OwnedImage& out,
+                     std::string& error) {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if (expected_channel <= 0) {
+        expected_channel = 3;
+    }
+
+    stbi_uc* raw_pixels = stbi_load(path.c_str(), &width, &height, &channels, expected_channel);
+    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels_guard(raw_pixels, stbi_image_free);
+
+    if (pixels_guard == nullptr) {
+        error = "failed to load image from '" + path + "'";
+        return false;
+    }
+
+    const int actual_channel = expected_channel;
+    if (width <= 0 || height <= 0) {
+        error = "image '" + path + "' has invalid dimensions";
+        return false;
+    }
+
+    std::vector<uint8_t> buffer;
+    buffer.assign(pixels_guard.get(), pixels_guard.get() + static_cast<size_t>(width) * height * actual_channel);
+
+    if (expected_width > 0 && expected_height > 0 && (width != expected_width || height != expected_height)) {
+        float dst_aspect = static_cast<float>(expected_width) / static_cast<float>(expected_height);
+        float src_aspect = static_cast<float>(width) / static_cast<float>(height);
+
+        int crop_x = 0;
+        int crop_y = 0;
+        int crop_w = width;
+        int crop_h = height;
+
+        if (src_aspect > dst_aspect) {
+            crop_w = static_cast<int>(std::lround(height * dst_aspect));
+            crop_x = (width - crop_w) / 2;
+        } else if (src_aspect < dst_aspect) {
+            crop_h = static_cast<int>(std::lround(width / dst_aspect));
+            crop_y = (height - crop_h) / 2;
+        }
+
+        if (crop_x != 0 || crop_y != 0 || crop_w != width || crop_h != height) {
+            std::vector<uint8_t> cropped(static_cast<size_t>(crop_w) * crop_h * actual_channel);
+            for (int row = 0; row < crop_h; ++row) {
+                const uint8_t* src = buffer.data() + (static_cast<size_t>(crop_y + row) * width + crop_x) * actual_channel;
+                uint8_t* dst = cropped.data() + static_cast<size_t>(row) * crop_w * actual_channel;
+                std::memcpy(dst, src, static_cast<size_t>(crop_w) * actual_channel);
+            }
+            buffer.swap(cropped);
+            width = crop_w;
+            height = crop_h;
+        }
+
+        if (width != expected_width || height != expected_height) {
+            std::vector<uint8_t> resized(static_cast<size_t>(expected_width) * expected_height * actual_channel);
+            if (!stbir_resize_uint8(buffer.data(),
+                                    width,
+                                    height,
+                                    0,
+                                    resized.data(),
+                                    expected_width,
+                                    expected_height,
+                                    0,
+                                    actual_channel)) {
+                error = "failed to resize image '" + path + "'";
+                return false;
+            }
+            buffer.swap(resized);
+            width = expected_width;
+            height = expected_height;
+        }
+    }
+
+    out.width = static_cast<uint32_t>(width);
+    out.height = static_cast<uint32_t>(height);
+    out.channel = static_cast<uint32_t>(actual_channel);
+    out.data = std::move(buffer);
+    return true;
+}
+
+bool load_images_from_directory(const std::string& directory,
+                                int expected_width,
+                                int expected_height,
+                                int expected_channel,
+                                int max_images,
+                                std::vector<OwnedImage>& images,
+                                std::string& error) {
+    std::error_code ec;
+    if (!fs::exists(directory, ec) || !fs::is_directory(directory, ec)) {
+        error = "directory '" + directory + "' does not exist or is not accessible";
+        return false;
+    }
+
+    std::vector<fs::directory_entry> candidates;
+    for (const auto& entry : fs::directory_iterator(directory, ec)) {
+        if (ec) {
+            error = "failed to iterate directory '" + directory + "'";
+            return false;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        candidates.push_back(entry);
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const fs::directory_entry& a, const fs::directory_entry& b) {
+        return to_lower_copy(a.path().filename().string()) < to_lower_copy(b.path().filename().string());
+    });
+
+    images.clear();
+    images.reserve(candidates.size());
+
+    auto has_image_extension = [](const fs::path& path) {
+        std::string ext = to_lower_copy(path.extension().string());
+        return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp";
+    };
+
+    for (const auto& entry : candidates) {
+        if (!has_image_extension(entry.path())) {
+            continue;
+        }
+        OwnedImage loaded;
+        if (!load_image_file(entry.path().string(), expected_width, expected_height, expected_channel, loaded, error)) {
+            return false;
+        }
+        images.push_back(std::move(loaded));
+        if (max_images > 0 && static_cast<int>(images.size()) >= max_images) {
+            break;
+        }
+    }
+
+    if (images.empty()) {
+        error = "no images found in directory '" + directory + "'";
+        return false;
+    }
+
+    return true;
+}
+
 struct CLIOptions {
     std::string model_path;
+    std::string clip_l_path;
+    std::string clip_g_path;
+    std::string clip_vision_path;
+    std::string t5xxl_path;
+    std::string qwen2vl_path;
+    std::string qwen2vl_vision_path;
+    std::string diffusion_model_path;
+    std::string high_noise_diffusion_model_path;
+    std::string vae_path;
+    std::string taesd_path;
+    std::string control_net_path;
+    std::string lora_model_dir;
+    std::string embedding_dir;
+    std::string photo_maker_path;
     int port = 8000;
     int n_threads = -1;
     bool verbose = false;
     bool diffusion_flash_attn = false;
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
+    bool offload_params_to_cpu = false;
+    bool control_net_cpu = false;
+    bool clip_on_cpu = false;
+    bool vae_on_cpu = false;
+    bool force_sdxl_vae_conv_scale = false;
+    bool chroma_use_dit_mask = true;
+    bool chroma_use_t5_mask = false;
+    int chroma_t5_mask_pad = 1;
+    float flow_shift = std::numeric_limits<float>::infinity();
+    sd_type_t wtype = SD_TYPE_COUNT;
+    rng_type_t rng_type = CUDA_RNG;
+    prediction_t prediction = DEFAULT_PRED;
 };
 
 void print_usage() {
     std::cout
-        << "Usage: sd-server -m <model_path> [-t <threads>] [--port <port>] [--verbose] [--diffusion-fa]"
-        << " [--diffusion-conv-direct] [--vae-conv-direct]" << std::endl;
+        << "Usage: sd-server -m <model_path> [options]\n"
+        << "\n"
+        << "Model & encoder paths:\n"
+        << "  -m, --model <path>                      Primary model path (.gguf)\n"
+        << "      --diffusion-model <path>            Standalone diffusion model path\n"
+        << "      --high-noise-diffusion-model <path> Standalone high-noise diffusion model path\n"
+        << "      --vae <path>                        Standalone VAE path\n"
+        << "      --taesd <path>                      Tiny autoencoder path\n"
+        << "      --clip_l <path>                     CLIP-L text encoder\n"
+        << "      --clip_g <path>                     CLIP-G text encoder\n"
+        << "      --clip_vision <path>                CLIP-Vision encoder\n"
+        << "      --t5xxl <path>                      T5 XXL text encoder\n"
+        << "      --qwen2vl <path>                    Qwen2VL text encoder\n"
+        << "      --qwen2vl_vision <path>             Qwen2VL vision encoder\n"
+        << "      --control-net <path>                ControlNet model path\n"
+        << "      --lora-model-dir <path>             Directory containing LoRA weights\n"
+        << "      --embd-dir <path>                   Directory containing textual inversion embeddings\n"
+        << "      --photo-maker <path>                PhotoMaker model path\n"
+        << "\n"
+        << "Runtime options:\n"
+        << "  -p, --port <port>                       HTTP port (default 8000)\n"
+        << "  -t, --threads <n>                       Number of CPU threads (-1 auto)\n"
+        << "      --type <format>                     Weight type override (e.g. f16, q8_0)\n"
+        << "      --rng <type>                        RNG, one of [std_default, cuda]\n"
+        << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow]\n"
+        << "      --flow-shift <value>                Flow model shift override\n"
+        << "      --chroma-t5-mask-pad <int>          Padding for Chroma T5 mask\n"
+        << "\n"
+        << "Device placement:\n"
+        << "      --offload-to-cpu                    Offload model weights to CPU RAM\n"
+        << "      --control-net-cpu                   Keep ControlNet on CPU\n"
+        << "      --clip-on-cpu                       Keep CLIP on CPU\n"
+        << "      --vae-on-cpu                        Keep VAE on CPU\n"
+        << "\n"
+        << "Kernel options:\n"
+        << "      --diffusion-fa                      Enable flash attention in diffusion UNet\n"
+        << "      --diffusion-conv-direct             Use ggml_conv2d_direct for diffusion\n"
+        << "      --vae-conv-direct                   Use ggml_conv2d_direct for VAE\n"
+        << "      --force-sdxl-vae-conv-scale         Force conv scale for SDXL VAE\n"
+        << "\n"
+        << "Chroma:\n"
+        << "      --chroma-disable-dit-mask           Disable DiT mask usage\n"
+        << "      --chroma-enable-t5-mask             Enable T5 mask usage\n"
+        << "\n"
+        << "General:\n"
+        << "  -v, --verbose                           Verbose logging\n"
+        << "  -h, --help                              Show this help message\n"
+        << std::endl;
 }
 
 bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help, std::string& error) {
@@ -269,6 +518,90 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 return false;
             }
             options.model_path = argv[++i];
+        } else if (arg == "--clip_l") {
+            if (i + 1 >= argc) {
+                error = "missing value for --clip_l";
+                return false;
+            }
+            options.clip_l_path = argv[++i];
+        } else if (arg == "--clip_g") {
+            if (i + 1 >= argc) {
+                error = "missing value for --clip_g";
+                return false;
+            }
+            options.clip_g_path = argv[++i];
+        } else if (arg == "--clip_vision") {
+            if (i + 1 >= argc) {
+                error = "missing value for --clip_vision";
+                return false;
+            }
+            options.clip_vision_path = argv[++i];
+        } else if (arg == "--t5xxl") {
+            if (i + 1 >= argc) {
+                error = "missing value for --t5xxl";
+                return false;
+            }
+            options.t5xxl_path = argv[++i];
+        } else if (arg == "--qwen2vl") {
+            if (i + 1 >= argc) {
+                error = "missing value for --qwen2vl";
+                return false;
+            }
+            options.qwen2vl_path = argv[++i];
+        } else if (arg == "--qwen2vl_vision") {
+            if (i + 1 >= argc) {
+                error = "missing value for --qwen2vl_vision";
+                return false;
+            }
+            options.qwen2vl_vision_path = argv[++i];
+        } else if (arg == "--diffusion-model") {
+            if (i + 1 >= argc) {
+                error = "missing value for --diffusion-model";
+                return false;
+            }
+            options.diffusion_model_path = argv[++i];
+        } else if (arg == "--high-noise-diffusion-model") {
+            if (i + 1 >= argc) {
+                error = "missing value for --high-noise-diffusion-model";
+                return false;
+            }
+            options.high_noise_diffusion_model_path = argv[++i];
+        } else if (arg == "--vae") {
+            if (i + 1 >= argc) {
+                error = "missing value for --vae";
+                return false;
+            }
+            options.vae_path = argv[++i];
+        } else if (arg == "--taesd") {
+            if (i + 1 >= argc) {
+                error = "missing value for --taesd";
+                return false;
+            }
+            options.taesd_path = argv[++i];
+        } else if (arg == "--control-net") {
+            if (i + 1 >= argc) {
+                error = "missing value for --control-net";
+                return false;
+            }
+            options.control_net_path = argv[++i];
+        } else if (arg == "--lora-model-dir") {
+            if (i + 1 >= argc) {
+                error = "missing value for --lora-model-dir";
+                return false;
+            }
+            options.lora_model_dir = argv[++i];
+        } else if (arg == "--embd-dir") {
+            if (i + 1 >= argc) {
+                error = "missing value for --embd-dir";
+                return false;
+            }
+            options.embedding_dir = argv[++i];
+        } else if (arg == "--photo-maker") {
+            if (i + 1 >= argc) {
+                error = "missing value for --photo-maker";
+                return false;
+            }
+            options.photo_maker_path = argv[++i];
         } else if (arg == "-p" || arg == "--port") {
             if (i + 1 >= argc) {
                 error = "missing value for --port";
@@ -295,9 +628,61 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 error = "invalid threads value";
                 return false;
             }
-            if (options.n_threads <= 0) {
-                error = "thread count must be greater than 0";
+            if (options.n_threads == 0) {
+                error = "thread count must not be zero";
                 return false;
+            }
+        } else if (arg == "--type") {
+            if (i + 1 >= argc) {
+                error = "missing value for --type";
+                return false;
+            }
+            std::string value = to_lower_copy(argv[++i]);
+            sd_type_t type = str_to_sd_type(value.c_str());
+            if (type == SD_TYPE_COUNT) {
+                error = "invalid weight type '" + value + "'";
+                return false;
+            }
+            options.wtype = type;
+        } else if (arg == "--rng") {
+            if (i + 1 >= argc) {
+                error = "missing value for --rng";
+                return false;
+            }
+            std::string value = to_lower_copy(argv[++i]);
+            rng_type_t rng = str_to_rng_type(value.c_str());
+            if (rng == RNG_TYPE_COUNT) {
+                error = "invalid rng '" + value + "'";
+                return false;
+            }
+            options.rng_type = rng;
+        } else if (arg == "--prediction") {
+            if (i + 1 >= argc) {
+                error = "missing value for --prediction";
+                return false;
+            }
+            std::string value = to_lower_copy(argv[++i]);
+            prediction_t prediction = str_to_prediction(value.c_str());
+            if (prediction == PREDICTION_COUNT) {
+                error = "invalid prediction '" + value + "'";
+                return false;
+            }
+            options.prediction = prediction;
+        } else if (arg == "--flow-shift") {
+            if (i + 1 >= argc) {
+                error = "missing value for --flow-shift";
+                return false;
+            }
+            std::string value = argv[++i];
+            if (value == "auto") {
+                options.flow_shift = std::numeric_limits<float>::infinity();
+            } else {
+                try {
+                    options.flow_shift = std::stof(value);
+                } catch (const std::exception&) {
+                    error = "invalid float for --flow-shift";
+                    return false;
+                }
             }
         } else if (arg == "-v" || arg == "--verbose") {
             options.verbose = true;
@@ -307,6 +692,35 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
             options.diffusion_conv_direct = true;
         } else if (arg == "--vae-conv-direct") {
             options.vae_conv_direct = true;
+        } else if (arg == "--offload-to-cpu") {
+            options.offload_params_to_cpu = true;
+        } else if (arg == "--control-net-cpu") {
+            options.control_net_cpu = true;
+        } else if (arg == "--clip-on-cpu") {
+            options.clip_on_cpu = true;
+        } else if (arg == "--vae-on-cpu") {
+            options.vae_on_cpu = true;
+        } else if (arg == "--force-sdxl-vae-conv-scale") {
+            options.force_sdxl_vae_conv_scale = true;
+        } else if (arg == "--chroma-disable-dit-mask") {
+            options.chroma_use_dit_mask = false;
+        } else if (arg == "--chroma-enable-t5-mask") {
+            options.chroma_use_t5_mask = true;
+        } else if (arg == "--chroma-t5-mask-pad") {
+            if (i + 1 >= argc) {
+                error = "missing value for --chroma-t5-mask-pad";
+                return false;
+            }
+            try {
+                options.chroma_t5_mask_pad = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                error = "invalid integer for --chroma-t5-mask-pad";
+                return false;
+            }
+            if (options.chroma_t5_mask_pad < 0) {
+                error = "--chroma-t5-mask-pad must be non-negative";
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             show_help = true;
             return false;
@@ -316,8 +730,12 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
         }
     }
 
-    if (options.model_path.empty()) {
-        error = "model path is required (-m/--model)";
+    if (options.n_threads < 0) {
+        options.n_threads = -1;
+    }
+
+    if (options.model_path.empty() && options.diffusion_model_path.empty()) {
+        error = "model path is required (-m/--model or --diffusion-model)";
         return false;
     }
 
@@ -330,6 +748,8 @@ struct CtxConfig {
     std::string clip_g_path;
     std::string clip_vision_path;
     std::string t5xxl_path;
+    std::string qwen2vl_path;
+    std::string qwen2vl_vision_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string vae_path;
@@ -350,10 +770,12 @@ struct CtxConfig {
     bool diffusion_flash_attn = false;
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
+    bool force_sdxl_vae_conv_scale = false;
     bool chroma_use_dit_mask = true;
     bool chroma_use_t5_mask = false;
     int chroma_t5_mask_pad = 1;
     float flow_shift = std::numeric_limits<float>::infinity();
+    prediction_t prediction = DEFAULT_PRED;
 
     bool operator==(const CtxConfig& other) const {
         return model_path == other.model_path &&
@@ -361,6 +783,8 @@ struct CtxConfig {
                clip_g_path == other.clip_g_path &&
                clip_vision_path == other.clip_vision_path &&
                t5xxl_path == other.t5xxl_path &&
+               qwen2vl_path == other.qwen2vl_path &&
+               qwen2vl_vision_path == other.qwen2vl_vision_path &&
                diffusion_model_path == other.diffusion_model_path &&
                high_noise_diffusion_model_path == other.high_noise_diffusion_model_path &&
                vae_path == other.vae_path &&
@@ -380,10 +804,12 @@ struct CtxConfig {
                diffusion_flash_attn == other.diffusion_flash_attn &&
                diffusion_conv_direct == other.diffusion_conv_direct &&
                vae_conv_direct == other.vae_conv_direct &&
+               force_sdxl_vae_conv_scale == other.force_sdxl_vae_conv_scale &&
                chroma_use_dit_mask == other.chroma_use_dit_mask &&
                chroma_use_t5_mask == other.chroma_use_t5_mask &&
                chroma_t5_mask_pad == other.chroma_t5_mask_pad &&
-               flow_shift == other.flow_shift;
+               flow_shift == other.flow_shift &&
+               prediction == other.prediction;
     }
 
     bool operator!=(const CtxConfig& other) const { return !(*this == other); }
@@ -397,6 +823,8 @@ struct CtxConfig {
         params.clip_g_path                     = clip_g_path.c_str();
         params.clip_vision_path                = clip_vision_path.c_str();
         params.t5xxl_path                      = t5xxl_path.c_str();
+        params.qwen2vl_path                    = qwen2vl_path.c_str();
+        params.qwen2vl_vision_path             = qwen2vl_vision_path.c_str();
         params.diffusion_model_path            = diffusion_model_path.c_str();
         params.high_noise_diffusion_model_path = high_noise_diffusion_model_path.c_str();
         params.vae_path                        = vae_path.c_str();
@@ -419,10 +847,12 @@ struct CtxConfig {
         params.diffusion_flash_attn    = diffusion_flash_attn;
         params.diffusion_conv_direct   = diffusion_conv_direct;
         params.vae_conv_direct         = vae_conv_direct;
+        params.force_sdxl_vae_conv_scale = force_sdxl_vae_conv_scale;
         params.chroma_use_dit_mask     = chroma_use_dit_mask;
         params.chroma_use_t5_mask      = chroma_use_t5_mask;
         params.chroma_t5_mask_pad      = chroma_t5_mask_pad;
         params.flow_shift              = flow_shift;
+        params.prediction              = prediction;
 
         return params;
     }
@@ -493,6 +923,31 @@ struct GenerationRequest {
     int shifted_timestep = 0;
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0.0f, 0.0f};
     bool has_vae_tiling_override = false;
+    float distilled_guidance = 3.5f;
+    float slg_scale = 0.0f;
+    float slg_layer_start = 0.01f;
+    float slg_layer_end = 0.2f;
+    std::vector<int> slg_layers = {7, 8, 9};
+    bool auto_resize_ref_image = true;
+    bool increase_ref_index = false;
+    float strength = 0.75f;
+    float control_strength = 0.9f;
+    bool canny_preprocess = false;
+    std::string init_image_path;
+    std::string mask_image_path;
+    std::string control_image_path;
+    std::vector<std::string> ref_image_paths;
+    std::string pm_id_images_dir;
+    std::string pm_id_embed_path;
+    float pm_style_strength = 20.0f;
+    OwnedImage init_image;
+    bool has_init_image = false;
+    OwnedImage mask_image;
+    bool has_mask_image = false;
+    OwnedImage control_image;
+    bool has_control_image = false;
+    std::vector<OwnedImage> ref_images;
+    std::vector<OwnedImage> pm_id_images;
 };
 
 struct ImageResultGuard {
@@ -578,9 +1033,44 @@ class StreamingImageResponder {
         params.height = request_.height;
         params.batch_count = 1;
         params.seed = effective_seed_ + index;
+        params.auto_resize_ref_image = request_.auto_resize_ref_image;
+        params.increase_ref_index = request_.increase_ref_index;
+        params.strength = request_.strength;
+        params.control_strength = request_.control_strength;
+        if (request_.has_init_image) {
+            params.init_image = request_.init_image.as_sd_image();
+        }
+        if (request_.has_mask_image) {
+            params.mask_image = request_.mask_image.as_sd_image();
+        }
+        if (request_.has_control_image) {
+            params.control_image = request_.control_image.as_sd_image();
+        }
         if (request_.has_vae_tiling_override) {
             params.vae_tiling_params = request_.vae_tiling_params;
         }
+
+        std::vector<sd_image_t> ref_views;
+        if (!request_.ref_images.empty()) {
+            ref_views.reserve(request_.ref_images.size());
+            for (const auto& image : request_.ref_images) {
+                ref_views.push_back(image.as_sd_image());
+            }
+            params.ref_images = ref_views.data();
+            params.ref_images_count = static_cast<int>(ref_views.size());
+        }
+
+        std::vector<sd_image_t> pm_views;
+        if (!request_.pm_id_images.empty()) {
+            pm_views.reserve(request_.pm_id_images.size());
+            for (const auto& image : request_.pm_id_images) {
+                pm_views.push_back(image.as_sd_image());
+            }
+        }
+        params.pm_params.id_images = pm_views.empty() ? nullptr : pm_views.data();
+        params.pm_params.id_images_count = static_cast<int>(pm_views.size());
+        params.pm_params.id_embed_path = request_.pm_id_embed_path.empty() ? nullptr : request_.pm_id_embed_path.c_str();
+        params.pm_params.style_strength = request_.pm_style_strength;
 
         sd_sample_params_t& sample_params = params.sample_params;
         sample_params.sample_steps = request_.sample_steps;
@@ -590,6 +1080,17 @@ class StreamingImageResponder {
         }
         if (!std::isfinite(sample_params.guidance.img_cfg)) {
             sample_params.guidance.img_cfg = sample_params.guidance.txt_cfg;
+        }
+        sample_params.guidance.distilled_guidance = request_.distilled_guidance;
+        sample_params.guidance.slg.layer_start = request_.slg_layer_start;
+        sample_params.guidance.slg.layer_end = request_.slg_layer_end;
+        sample_params.guidance.slg.scale = request_.slg_scale;
+        if (!request_.slg_layers.empty()) {
+            sample_params.guidance.slg.layers = request_.slg_layers.data();
+            sample_params.guidance.slg.layer_count = request_.slg_layers.size();
+        } else {
+            sample_params.guidance.slg.layers = nullptr;
+            sample_params.guidance.slg.layer_count = 0;
         }
         if (request_.override_sample_method) {
             sample_params.sample_method = request_.sample_method;
@@ -877,6 +1378,8 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_string("clip_g_path", config.clip_g_path) ||
         !assign_string("clip_vision_path", config.clip_vision_path) ||
         !assign_string("t5xxl_path", config.t5xxl_path) ||
+        !assign_string("qwen2vl_path", config.qwen2vl_path) ||
+        !assign_string("qwen2vl_vision_path", config.qwen2vl_vision_path) ||
         !assign_string("diffusion_model_path", config.diffusion_model_path) ||
         !assign_string("high_noise_diffusion_model_path", config.high_noise_diffusion_model_path) ||
         !assign_string("vae_path", config.vae_path) ||
@@ -897,6 +1400,7 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_bool("diffusion_flash_attn", config.diffusion_flash_attn) ||
         !assign_bool("diffusion_conv_direct", config.diffusion_conv_direct) ||
         !assign_bool("vae_conv_direct", config.vae_conv_direct) ||
+        !assign_bool("force_sdxl_vae_conv_scale", config.force_sdxl_vae_conv_scale) ||
         !assign_bool("chroma_use_dit_mask", config.chroma_use_dit_mask) ||
         !assign_bool("chroma_use_t5_mask", config.chroma_use_t5_mask)) {
         return false;
@@ -939,6 +1443,21 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
             return false;
         }
         config.wtype = type;
+    }
+
+    auto prediction_it = body.find("prediction");
+    if (prediction_it != body.end()) {
+        if (!prediction_it->is_string()) {
+            error = "field 'prediction' must be a string";
+            return false;
+        }
+        std::string value = to_lower_copy(prediction_it->get<std::string>());
+        prediction_t prediction = str_to_prediction(value.c_str());
+        if (prediction == PREDICTION_COUNT) {
+            error = "invalid prediction value";
+            return false;
+        }
+        config.prediction = prediction;
     }
 
     return true;
@@ -1093,6 +1612,90 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         request.has_img_cfg_scale = true;
     }
 
+    auto guidance_it = body.find("guidance");
+    if (guidance_it == body.end()) {
+        guidance_it = body.find("distilled_guidance");
+    }
+    if (guidance_it != body.end()) {
+        if (!guidance_it->is_number_float() && !guidance_it->is_number_integer()) {
+            error = "field 'guidance' must be numeric";
+            return false;
+        }
+        request.distilled_guidance = static_cast<float>(guidance_it->get<double>());
+    }
+
+    auto slg_scale_it = body.find("slg_scale");
+    if (slg_scale_it != body.end()) {
+        if (!slg_scale_it->is_number_float() && !slg_scale_it->is_number_integer()) {
+            error = "field 'slg_scale' must be numeric";
+            return false;
+        }
+        request.slg_scale = static_cast<float>(slg_scale_it->get<double>());
+    }
+
+    auto slg_start_it = body.find("skip_layer_start");
+    if (slg_start_it == body.end()) {
+        slg_start_it = body.find("slg_layer_start");
+    }
+    if (slg_start_it != body.end()) {
+        if (!slg_start_it->is_number_float() && !slg_start_it->is_number_integer()) {
+            error = "field 'skip_layer_start' must be numeric";
+            return false;
+        }
+        request.slg_layer_start = static_cast<float>(slg_start_it->get<double>());
+    }
+
+    auto slg_end_it = body.find("skip_layer_end");
+    if (slg_end_it == body.end()) {
+        slg_end_it = body.find("slg_layer_end");
+    }
+    if (slg_end_it != body.end()) {
+        if (!slg_end_it->is_number_float() && !slg_end_it->is_number_integer()) {
+            error = "field 'skip_layer_end' must be numeric";
+            return false;
+        }
+        request.slg_layer_end = static_cast<float>(slg_end_it->get<double>());
+    }
+
+    auto skip_layers_it = body.find("skip_layers");
+    if (skip_layers_it != body.end()) {
+        std::vector<int> layers;
+        if (skip_layers_it->is_array()) {
+            for (const auto& item : *skip_layers_it) {
+                if (!item.is_number_integer()) {
+                    error = "elements of 'skip_layers' must be integers";
+                    return false;
+                }
+                layers.push_back(static_cast<int>(item.get<int64_t>()));
+            }
+        } else if (skip_layers_it->is_string()) {
+            std::string value = trim_copy(skip_layers_it->get<std::string>());
+            if (!value.empty()) {
+                if (value.front() == '[' && value.back() == ']') {
+                    value = value.substr(1, value.size() - 2);
+                }
+                std::vector<std::string> tokens = split_and_trim(value, ',');
+                for (const auto& token : tokens) {
+                    if (token.empty()) {
+                        continue;
+                    }
+                    try {
+                        layers.push_back(std::stoi(token));
+                    } catch (const std::exception&) {
+                        error = "failed to parse 'skip_layers'";
+                        return false;
+                    }
+                }
+            }
+        } else {
+            error = "field 'skip_layers' must be an array or string";
+            return false;
+        }
+        if (!layers.empty()) {
+            request.slg_layers = std::move(layers);
+        }
+    }
+
     auto eta_it = body.find("eta");
     if (eta_it != body.end()) {
         if (!eta_it->is_number_float() && !eta_it->is_number_integer()) {
@@ -1120,6 +1723,147 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         request.shifted_timestep = value;
+    }
+
+    auto strength_it = body.find("strength");
+    if (strength_it != body.end()) {
+        if (!strength_it->is_number_float() && !strength_it->is_number_integer()) {
+            error = "field 'strength' must be numeric";
+            return false;
+        }
+        request.strength = static_cast<float>(strength_it->get<double>());
+    }
+
+    auto control_strength_it = body.find("control_strength");
+    if (control_strength_it != body.end()) {
+        if (!control_strength_it->is_number_float() && !control_strength_it->is_number_integer()) {
+            error = "field 'control_strength' must be numeric";
+            return false;
+        }
+        request.control_strength = static_cast<float>(control_strength_it->get<double>());
+    }
+
+    auto auto_resize_it = body.find("auto_resize_ref_image");
+    if (auto_resize_it != body.end()) {
+        if (!auto_resize_it->is_boolean()) {
+            error = "field 'auto_resize_ref_image' must be a boolean";
+            return false;
+        }
+        request.auto_resize_ref_image = auto_resize_it->get<bool>();
+    }
+
+    auto increase_it = body.find("increase_ref_index");
+    if (increase_it != body.end()) {
+        if (!increase_it->is_boolean()) {
+            error = "field 'increase_ref_index' must be a boolean";
+            return false;
+        }
+        request.increase_ref_index = increase_it->get<bool>();
+    }
+
+    auto canny_it = body.find("canny_preprocess");
+    if (canny_it != body.end()) {
+        if (!canny_it->is_boolean()) {
+            error = "field 'canny_preprocess' must be a boolean";
+            return false;
+        }
+        request.canny_preprocess = canny_it->get<bool>();
+    }
+
+    auto init_image_it = body.find("init_image_path");
+    if (init_image_it == body.end()) {
+        init_image_it = body.find("init_image");
+    }
+    if (init_image_it != body.end()) {
+        if (!init_image_it->is_string()) {
+            error = "field 'init_image_path' must be a string";
+            return false;
+        }
+        request.init_image_path = trim_copy(init_image_it->get<std::string>());
+    }
+
+    auto mask_image_it = body.find("mask_image_path");
+    if (mask_image_it == body.end()) {
+        mask_image_it = body.find("mask_path");
+    }
+    if (mask_image_it != body.end()) {
+        if (!mask_image_it->is_string()) {
+            error = "field 'mask_image_path' must be a string";
+            return false;
+        }
+        request.mask_image_path = trim_copy(mask_image_it->get<std::string>());
+    }
+
+    auto control_image_it = body.find("control_image_path");
+    if (control_image_it == body.end()) {
+        control_image_it = body.find("control_image");
+    }
+    if (control_image_it != body.end()) {
+        if (!control_image_it->is_string()) {
+            error = "field 'control_image_path' must be a string";
+            return false;
+        }
+        request.control_image_path = trim_copy(control_image_it->get<std::string>());
+    }
+
+    auto ref_images_it = body.find("ref_image_paths");
+    if (ref_images_it == body.end()) {
+        ref_images_it = body.find("ref_images");
+    }
+    if (ref_images_it != body.end()) {
+        request.ref_image_paths.clear();
+        if (ref_images_it->is_array()) {
+            for (const auto& item : *ref_images_it) {
+                if (!item.is_string()) {
+                    error = "elements of 'ref_image_paths' must be strings";
+                    return false;
+                }
+                std::string path = trim_copy(item.get<std::string>());
+                if (!path.empty()) {
+                    request.ref_image_paths.push_back(path);
+                }
+            }
+        } else if (ref_images_it->is_string()) {
+            std::string value = trim_copy(ref_images_it->get<std::string>());
+            if (!value.empty()) {
+                auto paths = split_and_trim(value, ',');
+                for (auto& path : paths) {
+                    if (!path.empty()) {
+                        request.ref_image_paths.push_back(path);
+                    }
+                }
+            }
+        } else {
+            error = "field 'ref_image_paths' must be an array or string";
+            return false;
+        }
+    }
+
+    auto pm_dir_it = body.find("pm_id_images_dir");
+    if (pm_dir_it != body.end()) {
+        if (!pm_dir_it->is_string()) {
+            error = "field 'pm_id_images_dir' must be a string";
+            return false;
+        }
+        request.pm_id_images_dir = trim_copy(pm_dir_it->get<std::string>());
+    }
+
+    auto pm_embed_it = body.find("pm_id_embed_path");
+    if (pm_embed_it != body.end()) {
+        if (!pm_embed_it->is_string()) {
+            error = "field 'pm_id_embed_path' must be a string";
+            return false;
+        }
+        request.pm_id_embed_path = trim_copy(pm_embed_it->get<std::string>());
+    }
+
+    auto pm_style_it = body.find("pm_style_strength");
+    if (pm_style_it != body.end()) {
+        if (!pm_style_it->is_number_float() && !pm_style_it->is_number_integer()) {
+            error = "field 'pm_style_strength' must be numeric";
+            return false;
+        }
+        request.pm_style_strength = static_cast<float>(pm_style_it->get<double>());
     }
 
     auto batch_it = body.find("batch_count");
@@ -1249,6 +1993,67 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         if (modified) {
             request.vae_tiling_params = tiling;
             request.has_vae_tiling_override = true;
+        }
+    }
+
+    return true;
+}
+
+bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
+    request.has_init_image = false;
+    request.has_mask_image = false;
+    request.has_control_image = false;
+    request.ref_images.clear();
+    request.pm_id_images.clear();
+
+    if (!request.init_image_path.empty()) {
+        OwnedImage init;
+        if (!load_image_file(request.init_image_path, request.width, request.height, 3, init, error)) {
+            return false;
+        }
+        request.init_image = std::move(init);
+        request.has_init_image = true;
+    }
+
+    if (!request.mask_image_path.empty()) {
+        OwnedImage mask;
+        if (!load_image_file(request.mask_image_path, request.width, request.height, 1, mask, error)) {
+            return false;
+        }
+        request.mask_image = std::move(mask);
+        request.has_mask_image = true;
+    }
+
+    if (!request.control_image_path.empty()) {
+        OwnedImage control;
+        if (!load_image_file(request.control_image_path, request.width, request.height, 3, control, error)) {
+            return false;
+        }
+        request.control_image = std::move(control);
+        request.has_control_image = true;
+        if (request.canny_preprocess) {
+            sd_image_t control_view = request.control_image.as_sd_image();
+            if (!preprocess_canny(control_view, 0.08f, 0.08f, 0.8f, 1.0f, false)) {
+                error = "failed to run canny preprocessor on control image";
+                return false;
+            }
+        }
+    }
+
+    if (!request.ref_image_paths.empty()) {
+        request.ref_images.reserve(request.ref_image_paths.size());
+        for (const auto& path : request.ref_image_paths) {
+            OwnedImage reference;
+            if (!load_image_file(path, 0, 0, 3, reference, error)) {
+                return false;
+            }
+            request.ref_images.push_back(std::move(reference));
+        }
+    }
+
+    if (!request.pm_id_images_dir.empty()) {
+        if (!load_images_from_directory(request.pm_id_images_dir, 0, 0, 3, 0, request.pm_id_images, error)) {
+            return false;
         }
     }
 
@@ -1386,7 +2191,12 @@ json make_telemetry(const LogCollector& collector,
     std::vector<std::string> embedding_order;
     std::set<std::string> embedding_paths;
     std::set<std::string> embedding_compare_paths;
-    std::deque<std::string> pending_tensor_sources;
+    struct TensorSourceInfo {
+        std::string path;
+        std::string component;
+    };
+    std::deque<TensorSourceInfo> pending_tensor_sources;
+    std::map<std::string, std::string> component_by_path;
     std::optional<json> model_summary;
 
     std::vector<double> condition_graph_ms;
@@ -1398,6 +2208,25 @@ json make_telemetry(const LogCollector& collector,
     };
     std::vector<VaeTiming> vae_timings;
     std::optional<double> generate_image_ms;
+    json component_loads = json::array();
+    auto record_component_load = [&](const std::string& component_name,
+                                     const std::string& component_path,
+                                     const std::optional<double>& duration,
+                                     const std::map<std::string, double>& breakdown) {
+        json entry = json::object();
+        entry["component"] = component_name;
+        if (!component_path.empty()) {
+            entry["path"] = component_path;
+        }
+        if (duration) {
+            entry["duration_ms"] = *duration;
+        }
+        json breakdown_json = breakdown_to_json(breakdown);
+        if (!breakdown_json.empty()) {
+            entry["breakdown_ms"] = breakdown_json;
+        }
+        component_loads.push_back(std::move(entry));
+    };
 
     struct SpanRecord {
         std::string span_id;
@@ -1436,9 +2265,46 @@ json make_telemetry(const LogCollector& collector,
     };
 
     const std::string model_compare_path = config.model_path.empty() ? std::string() : normalize_path_for_compare(config.model_path);
+    const std::vector<std::pair<std::string, std::string>> component_markers = {
+        {"loading model from '", "model.core"},
+        {"loading diffusion model from '", "model.diffusion"},
+        {"loading high noise diffusion model from '", "model.diffusion_high_noise"},
+        {"loading clip_l from '", "encoder.clip_l"},
+        {"loading clip_g from '", "encoder.clip_g"},
+        {"loading clip_vision from '", "encoder.clip_vision"},
+        {"loading t5xxl from '", "encoder.t5xxl"},
+        {"loading qwen2vl from '", "encoder.qwen2vl"},
+        {"loading qwen2vl vision from '", "encoder.qwen2vl_vision"},
+        {"loading vae from '", "vae.decoder"},
+        {"loading stacked ID embedding (PHOTOMAKER) model file from '", "photomaker.embedding"}
+    };
 
     for (const auto& entry : collector.entries) {
         const std::string& message = entry.message;
+
+        bool component_logged = false;
+        for (const auto& marker : component_markers) {
+            auto pos = message.find(marker.first);
+            if (pos != std::string::npos) {
+                std::size_t path_start = pos + marker.first.size();
+                std::size_t path_end = message.find("'", path_start);
+                if (path_end != std::string::npos && path_end > path_start) {
+                    std::string path = message.substr(path_start, path_end - path_start);
+                    std::string normalized = normalize_path_for_compare(path);
+                    if (!normalized.empty()) {
+                        component_by_path[normalized] = marker.second;
+                    }
+                    if (!path.empty()) {
+                        component_by_path[path] = marker.second;
+                    }
+                }
+                component_logged = true;
+                break;
+            }
+        }
+        if (component_logged) {
+            continue;
+        }
 
         const std::string embed_tag = "<embed:";
         std::size_t embed_search_pos = 0;
@@ -1478,7 +2344,19 @@ json make_telemetry(const LogCollector& collector,
         if (from_pos != std::string::npos) {
             std::string path = trim_copy(message.substr(from_pos + loading_from_marker.size()));
             if (!path.empty()) {
-                pending_tensor_sources.push_back(path);
+                TensorSourceInfo info;
+                info.path = path;
+                std::string normalized = normalize_path_for_compare(path);
+                auto comp_it = component_by_path.find(normalized);
+                if (comp_it != component_by_path.end()) {
+                    info.component = comp_it->second;
+                } else {
+                    auto raw_it = component_by_path.find(path);
+                    if (raw_it != component_by_path.end()) {
+                        info.component = raw_it->second;
+                    }
+                }
+                pending_tensor_sources.push_back(std::move(info));
             }
             continue;
         }
@@ -1486,9 +2364,12 @@ json make_telemetry(const LogCollector& collector,
         if (message.find("loading tensors completed") != std::string::npos) {
             auto duration = extract_duration_ms(message);
             std::string path;
+            std::string component;
             if (!pending_tensor_sources.empty()) {
-                path = pending_tensor_sources.front();
+                TensorSourceInfo info = std::move(pending_tensor_sources.front());
                 pending_tensor_sources.pop_front();
+                path = std::move(info.path);
+                component = std::move(info.component);
             }
             auto breakdown = extract_duration_breakdown_ms(message);
 
@@ -1500,6 +2381,17 @@ json make_telemetry(const LogCollector& collector,
                 normalized_path = normalize_path_for_compare(path);
                 if (!model_compare_path.empty() && normalized_path == model_compare_path) {
                     is_model = true;
+                }
+                if (component.empty()) {
+                    auto comp_it = component_by_path.find(normalized_path);
+                    if (comp_it != component_by_path.end()) {
+                        component = comp_it->second;
+                    } else {
+                        auto raw_it = component_by_path.find(path);
+                        if (raw_it != component_by_path.end()) {
+                            component = raw_it->second;
+                        }
+                    }
                 }
                 if (!normalized_path.empty() && embedding_compare_paths.find(normalized_path) != embedding_compare_paths.end()) {
                     is_embedding = true;
@@ -1578,6 +2470,13 @@ json make_telemetry(const LogCollector& collector,
                 attributes["sdcpp.embedding.phase"] = "load";
                 span_name = "gen_ai.artifact.embedding.load";
             } else if (is_model) {
+                if (component.empty()) {
+                    component = "model.core";
+                }
+                attributes["gen_ai.artifact.type"] = "model";
+                if (!component.empty()) {
+                    attributes["sdcpp.artifact.component"] = component;
+                }
                 attributes["gen_ai.operation.stage"] = "model.load";
                 span_name = "gen_ai.model.load";
                 if (duration) {
@@ -1590,6 +2489,15 @@ json make_telemetry(const LogCollector& collector,
                     }
                     model_summary = model;
                 }
+                if (!component.empty()) {
+                    record_component_load(component, path, duration, breakdown);
+                }
+            } else if (!component.empty()) {
+                attributes["gen_ai.artifact.type"] = "component";
+                attributes["gen_ai.operation.stage"] = "component.load";
+                attributes["sdcpp.artifact.component"] = component;
+                span_name = "gen_ai.component.load";
+                record_component_load(component, path, duration, breakdown);
             } else {
                 attributes["gen_ai.operation.stage"] = "artifact.load";
             }
@@ -1906,6 +2814,9 @@ json make_telemetry(const LogCollector& collector,
         generate["duration_ms"] = *generate_image_ms;
         summary["generate_image"] = std::move(generate);
     }
+    if (!component_loads.empty()) {
+        summary["component_loads"] = component_loads;
+    }
 
     json span_attributes = json::object();
     span_attributes["gen_ai.operation.name"] = "image_generation";
@@ -1929,10 +2840,104 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.request.height"] = request.height;
     span_attributes["sdcpp.request.sample_steps"] = request.sample_steps;
     span_attributes["sdcpp.request.cfg_scale"] = request.cfg_scale;
+    span_attributes["sdcpp.request.clip_skip"] = request.clip_skip;
+    if (request.has_eta) {
+        span_attributes["sdcpp.request.eta"] = request.eta;
+    }
+    span_attributes["sdcpp.request.shifted_timestep"] = request.shifted_timestep;
+    span_attributes["sdcpp.request.strength"] = request.strength;
+    span_attributes["sdcpp.request.control_strength"] = request.control_strength;
+    span_attributes["sdcpp.request.auto_resize_ref_image"] = request.auto_resize_ref_image;
+    span_attributes["sdcpp.request.increase_ref_index"] = request.increase_ref_index;
+    span_attributes["sdcpp.request.has_init_image"] = request.has_init_image;
+    span_attributes["sdcpp.request.has_mask_image"] = request.has_mask_image;
+    span_attributes["sdcpp.request.has_control_image"] = request.has_control_image;
+    if (!request.init_image_path.empty()) {
+        span_attributes["sdcpp.request.init_image_path"] = request.init_image_path;
+    }
+    if (!request.mask_image_path.empty()) {
+        span_attributes["sdcpp.request.mask_image_path"] = request.mask_image_path;
+    }
+    if (!request.control_image_path.empty()) {
+        span_attributes["sdcpp.request.control_image_path"] = request.control_image_path;
+    }
+    if (!request.ref_image_paths.empty()) {
+        span_attributes["sdcpp.request.ref_image_count"] = static_cast<int>(request.ref_image_paths.size());
+    }
+    if (!request.pm_id_images_dir.empty()) {
+        span_attributes["sdcpp.request.pm_id_images_dir"] = request.pm_id_images_dir;
+    }
+    if (!request.pm_id_embed_path.empty()) {
+        span_attributes["sdcpp.request.pm_id_embed_path"] = request.pm_id_embed_path;
+    }
+    span_attributes["sdcpp.request.pm_style_strength"] = request.pm_style_strength;
     if (request.has_img_cfg_scale) {
         span_attributes["sdcpp.request.img_cfg_scale"] = request.img_cfg_scale;
     }
+    if (!request.override_sample_method && request.sample_method != SAMPLE_METHOD_DEFAULT) {
+        span_attributes["sdcpp.request.sample_method"] = sd_sample_method_name(request.sample_method);
+    } else if (request.override_sample_method) {
+        span_attributes["sdcpp.request.sample_method"] = sd_sample_method_name(request.sample_method);
+    }
+    if (request.override_scheduler) {
+        span_attributes["sdcpp.request.scheduler"] = sd_schedule_name(request.scheduler);
+    }
+    span_attributes["sdcpp.request.distilled_guidance"] = request.distilled_guidance;
+    span_attributes["sdcpp.request.slg_scale"] = request.slg_scale;
+    span_attributes["sdcpp.request.slg_layer_start"] = request.slg_layer_start;
+    span_attributes["sdcpp.request.slg_layer_end"] = request.slg_layer_end;
     span_attributes["gen_ai.response.latency_ms"] = elapsed_ms;
+    span_attributes["sdcpp.context.diffusion_flash_attn"] = config.diffusion_flash_attn;
+    span_attributes["sdcpp.context.diffusion_conv_direct"] = config.diffusion_conv_direct;
+    span_attributes["sdcpp.context.vae_conv_direct"] = config.vae_conv_direct;
+    span_attributes["sdcpp.context.force_sdxl_vae_conv_scale"] = config.force_sdxl_vae_conv_scale;
+    span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
+    span_attributes["sdcpp.context.keep_clip_on_cpu"] = config.keep_clip_on_cpu;
+    span_attributes["sdcpp.context.keep_control_net_on_cpu"] = config.keep_control_net_on_cpu;
+    span_attributes["sdcpp.context.keep_vae_on_cpu"] = config.keep_vae_on_cpu;
+    span_attributes["sdcpp.context.rng_type"] = sd_rng_type_name(config.rng_type);
+    if (config.wtype != SD_TYPE_COUNT) {
+        span_attributes["sdcpp.context.weight_type"] = sd_type_name(config.wtype);
+    }
+    if (!std::isfinite(config.flow_shift)) {
+        span_attributes["sdcpp.context.flow_shift"] = "auto";
+    } else {
+        span_attributes["sdcpp.context.flow_shift"] = config.flow_shift;
+    }
+    span_attributes["sdcpp.context.chroma_use_dit_mask"] = config.chroma_use_dit_mask;
+    span_attributes["sdcpp.context.chroma_use_t5_mask"] = config.chroma_use_t5_mask;
+    span_attributes["sdcpp.context.chroma_t5_mask_pad"] = config.chroma_t5_mask_pad;
+    span_attributes["sdcpp.context.prediction"] = sd_prediction_name(config.prediction);
+    if (!config.clip_l_path.empty()) {
+        span_attributes["sdcpp.context.clip_l_path"] = config.clip_l_path;
+    }
+    if (!config.clip_g_path.empty()) {
+        span_attributes["sdcpp.context.clip_g_path"] = config.clip_g_path;
+    }
+    if (!config.clip_vision_path.empty()) {
+        span_attributes["sdcpp.context.clip_vision_path"] = config.clip_vision_path;
+    }
+    if (!config.t5xxl_path.empty()) {
+        span_attributes["sdcpp.context.t5xxl_path"] = config.t5xxl_path;
+    }
+    if (!config.qwen2vl_path.empty()) {
+        span_attributes["sdcpp.context.qwen2vl_path"] = config.qwen2vl_path;
+    }
+    if (!config.qwen2vl_vision_path.empty()) {
+        span_attributes["sdcpp.context.qwen2vl_vision_path"] = config.qwen2vl_vision_path;
+    }
+    if (!config.vae_path.empty()) {
+        span_attributes["sdcpp.context.vae_path"] = config.vae_path;
+    }
+    if (!config.diffusion_model_path.empty()) {
+        span_attributes["sdcpp.context.diffusion_model_path"] = config.diffusion_model_path;
+    }
+    if (!config.high_noise_diffusion_model_path.empty()) {
+        span_attributes["sdcpp.context.high_noise_diffusion_model_path"] = config.high_noise_diffusion_model_path;
+    }
+    if (!config.photo_maker_path.empty()) {
+        span_attributes["sdcpp.context.photo_maker_path"] = config.photo_maker_path;
+    }
 
     root_span.name = "gen_ai.inference.image_generation";
     root_span.duration_ms = static_cast<double>(elapsed_ms);
@@ -2099,12 +3104,38 @@ int main(int argc, char** argv) {
     ServerState state;
     state.verbose = options.verbose;
     state.ctx_config.model_path = options.model_path;
+    state.ctx_config.clip_l_path = options.clip_l_path;
+    state.ctx_config.clip_g_path = options.clip_g_path;
+    state.ctx_config.clip_vision_path = options.clip_vision_path;
+    state.ctx_config.t5xxl_path = options.t5xxl_path;
+    state.ctx_config.qwen2vl_path = options.qwen2vl_path;
+    state.ctx_config.qwen2vl_vision_path = options.qwen2vl_vision_path;
+    state.ctx_config.diffusion_model_path = options.diffusion_model_path;
+    state.ctx_config.high_noise_diffusion_model_path = options.high_noise_diffusion_model_path;
+    state.ctx_config.vae_path = options.vae_path;
+    state.ctx_config.taesd_path = options.taesd_path;
+    state.ctx_config.control_net_path = options.control_net_path;
+    state.ctx_config.lora_model_dir = options.lora_model_dir;
+    state.ctx_config.embedding_dir = options.embedding_dir;
+    state.ctx_config.photo_maker_path = options.photo_maker_path;
     state.ctx_config.vae_decode_only = true;
     state.ctx_config.free_params_immediately = false;
     state.ctx_config.n_threads = options.n_threads;
+    state.ctx_config.wtype = options.wtype;
+    state.ctx_config.rng_type = options.rng_type;
+    state.ctx_config.offload_params_to_cpu = options.offload_params_to_cpu;
+    state.ctx_config.keep_control_net_on_cpu = options.control_net_cpu;
+    state.ctx_config.keep_clip_on_cpu = options.clip_on_cpu;
+    state.ctx_config.keep_vae_on_cpu = options.vae_on_cpu;
     state.ctx_config.diffusion_flash_attn = options.diffusion_flash_attn;
     state.ctx_config.diffusion_conv_direct = options.diffusion_conv_direct;
     state.ctx_config.vae_conv_direct = options.vae_conv_direct;
+    state.ctx_config.force_sdxl_vae_conv_scale = options.force_sdxl_vae_conv_scale;
+    state.ctx_config.chroma_use_dit_mask = options.chroma_use_dit_mask;
+    state.ctx_config.chroma_use_t5_mask = options.chroma_use_t5_mask;
+    state.ctx_config.chroma_t5_mask_pad = options.chroma_t5_mask_pad;
+    state.ctx_config.flow_shift = options.flow_shift;
+    state.ctx_config.prediction = options.prediction;
     state.default_config = state.ctx_config;
 
     sd_set_log_callback(sd_server_log_callback, &state);
@@ -2157,6 +3188,14 @@ int main(int argc, char** argv) {
         std::string parse_error;
         if (!parse_generation_request(body, request_params, parse_error)) {
             auto response = make_error_response(parse_error, collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        std::string prepare_error;
+        if (!prepare_generation_inputs(request_params, prepare_error)) {
+            auto response = make_error_response(prepare_error, collector);
             res.status = 400;
             res.set_content(response.dump(), "application/json");
             return;
