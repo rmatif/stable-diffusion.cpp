@@ -369,6 +369,20 @@ SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
 
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
+SD_API bool sd_reload_diffusion_model(sd_ctx_t* sd_ctx,
+                                      const char* diffusion_model_path,
+                                      const char* high_noise_diffusion_model_path,
+                                      bool diffusion_flash_attn,
+                                      bool diffusion_conv_direct);
+SD_API bool sd_reload_vae(sd_ctx_t* sd_ctx,
+                          const char* vae_path,
+                          bool vae_conv_direct);
+SD_API bool sd_reload_text_encoders(sd_ctx_t* sd_ctx,
+                                    const char* clip_l_path,
+                                    const char* clip_g_path,
+                                    const char* t5xxl_path,
+                                    const char* qwen2vl_path,
+                                    const char* qwen2vl_vision_path);
 
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
 SD_API char* sd_sample_params_to_str(const sd_sample_params_t* sample_params);
