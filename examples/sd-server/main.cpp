@@ -2993,27 +2993,117 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
         return true;
     }
 
-    CtxConfig previous_config = state.ctx_config;
-    sd_ctx_t* previous_ctx = state.ctx;
-    if (previous_ctx != nullptr) {
-        free_sd_ctx(previous_ctx);
-        state.ctx = nullptr;
+    if (state.ctx == nullptr) {
+        state.ctx_config = desired;
+        sd_ctx_params_t params = state.ctx_config.to_sd_params();
+        sd_ctx_t* new_ctx = new_sd_ctx(&params);
+        if (new_ctx == nullptr) {
+            error_message = "failed to create Stable Diffusion context";
+            return false;
+        }
+        state.ctx = new_ctx;
+        return true;
+    }
+
+    const CtxConfig& current = state.ctx_config;
+
+    auto needs_full_reload = [&]() {
+        return current.model_path != desired.model_path ||
+               current.n_threads != desired.n_threads ||
+               current.wtype != desired.wtype ||
+               current.rng_type != desired.rng_type ||
+               current.offload_params_to_cpu != desired.offload_params_to_cpu ||
+               current.keep_clip_on_cpu != desired.keep_clip_on_cpu ||
+               current.keep_control_net_on_cpu != desired.keep_control_net_on_cpu ||
+               current.keep_vae_on_cpu != desired.keep_vae_on_cpu ||
+               current.vae_decode_only != desired.vae_decode_only ||
+               current.free_params_immediately != desired.free_params_immediately ||
+               current.taesd_path != desired.taesd_path ||
+               current.control_net_path != desired.control_net_path ||
+               current.lora_model_dir != desired.lora_model_dir ||
+               current.embedding_dir != desired.embedding_dir ||
+               current.photo_maker_path != desired.photo_maker_path ||
+               current.clip_vision_path != desired.clip_vision_path ||
+               current.force_sdxl_vae_conv_scale != desired.force_sdxl_vae_conv_scale ||
+               current.chroma_use_dit_mask != desired.chroma_use_dit_mask ||
+               current.chroma_use_t5_mask != desired.chroma_use_t5_mask ||
+               current.chroma_t5_mask_pad != desired.chroma_t5_mask_pad ||
+               current.flow_shift != desired.flow_shift ||
+               current.prediction != desired.prediction;
+    };
+
+    if (needs_full_reload()) {
+        CtxConfig previous_config = state.ctx_config;
+        sd_ctx_t* previous_ctx = state.ctx;
+        if (previous_ctx != nullptr) {
+            free_sd_ctx(previous_ctx);
+            state.ctx = nullptr;
+        }
+
+        state.ctx_config = desired;
+        sd_ctx_params_t params = state.ctx_config.to_sd_params();
+        sd_ctx_t* new_ctx = new_sd_ctx(&params);
+        if (new_ctx == nullptr) {
+            error_message = "failed to create Stable Diffusion context";
+            state.ctx_config = previous_config;
+            if (!previous_config.model_path.empty() || !previous_config.diffusion_model_path.empty()) {
+                sd_ctx_params_t restore_params = state.ctx_config.to_sd_params();
+                state.ctx = new_sd_ctx(&restore_params);
+            }
+            return false;
+        }
+
+        state.ctx = new_ctx;
+        return true;
+    }
+
+    bool diffusion_changed = current.diffusion_model_path != desired.diffusion_model_path ||
+                             current.high_noise_diffusion_model_path != desired.high_noise_diffusion_model_path ||
+                             current.diffusion_flash_attn != desired.diffusion_flash_attn ||
+                             current.diffusion_conv_direct != desired.diffusion_conv_direct;
+
+    bool vae_changed = current.vae_path != desired.vae_path ||
+                       current.vae_conv_direct != desired.vae_conv_direct;
+
+    bool text_encoders_changed = current.clip_l_path != desired.clip_l_path ||
+                                 current.clip_g_path != desired.clip_g_path ||
+                                 current.t5xxl_path != desired.t5xxl_path ||
+                                 current.qwen2vl_path != desired.qwen2vl_path ||
+                                 current.qwen2vl_vision_path != desired.qwen2vl_vision_path;
+
+    if (diffusion_changed) {
+        if (!sd_reload_diffusion_model(state.ctx,
+                                       desired.diffusion_model_path.c_str(),
+                                       desired.high_noise_diffusion_model_path.c_str(),
+                                       desired.diffusion_flash_attn,
+                                       desired.diffusion_conv_direct)) {
+            error_message = "failed to reload diffusion model";
+            return false;
+        }
+    }
+
+    if (vae_changed) {
+        if (!sd_reload_vae(state.ctx,
+                          desired.vae_path.c_str(),
+                          desired.vae_conv_direct)) {
+            error_message = "failed to reload VAE";
+            return false;
+        }
+    }
+
+    if (text_encoders_changed) {
+        if (!sd_reload_text_encoders(state.ctx,
+                                     desired.clip_l_path.c_str(),
+                                     desired.clip_g_path.c_str(),
+                                     desired.t5xxl_path.c_str(),
+                                     desired.qwen2vl_path.c_str(),
+                                     desired.qwen2vl_vision_path.c_str())) {
+            error_message = "failed to reload text encoders";
+            return false;
+        }
     }
 
     state.ctx_config = desired;
-    sd_ctx_params_t params = state.ctx_config.to_sd_params();
-    sd_ctx_t* new_ctx = new_sd_ctx(&params);
-    if (new_ctx == nullptr) {
-        error_message = "failed to create Stable Diffusion context";
-        state.ctx_config = previous_config;
-        if (!previous_config.model_path.empty() || !previous_config.diffusion_model_path.empty()) {
-            sd_ctx_params_t restore_params = state.ctx_config.to_sd_params();
-            state.ctx = new_sd_ctx(&restore_params);
-        }
-        return false;
-    }
-
-    state.ctx = new_ctx;
     return true;
 }
 

@@ -1012,6 +1012,300 @@ public:
         return true;
     }
 
+    bool reload_diffusion_model(const char* diffusion_model_path, const char* high_noise_diffusion_model_path, bool diffusion_flash_attn, bool diffusion_conv_direct) {
+        if (strlen(SAFE_STR(diffusion_model_path)) == 0) {
+            LOG_ERROR("diffusion_model_path is empty");
+            return false;
+        }
+
+        LOG_INFO("reloading diffusion model from '%s'", diffusion_model_path);
+
+        ModelLoader model_loader;
+        if (!model_loader.init_from_file(diffusion_model_path, "model.diffusion_model.", n_threads)) {
+            LOG_ERROR("failed to load diffusion model from '%s'", diffusion_model_path);
+            return false;
+        }
+
+        if (strlen(SAFE_STR(high_noise_diffusion_model_path)) > 0) {
+            LOG_INFO("reloading high noise diffusion model from '%s'", high_noise_diffusion_model_path);
+            if (!model_loader.init_from_file(high_noise_diffusion_model_path, "model.high_noise_diffusion_model.", n_threads)) {
+                LOG_WARN("failed to load high noise diffusion model from '%s'", high_noise_diffusion_model_path);
+            }
+        }
+
+        auto it = tensors.begin();
+        while (it != tensors.end()) {
+            if (it->first.find("model.diffusion_model") == 0 || it->first.find("model.high_noise_diffusion_model") == 0) {
+                it = tensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (diffusion_model) {
+            diffusion_model->free_params_buffer();
+            diffusion_model.reset();
+        }
+        if (high_noise_diffusion_model) {
+            high_noise_diffusion_model->free_params_buffer();
+            high_noise_diffusion_model.reset();
+        }
+
+        if (sd_version_is_flux(version)) {
+            diffusion_model = std::make_shared<FluxModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version, false);
+        } else if (sd_version_is_wan(version)) {
+            diffusion_model = std::make_shared<WanModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.diffusion_model", version);
+            if (strlen(SAFE_STR(high_noise_diffusion_model_path)) > 0) {
+                high_noise_diffusion_model = std::make_shared<WanModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.high_noise_diffusion_model", version);
+            }
+        } else if (sd_version_is_sd3(version)) {
+            diffusion_model = std::make_shared<MMDiTModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map());
+        } else if (sd_version_is_qwen_image(version)) {
+            diffusion_model = std::make_shared<QwenImageModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.diffusion_model", version);
+        } else {
+            diffusion_model = std::make_shared<UNetModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version);
+            if (diffusion_conv_direct) {
+                LOG_INFO("Using Conv2d direct in the diffusion model");
+                std::dynamic_pointer_cast<UNetModel>(diffusion_model)->unet.set_conv2d_direct_enabled(true);
+            }
+        }
+
+        if (diffusion_flash_attn) {
+            LOG_INFO("Using flash attention in the diffusion model");
+            diffusion_model->set_flash_attn_enabled(true);
+        }
+
+        diffusion_model->alloc_params_buffer();
+        if (high_noise_diffusion_model) {
+            high_noise_diffusion_model->alloc_params_buffer();
+        }
+
+        std::map<std::string, struct ggml_tensor*> diffusion_tensors;
+        diffusion_model->get_param_tensors(diffusion_tensors);
+        if (high_noise_diffusion_model) {
+            high_noise_diffusion_model->get_param_tensors(diffusion_tensors);
+        }
+
+        std::set<std::string> ignore_tensors;
+        if (!model_loader.load_tensors(diffusion_tensors, ignore_tensors, n_threads)) {
+            LOG_ERROR("failed to load tensors for diffusion model");
+            return false;
+        }
+
+        for (const auto& pair : diffusion_tensors) {
+            tensors[pair.first] = pair.second;
+        }
+
+        LOG_INFO("diffusion model reloaded successfully, VRAM usage: %.2fMB", diffusion_model->get_params_buffer_size() / 1024.0 / 1024.0);
+        return true;
+    }
+
+    bool reload_vae(const char* vae_path, bool vae_conv_direct) {
+        if (strlen(SAFE_STR(vae_path)) == 0) {
+            LOG_ERROR("vae_path is empty");
+            return false;
+        }
+
+        LOG_INFO("reloading VAE from '%s'", vae_path);
+
+        ModelLoader model_loader;
+        if (!model_loader.init_from_file(vae_path, "vae.", n_threads)) {
+            LOG_ERROR("failed to load VAE from '%s'", vae_path);
+            return false;
+        }
+
+        auto it = tensors.begin();
+        while (it != tensors.end()) {
+            if (it->first.find("first_stage_model") == 0) {
+                it = tensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (first_stage_model) {
+            first_stage_model->free_params_buffer();
+            first_stage_model.reset();
+        }
+
+        if (sd_version_is_wan(version) || sd_version_is_qwen_image(version)) {
+            first_stage_model = std::make_shared<WAN::WanVAERunner>(vae_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "first_stage_model", vae_decode_only, version);
+        } else if (version == VERSION_CHROMA_RADIANCE) {
+            first_stage_model = std::make_shared<FakeVAE>(vae_backend, offload_params_to_cpu);
+        } else {
+            first_stage_model = std::make_shared<AutoEncoderKL>(vae_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "first_stage_model", vae_decode_only, false, version);
+            if (vae_conv_direct) {
+                LOG_INFO("Using Conv2d direct in the VAE");
+                first_stage_model->set_conv2d_direct_enabled(true);
+            }
+        }
+
+        first_stage_model->alloc_params_buffer();
+
+        std::map<std::string, struct ggml_tensor*> vae_tensors;
+        first_stage_model->get_param_tensors(vae_tensors, "first_stage_model");
+
+        std::set<std::string> ignore_tensors;
+        if (vae_decode_only) {
+            ignore_tensors.insert("first_stage_model.encoder");
+            ignore_tensors.insert("first_stage_model.conv1");
+            ignore_tensors.insert("first_stage_model.quant");
+        }
+
+        if (!model_loader.load_tensors(vae_tensors, ignore_tensors, n_threads)) {
+            LOG_ERROR("failed to load tensors for VAE");
+            return false;
+        }
+
+        for (const auto& pair : vae_tensors) {
+            tensors[pair.first] = pair.second;
+        }
+
+        LOG_INFO("VAE reloaded successfully, VRAM usage: %.2fMB", first_stage_model->get_params_buffer_size() / 1024.0 / 1024.0);
+        return true;
+    }
+
+    bool reload_text_encoders(const char* clip_l_path, const char* clip_g_path, const char* t5xxl_path, const char* qwen2vl_path, const char* qwen2vl_vision_path) {
+        LOG_INFO("reloading text encoders");
+
+        ModelLoader model_loader;
+        bool is_unet = sd_version_is_unet(version);
+
+        if (strlen(SAFE_STR(clip_l_path)) > 0) {
+            LOG_INFO("loading clip_l from '%s'", clip_l_path);
+            std::string prefix = is_unet ? "cond_stage_model.transformer." : "text_encoders.clip_l.transformer.";
+            if (!model_loader.init_from_file(clip_l_path, prefix, n_threads)) {
+                LOG_ERROR("failed to load clip_l from '%s'", clip_l_path);
+                return false;
+            }
+        }
+
+        if (strlen(SAFE_STR(clip_g_path)) > 0) {
+            LOG_INFO("loading clip_g from '%s'", clip_g_path);
+            std::string prefix = is_unet ? "cond_stage_model.1.transformer." : "text_encoders.clip_g.transformer.";
+            if (!model_loader.init_from_file(clip_g_path, prefix, n_threads)) {
+                LOG_WARN("failed to load clip_g from '%s'", clip_g_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(t5xxl_path)) > 0) {
+            LOG_INFO("loading t5xxl from '%s'", t5xxl_path);
+            if (!model_loader.init_from_file(t5xxl_path, "text_encoders.t5xxl.transformer.", n_threads)) {
+                LOG_WARN("failed to load t5xxl from '%s'", t5xxl_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(qwen2vl_path)) > 0) {
+            LOG_INFO("loading qwen2vl from '%s'", qwen2vl_path);
+            if (!model_loader.init_from_file(qwen2vl_path, "text_encoders.qwen2vl.")) {
+                LOG_WARN("failed to load qwen2vl from '%s'", qwen2vl_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(qwen2vl_vision_path)) > 0) {
+            LOG_INFO("loading qwen2vl vision from '%s'", qwen2vl_vision_path);
+            if (!model_loader.init_from_file(qwen2vl_vision_path, "text_encoders.qwen2vl.visual.")) {
+                LOG_WARN("failed to load qwen2vl vision from '%s'", qwen2vl_vision_path);
+            }
+        }
+
+        auto it = tensors.begin();
+        while (it != tensors.end()) {
+            if (it->first.find("cond_stage_model") == 0 || it->first.find("text_encoders") == 0) {
+                it = tensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (cond_stage_model) {
+            cond_stage_model->free_params_buffer();
+            cond_stage_model.reset();
+        }
+
+        if (sd_version_is_sd3(version)) {
+            cond_stage_model = std::make_shared<SD3CLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map());
+        } else if (sd_version_is_flux(version)) {
+            if (version == VERSION_CHROMA_RADIANCE) {
+                cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), true, 0);
+            } else {
+                cond_stage_model = std::make_shared<FluxCLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map());
+            }
+        } else if (sd_version_is_wan(version)) {
+            cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), true, 1, true);
+        } else if (sd_version_is_qwen_image(version)) {
+            bool enable_vision = !vae_decode_only;
+            cond_stage_model = std::make_shared<Qwen2_5_VLCLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "", enable_vision);
+        } else {
+            cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "", version);
+        }
+
+        cond_stage_model->alloc_params_buffer();
+
+        std::map<std::string, struct ggml_tensor*> text_encoder_tensors;
+        cond_stage_model->get_param_tensors(text_encoder_tensors);
+
+        std::set<std::string> ignore_tensors;
+        if (!model_loader.load_tensors(text_encoder_tensors, ignore_tensors, n_threads)) {
+            LOG_ERROR("failed to load tensors for text encoders");
+            return false;
+        }
+
+        for (const auto& pair : text_encoder_tensors) {
+            tensors[pair.first] = pair.second;
+        }
+
+        LOG_INFO("text encoders reloaded successfully, VRAM usage: %.2fMB", cond_stage_model->get_params_buffer_size() / 1024.0 / 1024.0);
+        return true;
+    }
+
+    void init_scheduler(scheduler_t scheduler) {
+        switch (scheduler) {
+            case DISCRETE:
+                LOG_INFO("running with discrete scheduler");
+                denoiser->scheduler = std::make_shared<DiscreteSchedule>();
+                break;
+            case KARRAS:
+                LOG_INFO("running with Karras scheduler");
+                denoiser->scheduler = std::make_shared<KarrasSchedule>();
+                break;
+            case EXPONENTIAL:
+                LOG_INFO("running exponential scheduler");
+                denoiser->scheduler = std::make_shared<ExponentialSchedule>();
+                break;
+            case AYS:
+                LOG_INFO("Running with Align-Your-Steps scheduler");
+                denoiser->scheduler          = std::make_shared<AYSSchedule>();
+                denoiser->scheduler->version = version;
+                break;
+            case GITS:
+                LOG_INFO("Running with GITS scheduler");
+                denoiser->scheduler          = std::make_shared<GITSSchedule>();
+                denoiser->scheduler->version = version;
+                break;
+            case SGM_UNIFORM:
+                LOG_INFO("Running with SGM Uniform schedule");
+                denoiser->scheduler          = std::make_shared<SGMUniformSchedule>();
+                denoiser->scheduler->version = version;
+                break;
+            case SIMPLE:
+                LOG_INFO("Running with Simple schedule");
+                denoiser->scheduler          = std::make_shared<SimpleSchedule>();
+                denoiser->scheduler->version = version;
+                break;
+            case SMOOTHSTEP:
+                LOG_INFO("Running with SmoothStep scheduler");
+                denoiser->scheduler = std::make_shared<SmoothStepSchedule>();
+                break;
+            case DEFAULT:
+                // Don't touch anything.
+                break;
+            default:
+                LOG_ERROR("Unknown scheduler %i", scheduler);
+                abort();
+        }
+    }
+
     bool is_using_v_parameterization_for_sd2(ggml_context* work_ctx, bool is_inpaint = false) {
         struct ggml_tensor* x_t = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, 8, 8, 4, 1);
         ggml_set_f32(x_t, 0.5);
@@ -3267,6 +3561,38 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
         sd_ctx->sd = nullptr;
     }
     free(sd_ctx);
+}
+
+bool sd_reload_diffusion_model(sd_ctx_t* sd_ctx,
+                               const char* diffusion_model_path,
+                               const char* high_noise_diffusion_model_path,
+                               bool diffusion_flash_attn,
+                               bool diffusion_conv_direct) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->reload_diffusion_model(diffusion_model_path, high_noise_diffusion_model_path, diffusion_flash_attn, diffusion_conv_direct);
+}
+
+bool sd_reload_vae(sd_ctx_t* sd_ctx,
+                  const char* vae_path,
+                  bool vae_conv_direct) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->reload_vae(vae_path, vae_conv_direct);
+}
+
+bool sd_reload_text_encoders(sd_ctx_t* sd_ctx,
+                             const char* clip_l_path,
+                             const char* clip_g_path,
+                             const char* t5xxl_path,
+                             const char* qwen2vl_path,
+                             const char* qwen2vl_vision_path) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->reload_text_encoders(clip_l_path, clip_g_path, t5xxl_path, qwen2vl_path, qwen2vl_vision_path);
 }
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
