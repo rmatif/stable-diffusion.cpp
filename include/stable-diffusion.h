@@ -367,6 +367,8 @@ SD_API void sd_cache_params_init(sd_cache_params_t* cache_params);
 SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
 
+SD_API void sd_easycache_params_init(sd_easycache_params_t* easycache_params);
+
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 SD_API bool sd_reload_diffusion_model(sd_ctx_t* sd_ctx,

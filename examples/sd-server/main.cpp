@@ -453,6 +453,8 @@ struct CLIOptions {
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
     prediction_t prediction = DEFAULT_PRED;
+    bool easycache_provided = false;
+    sd_easycache_params_t easycache_params = {false, 0.2f, 0.15f, 0.95f};
 };
 
 void print_usage() {
@@ -483,6 +485,7 @@ void print_usage() {
         << "      --rng <type>                        RNG, one of [std_default, cuda]\n"
         << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow]\n"
         << "      --flow-shift <value>                Flow model shift override\n"
+        << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
         << "      --chroma-t5-mask-pad <int>          Padding for Chroma T5 mask\n"
         << "\n"
         << "Device placement:\n"
@@ -684,6 +687,61 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                     return false;
                 }
             }
+        } else if (arg == "--easycache") {
+            if (i + 1 >= argc) {
+                error = "missing value for --easycache";
+                return false;
+            }
+            std::string value = argv[++i];
+            float parsed[3] = {0.0f, 0.0f, 0.0f};
+            std::stringstream ss(value);
+            std::string token;
+            int idx = 0;
+            auto trim = [](std::string& s) {
+                const char* whitespace = " \t\r\n";
+                auto start = s.find_first_not_of(whitespace);
+                if (start == std::string::npos) {
+                    s.clear();
+                    return;
+                }
+                auto end = s.find_last_not_of(whitespace);
+                s = s.substr(start, end - start + 1);
+            };
+            while (std::getline(ss, token, ',')) {
+                trim(token);
+                if (token.empty()) {
+                    error = "invalid easycache value";
+                    return false;
+                }
+                if (idx >= 3) {
+                    error = "easycache expects exactly 3 comma-separated values";
+                    return false;
+                }
+                try {
+                    parsed[idx] = std::stof(token);
+                } catch (const std::exception&) {
+                    error = "invalid easycache value";
+                    return false;
+                }
+                idx++;
+            }
+            if (idx != 3) {
+                error = "easycache expects exactly 3 comma-separated values";
+                return false;
+            }
+            if (parsed[0] < 0.0f) {
+                error = "easycache threshold must be non-negative";
+                return false;
+            }
+            if (parsed[1] < 0.0f || parsed[1] >= 1.0f || parsed[2] <= 0.0f || parsed[2] > 1.0f || parsed[1] >= parsed[2]) {
+                error = "easycache start/end percents must satisfy 0.0 <= start < end <= 1.0";
+                return false;
+            }
+            options.easycache_params.enabled = true;
+            options.easycache_params.reuse_threshold = parsed[0];
+            options.easycache_params.start_percent = parsed[1];
+            options.easycache_params.end_percent = parsed[2];
+            options.easycache_provided = true;
         } else if (arg == "-v" || arg == "--verbose") {
             options.verbose = true;
         } else if (arg == "--diffusion-fa") {
@@ -879,6 +937,7 @@ struct ServerState {
     LogCollector* active_collector = nullptr;
     std::string pending_log_fragment;
     bool verbose = false;
+    sd_easycache_params_t default_easycache = {false, 0.2f, 0.15f, 0.95f};
 };
 
 class LogCaptureScope {
@@ -948,6 +1007,8 @@ struct GenerationRequest {
     bool has_control_image = false;
     std::vector<OwnedImage> ref_images;
     std::vector<OwnedImage> pm_id_images;
+    sd_easycache_params_t easycache = {false, 0.2f, 0.15f, 0.95f};
+    bool easycache_provided = false;
 };
 
 struct ImageResultGuard {
@@ -1037,6 +1098,7 @@ class StreamingImageResponder {
         params.increase_ref_index = request_.increase_ref_index;
         params.strength = request_.strength;
         params.control_strength = request_.control_strength;
+        params.easycache = request_.easycache;
         if (request_.has_init_image) {
             params.init_image = request_.init_image.as_sd_image();
         }
@@ -1464,6 +1526,8 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
 }
 
 bool parse_generation_request(const json& body, GenerationRequest& request, std::string& error) {
+    sd_easycache_params_init(&request.easycache);
+    request.easycache_provided = false;
     auto prompt_it = body.find("prompt");
     if (prompt_it == body.end() || !prompt_it->is_string()) {
         error = "field 'prompt' is required";
@@ -1590,6 +1654,160 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
     }
     if (request.sample_steps <= 0) {
         error = "sample_steps must be greater than 0";
+        return false;
+    }
+
+    bool easycache_flag_explicit = false;
+    auto apply_easycache_values = [&](float threshold, float start, float end) -> bool {
+        if (threshold < 0.0f) {
+            error = "easycache threshold must be non-negative";
+            return false;
+        }
+        if (start < 0.0f || start >= 1.0f || end <= 0.0f || end > 1.0f || start >= end) {
+            error = "easycache start/end percents must satisfy 0.0 <= start < end <= 1.0";
+            return false;
+        }
+        request.easycache.reuse_threshold = threshold;
+        request.easycache.start_percent = start;
+        request.easycache.end_percent = end;
+        request.easycache_provided = true;
+        return true;
+    };
+
+    auto parse_easycache_triplet = [&](const std::string& value) -> bool {
+        float parsed[3] = {0.0f, 0.0f, 0.0f};
+        std::stringstream ss(value);
+        std::string token;
+        int idx = 0;
+        auto trim = [](std::string& s) {
+            const char* whitespace = " \t\r\n";
+            auto start = s.find_first_not_of(whitespace);
+            if (start == std::string::npos) {
+                s.clear();
+                return;
+            }
+            auto end = s.find_last_not_of(whitespace);
+            s = s.substr(start, end - start + 1);
+        };
+        while (std::getline(ss, token, ',')) {
+            trim(token);
+            if (token.empty()) {
+                error = "invalid easycache value";
+                return false;
+            }
+            if (idx >= 3) {
+                error = "easycache expects exactly 3 comma-separated values";
+                return false;
+            }
+            try {
+                parsed[idx] = std::stof(token);
+            } catch (const std::exception&) {
+                error = "invalid easycache value";
+                return false;
+            }
+            idx++;
+        }
+        if (idx != 3) {
+            error = "easycache expects exactly 3 comma-separated values";
+            return false;
+        }
+        return apply_easycache_values(parsed[0], parsed[1], parsed[2]);
+    };
+
+    auto easycache_it = body.find("easycache");
+    if (easycache_it != body.end()) {
+        if (easycache_it->is_boolean()) {
+            request.easycache.enabled = easycache_it->get<bool>();
+            request.easycache_provided = true;
+            easycache_flag_explicit = true;
+        } else if (easycache_it->is_string()) {
+            if (!parse_easycache_triplet(easycache_it->get<std::string>())) {
+                return false;
+            }
+            request.easycache.enabled = true;
+        } else if (easycache_it->is_array()) {
+            if (easycache_it->size() != 3) {
+                error = "field 'easycache' array must contain exactly 3 values";
+                return false;
+            }
+            float threshold = 0.0f;
+            float start = 0.0f;
+            float end = 0.0f;
+            for (size_t i = 0; i < 3; ++i) {
+                if (!(*easycache_it)[i].is_number_float() && !(*easycache_it)[i].is_number_integer()) {
+                    error = "field 'easycache' array must contain numeric values";
+                    return false;
+                }
+            }
+            threshold = static_cast<float>((*easycache_it)[0].get<double>());
+            start = static_cast<float>((*easycache_it)[1].get<double>());
+            end = static_cast<float>((*easycache_it)[2].get<double>());
+            if (!apply_easycache_values(threshold, start, end)) {
+                return false;
+            }
+            request.easycache.enabled = true;
+        } else {
+            error = "field 'easycache' must be boolean, string, or array";
+            return false;
+        }
+    }
+
+    auto easycache_threshold_it = body.find("easycache_threshold");
+    if (easycache_threshold_it != body.end()) {
+        if (!easycache_threshold_it->is_number_float() && !easycache_threshold_it->is_number_integer()) {
+            error = "field 'easycache_threshold' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(easycache_threshold_it->get<double>());
+        if (value < 0.0f) {
+            error = "easycache threshold must be non-negative";
+            return false;
+        }
+        request.easycache.reuse_threshold = value;
+        request.easycache_provided = true;
+        if (!easycache_flag_explicit) {
+            request.easycache.enabled = true;
+        }
+    }
+
+    auto easycache_start_it = body.find("easycache_start_percent");
+    if (easycache_start_it != body.end()) {
+        if (!easycache_start_it->is_number_float() && !easycache_start_it->is_number_integer()) {
+            error = "field 'easycache_start_percent' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(easycache_start_it->get<double>());
+        if (value < 0.0f || value >= 1.0f) {
+            error = "easycache_start_percent must be between 0.0 and 1.0";
+            return false;
+        }
+        request.easycache.start_percent = value;
+        request.easycache_provided = true;
+        if (!easycache_flag_explicit) {
+            request.easycache.enabled = true;
+        }
+    }
+
+    auto easycache_end_it = body.find("easycache_end_percent");
+    if (easycache_end_it != body.end()) {
+        if (!easycache_end_it->is_number_float() && !easycache_end_it->is_number_integer()) {
+            error = "field 'easycache_end_percent' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(easycache_end_it->get<double>());
+        if (value <= 0.0f || value > 1.0f) {
+            error = "easycache_end_percent must be between 0.0 and 1.0";
+            return false;
+        }
+        request.easycache.end_percent = value;
+        request.easycache_provided = true;
+        if (!easycache_flag_explicit) {
+            request.easycache.enabled = true;
+        }
+    }
+
+    if (request.easycache_provided && request.easycache.start_percent >= request.easycache.end_percent) {
+        error = "easycache_start_percent must be less than easycache_end_percent";
         return false;
     }
 
@@ -3227,6 +3445,12 @@ int main(int argc, char** argv) {
     state.ctx_config.flow_shift = options.flow_shift;
     state.ctx_config.prediction = options.prediction;
     state.default_config = state.ctx_config;
+    sd_easycache_params_init(&state.default_easycache);
+    if (options.easycache_provided) {
+        state.default_easycache = options.easycache_params;
+    } else {
+        state.default_easycache.enabled = false;
+    }
 
     sd_set_log_callback(sd_server_log_callback, &state);
 
@@ -3289,6 +3513,15 @@ int main(int argc, char** argv) {
             res.status = 400;
             res.set_content(response.dump(), "application/json");
             return;
+        }
+
+        if (!request_params.easycache_provided) {
+            if (state.default_easycache.enabled) {
+                request_params.easycache = state.default_easycache;
+                request_params.easycache_provided = true;
+            } else {
+                request_params.easycache.enabled = false;
+            }
         }
 
         std::unique_lock<std::mutex> lock(state.mutex);
