@@ -1125,6 +1125,7 @@ public:
                         const std::vector<float>& sigmas,
                         int start_merge_step,
                         SDCondition id_cond,
+                        sd_deepcache_params_t deepcache_params,
                         std::vector<ggml_tensor*> ref_latents = {},
                         bool increase_ref_index               = false,
                         ggml_tensor* denoise_mask             = nullptr,
@@ -1183,9 +1184,28 @@ public:
 
         int64_t t0 = ggml_time_us();
 
+        int deepcache_current_step = -1;
+        int deepcache_model_step = 0;
+        float deepcache_last_sigma = -1.0f;
+
         auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
+            }
+
+            if (deepcache_params.cache_interval > 0) {
+                if (sigma != deepcache_last_sigma) {
+                    deepcache_last_sigma = sigma;
+                    deepcache_model_step++;
+
+                    bool cache_apply = (deepcache_model_step > deepcache_params.start_step &&
+                                       deepcache_model_step <= deepcache_params.end_step);
+                    if (cache_apply) {
+                        deepcache_current_step++;
+                    } else {
+                        deepcache_current_step = -1;
+                    }
+                }
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -1238,6 +1258,8 @@ public:
             diffusion_params.control_strength   = control_strength;
             diffusion_params.vace_context       = vace_context;
             diffusion_params.vace_strength      = vace_strength;
+            diffusion_params.deepcache_step     = deepcache_current_step;
+            diffusion_params.deepcache_params   = deepcache_params;
 
             if (start_merge_step == -1 || step <= start_merge_step) {
                 // cond
@@ -1952,6 +1974,10 @@ void sd_sample_params_init(sd_sample_params_t* sample_params) {
     sample_params->scheduler                   = DEFAULT;
     sample_params->sample_method               = SAMPLE_METHOD_DEFAULT;
     sample_params->sample_steps                = 20;
+    sample_params->deepcache.cache_interval    = 0;  // 0 means disabled
+    sample_params->deepcache.cache_depth       = 3;
+    sample_params->deepcache.start_step        = 0;
+    sample_params->deepcache.end_step          = 0;
 }
 
 char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
@@ -1972,7 +1998,8 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              "sample_method: %s, "
              "sample_steps: %d, "
              "eta: %.2f, "
-             "shifted_timestep: %d)",
+             "shifted_timestep: %d, "
+             "deepcache: %s)",
              sample_params->guidance.txt_cfg,
              std::isfinite(sample_params->guidance.img_cfg)
                  ? sample_params->guidance.img_cfg
@@ -1986,7 +2013,8 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              sd_sample_method_name(sample_params->sample_method),
              sample_params->sample_steps,
              sample_params->eta,
-             sample_params->shifted_timestep);
+             sample_params->shifted_timestep,
+             sample_params->deepcache.cache_interval > 0 ? "enabled" : "disabled");
 
     return buf;
 }
@@ -2130,6 +2158,7 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                     std::vector<sd_image_t*> ref_images,
                                     std::vector<ggml_tensor*> ref_latents,
                                     bool increase_ref_index,
+                                    sd_deepcache_params_t deepcache_params,
                                     ggml_tensor* concat_latent = nullptr,
                                     ggml_tensor* denoise_mask  = nullptr) {
     if (seed < 0) {
@@ -2405,6 +2434,7 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                                      sigmas,
                                                      start_merge_step,
                                                      id_cond,
+                                                     deepcache_params,
                                                      ref_latents,
                                                      increase_ref_index,
                                                      denoise_mask);
@@ -2719,6 +2749,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
                                                         ref_images,
                                                         ref_latents,
                                                         sd_img_gen_params->increase_ref_index,
+                                                        sd_img_gen_params->sample_params.deepcache,
                                                         concat_latent,
                                                         denoise_mask);
 
@@ -3036,6 +3067,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                  high_noise_sigmas,
                                  -1,
                                  {},
+                                 sd_vid_gen_params->high_noise_sample_params.deepcache,
                                  {},
                                  false,
                                  denoise_mask,
@@ -3072,6 +3104,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                           sigmas,
                                           -1,
                                           {},
+                                          sd_vid_gen_params->sample_params.deepcache,
                                           {},
                                           false,
                                           denoise_mask,

@@ -185,6 +185,10 @@ public:
     int model_channels  = 320;
     int adm_in_channels = 2816;  // only for VERSION_SDXL/SVD
 
+    // DeepCache state
+    struct ggml_tensor* deepcache_cached_h = nullptr;
+    ggml_context* deepcache_cache_ctx = nullptr;
+
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
         if (sd_version_is_sd2(version)) {
@@ -420,7 +424,9 @@ public:
                                 struct ggml_tensor* y                     = nullptr,
                                 int num_video_frames                      = -1,
                                 std::vector<struct ggml_tensor*> controls = {},
-                                float control_strength                    = 0.f) {
+                                float control_strength                    = 0.f,
+                                int deepcache_step                        = -1,
+                                sd_deepcache_params_t deepcache_params    = {0, 3, 0, 0}) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
@@ -471,6 +477,9 @@ public:
             emb = ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
         }
 
+        bool use_deepcache = deepcache_params.cache_interval > 0 && deepcache_step >= 0;
+        bool step_cache_interval = use_deepcache && (deepcache_step % deepcache_params.cache_interval) != 0;
+
         // input_blocks
         std::vector<struct ggml_tensor*> hs;
 
@@ -495,6 +504,7 @@ public:
                 }
                 hs.push_back(h);
             }
+
             if (version == VERSION_SD1_TINY_UNET) {
                 input_block_idx++;
             }
@@ -513,10 +523,12 @@ public:
 
         // middle_block
         if (version != VERSION_SD1_TINY_UNET) {
-            h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
-            if (version != VERSION_SDXL_SSD1B) {
-                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
-                h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
+            if (!step_cache_interval || !use_deepcache) {
+                h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+                if (version != VERSION_SDXL_SSD1B) {
+                    h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+                    h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
+                }
             }
         }
         if (controls.size() > 0) {
@@ -527,6 +539,9 @@ public:
 
         // output_blocks
         int output_block_idx = 0;
+        int total_output_blocks = len_mults * (num_res_blocks + 1);
+        int cache_block_id = total_output_blocks - deepcache_params.cache_depth - 1;
+
         for (int i = (int)len_mults - 1; i >= 0; i--) {
             for (int j = 0; j < num_res_blocks + 1; j++) {
                 auto h_skip = hs.back();
@@ -534,7 +549,7 @@ public:
 
                 if (controls.size() > 0) {
                     auto cs = ggml_scale_inplace(ctx->ggml_ctx, controls[control_offset], control_strength);
-                    h_skip  = ggml_add(ctx->ggml_ctx, h_skip, cs);  // control net condition
+                    h_skip  = ggml_add(ctx->ggml_ctx, h_skip, cs);
                     control_offset--;
                 }
 
@@ -608,7 +623,9 @@ struct UNetModelRunner : public GGMLRunner {
                                     struct ggml_tensor* y                     = nullptr,
                                     int num_video_frames                      = -1,
                                     std::vector<struct ggml_tensor*> controls = {},
-                                    float control_strength                    = 0.f) {
+                                    float control_strength                    = 0.f,
+                                    int deepcache_step                        = -1,
+                                    sd_deepcache_params_t deepcache_params    = {0, 3, 0, 0}) {
         struct ggml_cgraph* gf = ggml_new_graph_custom(compute_ctx, UNET_GRAPH_SIZE, false);
 
         if (num_video_frames == -1) {
@@ -635,7 +652,9 @@ struct UNetModelRunner : public GGMLRunner {
                                                y,
                                                num_video_frames,
                                                controls,
-                                               control_strength);
+                                               control_strength,
+                                               deepcache_step,
+                                               deepcache_params);
 
         ggml_build_forward_expand(gf, out);
 
@@ -651,6 +670,8 @@ struct UNetModelRunner : public GGMLRunner {
                  int num_video_frames                      = -1,
                  std::vector<struct ggml_tensor*> controls = {},
                  float control_strength                    = 0.f,
+                 int deepcache_step                        = -1,
+                 sd_deepcache_params_t deepcache_params    = {0, 3, 0, 0},
                  struct ggml_tensor** output               = nullptr,
                  struct ggml_context* output_ctx           = nullptr) {
         // x: [N, in_channels, h, w]
@@ -659,7 +680,7 @@ struct UNetModelRunner : public GGMLRunner {
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> struct ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength);
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, deepcache_step, deepcache_params);
         };
 
         GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
@@ -698,7 +719,7 @@ struct UNetModelRunner : public GGMLRunner {
             struct ggml_tensor* out = nullptr;
 
             int t0 = ggml_time_ms();
-            compute(8, x, timesteps, context, nullptr, y, num_video_frames, {}, 0.f, &out, work_ctx);
+            compute(8, x, timesteps, context, nullptr, y, num_video_frames, {}, 0.f, -1, {0, 3, 0, 0}, &out, work_ctx);
             int t1 = ggml_time_ms();
 
             print_ggml_tensor(out);

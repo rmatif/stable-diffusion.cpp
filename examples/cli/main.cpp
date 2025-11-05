@@ -1046,6 +1046,42 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         return 1;
     };
 
+    auto on_deepcache_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        std::string deepcache_str = argv[index];
+        // Parse format: interval,depth,start,stop
+        std::regex regex("[,]+");
+        std::sregex_token_iterator iter(deepcache_str.begin(), deepcache_str.end(), regex, -1);
+        std::sregex_token_iterator end;
+        std::vector<std::string> tokens(iter, end);
+
+        if (tokens.size() != 4) {
+            fprintf(stderr, "error: --deepcache requires 4 values in format interval,depth,start,stop\n");
+            return -1;
+        }
+
+        try {
+            params.sample_params.deepcache.cache_interval = std::stoi(tokens[0]);
+            params.sample_params.deepcache.cache_depth = std::stoi(tokens[1]);
+            params.sample_params.deepcache.start_step = std::stoi(tokens[2]);
+            params.sample_params.deepcache.end_step = std::stoi(tokens[3]);
+
+            if (params.sample_params.deepcache.cache_interval <= 0) {
+                fprintf(stderr, "error: --deepcache interval must be > 0\n");
+                return -1;
+            }
+        } catch (const std::invalid_argument& e) {
+            fprintf(stderr, "error: --deepcache values must be integers\n");
+            return -1;
+        } catch (const std::out_of_range& e) {
+            fprintf(stderr, "error: --deepcache values out of range\n");
+            return -1;
+        }
+        return 1;
+    };
+
     options.manual_options = {
         {"-M",
          "--mode",
@@ -1110,6 +1146,10 @@ void parse_args(int argc, const char** argv, SDParams& params) {
          "--vae-relative-tile-size",
          "relative tile size for vae tiling, format [X]x[Y], in fraction of image size if < 1, in number of tiles per dim if >=1 (overrides --vae-tile-size)",
          on_relative_tile_size_arg},
+        {"",
+         "--deepcache",
+         "enable DeepCache acceleration with format interval,depth,start,stop (e.g., 3,3,0,20)",
+         on_deepcache_arg},
     };
 
     if (!parse_options(argc, argv, options)) {

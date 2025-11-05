@@ -194,12 +194,20 @@ typedef struct {
 } sd_guidance_params_t;
 
 typedef struct {
+    int cache_interval;
+    int cache_depth;
+    int start_step;
+    int end_step;
+} sd_deepcache_params_t;
+
+typedef struct {
     sd_guidance_params_t guidance;
     enum scheduler_t scheduler;
     enum sample_method_t sample_method;
     int sample_steps;
     float eta;
     int shifted_timestep;
+    sd_deepcache_params_t deepcache;
 } sd_sample_params_t;
 
 typedef struct {

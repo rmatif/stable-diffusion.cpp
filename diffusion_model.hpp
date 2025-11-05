@@ -6,6 +6,7 @@
 #include "qwen_image.hpp"
 #include "unet.hpp"
 #include "wan.hpp"
+#include "stable-diffusion.h"
 
 struct DiffusionParams {
     struct ggml_tensor* x                     = nullptr;
@@ -22,6 +23,9 @@ struct DiffusionParams {
     struct ggml_tensor* vace_context          = nullptr;
     float vace_strength                       = 1.f;
     std::vector<int> skip_layers              = {};
+    // DeepCache parameters
+    int deepcache_step                        = -1;
+    sd_deepcache_params_t deepcache_params    = {0, 3, 0, 0};
 };
 
 struct DiffusionModel {
@@ -93,7 +97,10 @@ struct UNetModel : public DiffusionModel {
                             diffusion_params.y,
                             diffusion_params.num_video_frames,
                             diffusion_params.controls,
-                            diffusion_params.control_strength, output, output_ctx);
+                            diffusion_params.control_strength,
+                            diffusion_params.deepcache_step,
+                            diffusion_params.deepcache_params,
+                            output, output_ctx);
     }
 };
 
