@@ -225,7 +225,7 @@ std::unordered_map<std::string, std::string> qwenvl_vision_name_map{
     {"ln2.", "norm2."},
 };
 
-std::string convert_cond_model_name(const std::string& name) {
+static std::string convert_cond_model_name(const std::string& name) {
     std::string new_name = name;
     std::string prefix;
     if (contains(new_name, ".enc.")) {
@@ -364,14 +364,14 @@ std::string convert_cond_model_name(const std::string& name) {
     return prefix + new_name;
 }
 
-std::string convert_vae_decoder_name(const std::string& name) {
+static std::string convert_vae_decoder_name(const std::string& name) {
     if (vae_decoder_name_map.find(name) != vae_decoder_name_map.end()) {
         return vae_decoder_name_map[name];
     }
     return name;
 }
 
-std::string convert_pmid_v2_name(const std::string& name) {
+static std::string convert_pmid_v2_name(const std::string& name) {
     if (pmid_v2_name_map.find(name) != pmid_v2_name_map.end()) {
         return pmid_v2_name_map[name];
     }
@@ -380,7 +380,7 @@ std::string convert_pmid_v2_name(const std::string& name) {
 
 /* If not a SDXL LoRA the unet" prefix will have already been replaced by this
  * point and "te2" and "te1" don't seem to appear in non-SDXL only "te_" */
-std::string convert_sdxl_lora_name(std::string tensor_name) {
+static std::string convert_sdxl_lora_name(std::string tensor_name) {
     const std::pair<std::string, std::string> sdxl_lora_name_lookup[] = {
         {"unet", "model_diffusion_model"},
         {"te2", "cond_stage_model_1_transformer"},
@@ -453,7 +453,7 @@ std::unordered_map<std::string, std::unordered_map<std::string, std::string>> su
     },
 };
 
-std::string convert_diffusers_name_to_compvis(std::string key, char seq) {
+static std::string convert_diffusers_name_to_compvis(std::string key, char seq) {
     std::vector<std::string> m;
 
     auto match = [](std::vector<std::string>& match_list, const std::regex& regex, const std::string& key) {
@@ -617,7 +617,7 @@ std::string convert_diffusers_name_to_compvis(std::string key, char seq) {
     return key;
 }
 
-std::string convert_tensor_name(std::string name) {
+static std::string convert_tensor_name(std::string name) {
     static thread_local std::unordered_map<std::string, std::string> cache;
 
     auto cached = cache.find(name);
