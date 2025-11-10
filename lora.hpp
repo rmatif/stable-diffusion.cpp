@@ -114,8 +114,8 @@ struct LoraModel : public GGMLRunner {
               std::string prefix           = "",
               SDVersion version            = VERSION_COUNT)
         : lora_id(lora_id), file_path(file_path), GGMLRunner(backend, false) {
-        prefix = "lora." + prefix;
-        if (!model_loader.init_from_file_and_convert_name(file_path, prefix, version)) {
+        (void)version;
+        if (!model_loader.init_from_file(file_path, prefix)) {
             load_failed = true;
         }
     }
