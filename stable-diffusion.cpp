@@ -81,6 +81,30 @@ const char* sampling_methods_str[] = {
     "Res Multistep",
     "Res 2s",
 };
+
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD1) == static_cast<int>(VERSION_SD1), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD1_INPAINT) == static_cast<int>(VERSION_SD1_INPAINT), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD1_PIX2PIX) == static_cast<int>(VERSION_SD1_PIX2PIX), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD1_TINY_UNET) == static_cast<int>(VERSION_SD1_TINY_UNET), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD2) == static_cast<int>(VERSION_SD2), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD2_INPAINT) == static_cast<int>(VERSION_SD2_INPAINT), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD2_TINY_UNET) == static_cast<int>(VERSION_SD2_TINY_UNET), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL) == static_cast<int>(VERSION_SDXL), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_INPAINT) == static_cast<int>(VERSION_SDXL_INPAINT), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_PIX2PIX) == static_cast<int>(VERSION_SDXL_PIX2PIX), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_SSD1B) == static_cast<int>(VERSION_SDXL_SSD1B), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SVD) == static_cast<int>(VERSION_SVD), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SD3) == static_cast<int>(VERSION_SD3), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX) == static_cast<int>(VERSION_FLUX), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX_FILL) == static_cast<int>(VERSION_FLUX_FILL), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX_CONTROLS) == static_cast<int>(VERSION_FLUX_CONTROLS), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLEX_2) == static_cast<int>(VERSION_FLEX_2), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_CHROMA_RADIANCE) == static_cast<int>(VERSION_CHROMA_RADIANCE), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2) == static_cast<int>(VERSION_WAN2), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_I2V) == static_cast<int>(VERSION_WAN2_2_I2V), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_TI2V) == static_cast<int>(VERSION_WAN2_2_TI2V), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_QWEN_IMAGE) == static_cast<int>(VERSION_QWEN_IMAGE), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_COUNT) == static_cast<int>(VERSION_COUNT), "sd model version mismatch");
 struct WeightedConditionRef {
     size_t cond_index;
     float weight;
@@ -1094,6 +1118,11 @@ public:
 
         for (const auto& pair : diffusion_tensors) {
             tensors[pair.first] = pair.second;
+        }
+
+        if (!curr_lora_state.empty()) {
+            curr_lora_state.clear();
+            LOG_INFO("cleared cached LoRA state after diffusion reload");
         }
 
         LOG_INFO("diffusion model reloaded successfully, VRAM usage: %.2fMB", diffusion_model->get_params_buffer_size() / 1024.0 / 1024.0);
@@ -3615,6 +3644,13 @@ enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_me
         return LCM_SCHEDULER;
     }
     return DISCRETE_SCHEDULER;
+}
+
+SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return SD_MODEL_VERSION_UNKNOWN;
+    }
+    return static_cast<sd_model_version_t>(sd_ctx->sd->version);
 }
 
 sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
