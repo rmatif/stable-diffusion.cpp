@@ -75,6 +75,33 @@ enum prediction_t {
     PREDICTION_COUNT
 };
 
+enum sd_model_version_t {
+    SD_MODEL_VERSION_UNKNOWN         = -1,
+    SD_MODEL_VERSION_SD1             = 0,
+    SD_MODEL_VERSION_SD1_INPAINT     = 1,
+    SD_MODEL_VERSION_SD1_PIX2PIX     = 2,
+    SD_MODEL_VERSION_SD1_TINY_UNET   = 3,
+    SD_MODEL_VERSION_SD2             = 4,
+    SD_MODEL_VERSION_SD2_INPAINT     = 5,
+    SD_MODEL_VERSION_SD2_TINY_UNET   = 6,
+    SD_MODEL_VERSION_SDXL            = 7,
+    SD_MODEL_VERSION_SDXL_INPAINT    = 8,
+    SD_MODEL_VERSION_SDXL_PIX2PIX    = 9,
+    SD_MODEL_VERSION_SDXL_SSD1B      = 10,
+    SD_MODEL_VERSION_SVD             = 11,
+    SD_MODEL_VERSION_SD3             = 12,
+    SD_MODEL_VERSION_FLUX            = 13,
+    SD_MODEL_VERSION_FLUX_FILL       = 14,
+    SD_MODEL_VERSION_FLUX_CONTROLS   = 15,
+    SD_MODEL_VERSION_FLEX_2          = 16,
+    SD_MODEL_VERSION_CHROMA_RADIANCE = 17,
+    SD_MODEL_VERSION_WAN2            = 18,
+    SD_MODEL_VERSION_WAN2_2_I2V      = 19,
+    SD_MODEL_VERSION_WAN2_2_TI2V     = 20,
+    SD_MODEL_VERSION_QWEN_IMAGE      = 21,
+    SD_MODEL_VERSION_COUNT           = 22,
+};
+
 // same as enum ggml_type
 enum sd_type_t {
     SD_TYPE_F32  = 0,
@@ -372,6 +399,7 @@ SD_API bool sd_reload_text_encoders(sd_ctx_t* sd_ctx,
                                     const char* t5xxl_path,
                                     const char* qwen2vl_path,
                                     const char* qwen2vl_vision_path);
+SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx);
 
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
 SD_API char* sd_sample_params_to_str(const sd_sample_params_t* sample_params);

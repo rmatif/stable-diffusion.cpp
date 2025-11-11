@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "stable-diffusion.h"
+#include "model.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -938,6 +940,8 @@ struct ServerState {
     std::string pending_log_fragment;
     bool verbose = false;
     sd_easycache_params_t default_easycache = {false, 0.2f, 0.15f, 0.95f};
+    sd_model_version_t ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
+    std::unordered_map<std::string, sd_model_version_t> model_version_cache;
 };
 
 class LogCaptureScope {
@@ -1032,6 +1036,50 @@ json make_telemetry(const LogCollector& collector,
                     const CtxConfig& config,
                     int64_t elapsed_ms,
                     int64_t effective_seed);
+
+void cache_active_model_version(ServerState& state) {
+    if (state.ctx_model_version == SD_MODEL_VERSION_UNKNOWN) {
+        return;
+    }
+    if (!state.ctx_config.model_path.empty()) {
+        state.model_version_cache[state.ctx_config.model_path] = state.ctx_model_version;
+    }
+    if (!state.ctx_config.diffusion_model_path.empty()) {
+        state.model_version_cache[state.ctx_config.diffusion_model_path] = state.ctx_model_version;
+    }
+}
+
+bool detect_diffusion_model_version(ServerState& state,
+                                    const CtxConfig& config,
+                                    sd_model_version_t& version_out,
+                                    std::string& error_message) {
+    if (config.diffusion_model_path.empty()) {
+        error_message = "diffusion_model_path is required to determine model version";
+        return false;
+    }
+
+    auto cached = state.model_version_cache.find(config.diffusion_model_path);
+    if (cached != state.model_version_cache.end()) {
+        version_out = cached->second;
+        return true;
+    }
+
+    ModelLoader loader;
+    int threads = config.n_threads > 0 ? config.n_threads : 0;
+    if (!loader.init_from_file(config.diffusion_model_path, "model.diffusion_model.", threads)) {
+        error_message = std::string("failed to inspect diffusion model '") + config.diffusion_model_path + "'";
+        return false;
+    }
+    SDVersion detected_version = loader.get_sd_version();
+    if (detected_version == VERSION_COUNT) {
+        error_message = std::string("unable to determine model version for '") + config.diffusion_model_path + "'";
+        return false;
+    }
+
+    version_out = static_cast<sd_model_version_t>(detected_version);
+    state.model_version_cache[config.diffusion_model_path] = version_out;
+    return true;
+}
 
 class StreamingImageResponder {
    public:
@@ -3211,16 +3259,42 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
         return true;
     }
 
-    if (state.ctx == nullptr) {
-        state.ctx_config = desired;
+    auto rebuild_ctx = [&](const CtxConfig& target) -> bool {
+        CtxConfig previous_config = state.ctx_config;
+        sd_ctx_t* previous_ctx = state.ctx;
+        sd_model_version_t previous_version = state.ctx_model_version;
+
+        if (previous_ctx != nullptr) {
+            free_sd_ctx(previous_ctx);
+            state.ctx = nullptr;
+        }
+
+        state.ctx_config = target;
         sd_ctx_params_t params = state.ctx_config.to_sd_params();
         sd_ctx_t* new_ctx = new_sd_ctx(&params);
         if (new_ctx == nullptr) {
             error_message = "failed to create Stable Diffusion context";
+            state.ctx_config = previous_config;
+            state.ctx_model_version = previous_version;
+            if (!previous_config.model_path.empty() || !previous_config.diffusion_model_path.empty()) {
+                sd_ctx_params_t restore_params = state.ctx_config.to_sd_params();
+                state.ctx = new_sd_ctx(&restore_params);
+                if (state.ctx != nullptr) {
+                    state.ctx_model_version = sd_get_model_version(state.ctx);
+                    cache_active_model_version(state);
+                }
+            }
             return false;
         }
+
         state.ctx = new_ctx;
+        state.ctx_model_version = sd_get_model_version(state.ctx);
+        cache_active_model_version(state);
         return true;
+    };
+
+    if (state.ctx == nullptr) {
+        return rebuild_ctx(desired);
     }
 
     const CtxConfig& current = state.ctx_config;
@@ -3251,34 +3325,26 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
     };
 
     if (needs_full_reload()) {
-        CtxConfig previous_config = state.ctx_config;
-        sd_ctx_t* previous_ctx = state.ctx;
-        if (previous_ctx != nullptr) {
-            free_sd_ctx(previous_ctx);
-            state.ctx = nullptr;
-        }
-
-        state.ctx_config = desired;
-        sd_ctx_params_t params = state.ctx_config.to_sd_params();
-        sd_ctx_t* new_ctx = new_sd_ctx(&params);
-        if (new_ctx == nullptr) {
-            error_message = "failed to create Stable Diffusion context";
-            state.ctx_config = previous_config;
-            if (!previous_config.model_path.empty() || !previous_config.diffusion_model_path.empty()) {
-                sd_ctx_params_t restore_params = state.ctx_config.to_sd_params();
-                state.ctx = new_sd_ctx(&restore_params);
-            }
-            return false;
-        }
-
-        state.ctx = new_ctx;
-        return true;
+        return rebuild_ctx(desired);
     }
 
     bool diffusion_changed = current.diffusion_model_path != desired.diffusion_model_path ||
                              current.high_noise_diffusion_model_path != desired.high_noise_diffusion_model_path ||
                              current.diffusion_flash_attn != desired.diffusion_flash_attn ||
                              current.diffusion_conv_direct != desired.diffusion_conv_direct;
+
+    if (diffusion_changed) {
+        if (state.ctx_model_version == SD_MODEL_VERSION_UNKNOWN) {
+            return rebuild_ctx(desired);
+        }
+        sd_model_version_t desired_version;
+        if (!detect_diffusion_model_version(state, desired, desired_version, error_message)) {
+            return false;
+        }
+        if (desired_version != state.ctx_model_version) {
+            return rebuild_ctx(desired);
+        }
+    }
 
     bool vae_changed = current.vae_path != desired.vae_path ||
                        current.vae_conv_direct != desired.vae_conv_direct;
@@ -3322,6 +3388,7 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
     }
 
     state.ctx_config = desired;
+    cache_active_model_version(state);
     return true;
 }
 
@@ -3591,6 +3658,7 @@ int main(int argc, char** argv) {
         if (state.ctx != nullptr) {
             free_sd_ctx(state.ctx);
             state.ctx = nullptr;
+            state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
         }
         json response = {{"success", true}, {"message", "context released"}, {"model_path", state.ctx_config.model_path}};
         res.status = 200;
@@ -3606,6 +3674,7 @@ int main(int argc, char** argv) {
     if (state.ctx != nullptr) {
         free_sd_ctx(state.ctx);
         state.ctx = nullptr;
+        state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
     }
 
     return 0;
