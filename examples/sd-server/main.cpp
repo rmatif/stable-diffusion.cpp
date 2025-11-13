@@ -276,35 +276,22 @@ struct OwnedImage {
     }
 };
 
-bool load_image_file(const std::string& path,
-                     int expected_width,
-                     int expected_height,
-                     int expected_channel,
-                     OwnedImage& out,
-                     std::string& error) {
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    if (expected_channel <= 0) {
-        expected_channel = 3;
-    }
-
-    stbi_uc* raw_pixels = stbi_load(path.c_str(), &width, &height, &channels, expected_channel);
-    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels_guard(raw_pixels, stbi_image_free);
-
-    if (pixels_guard == nullptr) {
-        error = "failed to load image from '" + path + "'";
-        return false;
-    }
-
-    const int actual_channel = expected_channel;
+bool process_loaded_pixels(const std::string& source_label,
+                           int expected_width,
+                           int expected_height,
+                           int actual_channel,
+                           int width,
+                           int height,
+                           const stbi_uc* pixels,
+                           OwnedImage& out,
+                           std::string& error) {
     if (width <= 0 || height <= 0) {
-        error = "image '" + path + "' has invalid dimensions";
+        error = "image '" + source_label + "' has invalid dimensions";
         return false;
     }
 
     std::vector<uint8_t> buffer;
-    buffer.assign(pixels_guard.get(), pixels_guard.get() + static_cast<size_t>(width) * height * actual_channel);
+    buffer.assign(pixels, pixels + static_cast<size_t>(width) * height * actual_channel);
 
     if (expected_width > 0 && expected_height > 0 && (width != expected_width || height != expected_height)) {
         float dst_aspect = static_cast<float>(expected_width) / static_cast<float>(expected_height);
@@ -346,7 +333,7 @@ bool load_image_file(const std::string& path,
                                     expected_height,
                                     0,
                                     actual_channel)) {
-                error = "failed to resize image '" + path + "'";
+                error = "failed to resize image '" + source_label + "'";
                 return false;
             }
             buffer.swap(resized);
@@ -360,6 +347,224 @@ bool load_image_file(const std::string& path,
     out.channel = static_cast<uint32_t>(actual_channel);
     out.data = std::move(buffer);
     return true;
+}
+
+bool load_image_file(const std::string& path,
+                     int expected_width,
+                     int expected_height,
+                     int expected_channel,
+                     OwnedImage& out,
+                     std::string& error) {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if (expected_channel <= 0) {
+        expected_channel = 3;
+    }
+
+    stbi_uc* raw_pixels = stbi_load(path.c_str(), &width, &height, &channels, expected_channel);
+    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels_guard(raw_pixels, stbi_image_free);
+
+    if (pixels_guard == nullptr) {
+        error = "failed to load image from '" + path + "'";
+        return false;
+    }
+
+    const int actual_channel = expected_channel;
+    return process_loaded_pixels(path, expected_width, expected_height, actual_channel, width, height, pixels_guard.get(), out, error);
+}
+
+bool load_image_from_memory(const std::string& label,
+                            const unsigned char* buffer,
+                            size_t length,
+                            int expected_width,
+                            int expected_height,
+                            int expected_channel,
+                            OwnedImage& out,
+                            std::string& error) {
+    if (buffer == nullptr || length == 0) {
+        error = "image '" + label + "' has no data";
+        return false;
+    }
+    if (expected_channel <= 0) {
+        expected_channel = 3;
+    }
+    if (length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        error = "image '" + label + "' is too large to decode";
+        return false;
+    }
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* raw_pixels =
+        stbi_load_from_memory(buffer, static_cast<int>(length), &width, &height, &channels, expected_channel);
+    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels_guard(raw_pixels, stbi_image_free);
+    if (pixels_guard == nullptr) {
+        error = "failed to decode image data from '" + label + "'";
+        return false;
+    }
+
+    const int actual_channel = expected_channel;
+    return process_loaded_pixels(label, expected_width, expected_height, actual_channel, width, height, pixels_guard.get(), out, error);
+}
+
+std::string describe_httplib_error(httplib::Error err) {
+    switch (err) {
+        case httplib::Error::Success:
+            return "success";
+        case httplib::Error::Unknown:
+            return "unknown error";
+        case httplib::Error::Connection:
+            return "connection error";
+        case httplib::Error::BindIPAddress:
+            return "failed to bind local address";
+        case httplib::Error::Read:
+            return "read error";
+        case httplib::Error::Write:
+            return "write error";
+        case httplib::Error::ExceedRedirectCount:
+            return "too many redirects";
+        case httplib::Error::Canceled:
+            return "request canceled";
+        case httplib::Error::SSLConnection:
+            return "SSL connection error";
+        case httplib::Error::SSLLoadingCerts:
+            return "failed to load SSL certificates";
+        case httplib::Error::SSLServerVerification:
+            return "SSL server verification failed";
+        case httplib::Error::UnsupportedMultipartBoundaryChars:
+            return "unsupported multipart boundary characters";
+        case httplib::Error::Compression:
+            return "compression error";
+        case httplib::Error::ConnectionTimeout:
+            return "connection timed out";
+        case httplib::Error::ProxyConnection:
+            return "proxy connection error";
+        default:
+            return "unexpected transport error";
+    }
+}
+
+bool split_url_base_and_path(const std::string& raw_url, std::string& base, std::string& path, std::string& error) {
+    std::string trimmed = trim_copy(raw_url);
+    if (trimmed.empty()) {
+        error = "url must not be empty";
+        return false;
+    }
+
+    auto fragment_pos = trimmed.find('#');
+    if (fragment_pos != std::string::npos) {
+        trimmed = trimmed.substr(0, fragment_pos);
+    }
+
+    auto scheme_pos = trimmed.find("://");
+    if (scheme_pos == std::string::npos) {
+        error = "url must include a scheme such as http:// or https://";
+        return false;
+    }
+    std::string scheme = to_lower_copy(trimmed.substr(0, scheme_pos));
+    if (scheme != "http" && scheme != "https") {
+        error = "unsupported URL scheme '" + scheme + "'";
+        return false;
+    }
+
+    std::size_t authority_start = scheme_pos + 3;
+    if (authority_start >= trimmed.size()) {
+        error = "url is missing a host component";
+        return false;
+    }
+
+    std::size_t path_pos = trimmed.find_first_of("/?", authority_start);
+    std::string authority;
+    if (path_pos == std::string::npos) {
+        authority = trimmed.substr(authority_start);
+        path = "/";
+    } else {
+        authority = trimmed.substr(authority_start, path_pos - authority_start);
+        path = trimmed.substr(path_pos);
+        if (path.empty()) {
+            path = "/";
+        } else if (path[0] != '/') {
+            path.insert(path.begin(), '/');
+        }
+    }
+
+    if (authority.empty()) {
+        error = "url is missing a host component";
+        return false;
+    }
+    if (authority.find('@') != std::string::npos) {
+        error = "url must not include user info";
+        return false;
+    }
+
+    base = scheme + "://" + authority;
+    return true;
+}
+
+bool download_url_to_buffer(const std::string& raw_url, std::vector<uint8_t>& buffer, std::string& error) {
+    std::string base;
+    std::string path;
+    if (!split_url_base_and_path(raw_url, base, path, error)) {
+        return false;
+    }
+
+    buffer.clear();
+    try {
+        httplib::Client client(base);
+        client.set_follow_location(true);
+        client.set_connection_timeout(30, 0);
+        client.set_read_timeout(120, 0);
+        client.set_write_timeout(120, 0);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        client.enable_server_certificate_verification(true);
+#endif
+        if (!client.is_valid()) {
+            error = "failed to initialize HTTP client for '" + raw_url + "'";
+            return false;
+        }
+
+        auto result = client.Get(path);
+        if (!result) {
+            error = "request to '" + raw_url + "' failed: " + describe_httplib_error(result.error());
+            return false;
+        }
+        if (result->status >= 400) {
+            error = "request to '" + raw_url + "' failed with HTTP " + std::to_string(result->status);
+            return false;
+        }
+        buffer.assign(result->body.begin(), result->body.end());
+        return true;
+    } catch (const std::exception& ex) {
+        error = "failed to fetch '" + raw_url + "': " + std::string(ex.what());
+        return false;
+    }
+}
+
+bool load_image_from_url(const std::string& url,
+                         int expected_width,
+                         int expected_height,
+                         int expected_channel,
+                         OwnedImage& out,
+                         std::string& error) {
+    std::vector<uint8_t> bytes;
+    if (!download_url_to_buffer(url, bytes, error)) {
+        return false;
+    }
+    if (bytes.empty()) {
+        error = "downloaded image from '" + url + "' is empty";
+        return false;
+    }
+
+    return load_image_from_memory(url,
+                                  reinterpret_cast<const unsigned char*>(bytes.data()),
+                                  bytes.size(),
+                                  expected_width,
+                                  expected_height,
+                                  expected_channel,
+                                  out,
+                                  error);
 }
 
 bool load_images_from_directory(const std::string& directory,
@@ -996,7 +1201,9 @@ struct GenerationRequest {
     float strength = 0.75f;
     float control_strength = 0.9f;
     bool canny_preprocess = false;
+    bool image2image = false;
     std::string init_image_path;
+    std::string init_image_url;
     std::string mask_image_path;
     std::string control_image_path;
     std::vector<std::string> ref_image_paths;
@@ -1311,6 +1518,7 @@ class StreamingImageResponder {
         error_chunk["requested_seed"] = request_.seed;
         error_chunk["applied_seed"] = effective_seed_;
         error_chunk["random_seed_requested"] = random_seed_requested_;
+        error_chunk["image2image"] = request_.image2image;
         error_chunk["elapsed_ms"] = elapsed;
         if (!ctx_config_.model_path.empty()) {
             error_chunk["model_path"] = ctx_config_.model_path;
@@ -1333,6 +1541,7 @@ class StreamingImageResponder {
         summary["requested_seed"] = request_.seed;
         summary["applied_seed"] = effective_seed_;
         summary["random_seed_requested"] = random_seed_requested_;
+        summary["image2image"] = request_.image2image;
         summary["elapsed_ms"] = elapsed;
         if (!ctx_config_.model_path.empty()) {
             summary["model_path"] = ctx_config_.model_path;
@@ -2000,6 +2209,15 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         request.strength = static_cast<float>(strength_it->get<double>());
     }
 
+    auto image2image_it = body.find("image2image");
+    if (image2image_it != body.end()) {
+        if (!image2image_it->is_boolean()) {
+            error = "field 'image2image' must be a boolean";
+            return false;
+        }
+        request.image2image = image2image_it->get<bool>();
+    }
+
     auto control_strength_it = body.find("control_strength");
     if (control_strength_it != body.end()) {
         if (!control_strength_it->is_number_float() && !control_strength_it->is_number_integer()) {
@@ -2046,6 +2264,27 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         request.init_image_path = trim_copy(init_image_it->get<std::string>());
+    }
+
+    auto local_path_it = body.find("local_path");
+    if (local_path_it != body.end()) {
+        if (!local_path_it->is_string()) {
+            error = "field 'local_path' must be a string";
+            return false;
+        }
+        std::string local_path = trim_copy(local_path_it->get<std::string>());
+        if (!local_path.empty()) {
+            request.init_image_path = std::move(local_path);
+        }
+    }
+
+    auto url_path_it = body.find("url_path");
+    if (url_path_it != body.end()) {
+        if (!url_path_it->is_string()) {
+            error = "field 'url_path' must be a string";
+            return false;
+        }
+        request.init_image_url = trim_copy(url_path_it->get<std::string>());
     }
 
     auto mask_image_it = body.find("mask_image_path");
@@ -2272,9 +2511,26 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
     request.ref_images.clear();
     request.pm_id_images.clear();
 
+    if (request.image2image) {
+        if (request.init_image_path.empty() && request.init_image_url.empty()) {
+            error = "image2image mode requires either 'local_path' or 'url_path'";
+            return false;
+        }
+    }
+
+    const int init_expected_width = request.width;
+    const int init_expected_height = request.height;
+
     if (!request.init_image_path.empty()) {
         OwnedImage init;
-        if (!load_image_file(request.init_image_path, request.width, request.height, 3, init, error)) {
+        if (!load_image_file(request.init_image_path, init_expected_width, init_expected_height, 3, init, error)) {
+            return false;
+        }
+        request.init_image = std::move(init);
+        request.has_init_image = true;
+    } else if (!request.init_image_url.empty()) {
+        OwnedImage init;
+        if (!load_image_from_url(request.init_image_url, init_expected_width, init_expected_height, 3, init, error)) {
             return false;
         }
         request.init_image = std::move(init);
@@ -2287,6 +2543,17 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
             return false;
         }
         request.mask_image = std::move(mask);
+        request.has_mask_image = true;
+    } else if (request.has_init_image) {
+        if (request.width <= 0 || request.height <= 0) {
+            error = "invalid image dimensions for mask allocation";
+            return false;
+        }
+        const size_t pixels = static_cast<size_t>(request.width) * static_cast<size_t>(request.height);
+        request.mask_image.width = static_cast<uint32_t>(request.width);
+        request.mask_image.height = static_cast<uint32_t>(request.height);
+        request.mask_image.channel = 1;
+        request.mask_image.data.assign(pixels, 255);
         request.has_mask_image = true;
     }
 
@@ -3110,6 +3377,16 @@ json make_telemetry(const LogCollector& collector,
     if (request.has_eta) {
         span_attributes["sdcpp.request.eta"] = request.eta;
     }
+    span_attributes["sdcpp.request.image2image"] = request.image2image;
+    if (request.image2image) {
+        if (!request.init_image_url.empty()) {
+            span_attributes["sdcpp.request.init_image_source"] = "url";
+        } else if (!request.init_image_path.empty()) {
+            span_attributes["sdcpp.request.init_image_source"] = "local_path";
+        } else if (request.has_init_image) {
+            span_attributes["sdcpp.request.init_image_source"] = "provided";
+        }
+    }
     span_attributes["sdcpp.request.shifted_timestep"] = request.shifted_timestep;
     span_attributes["sdcpp.request.strength"] = request.strength;
     span_attributes["sdcpp.request.control_strength"] = request.control_strength;
@@ -3455,6 +3732,7 @@ json make_success_response(const json& images,
     response["model_path"] = config.model_path;
     response["batch_count"] = static_cast<int>(images.size());
     response["requested_seed"] = request.seed;
+    response["image2image"] = request.image2image;
     response["elapsed_ms"] = elapsed_ms;
     response["telemetry"] = make_telemetry(collector, request, config, elapsed_ms, effective_seed);
     response["images"] = images;
@@ -3611,6 +3889,9 @@ int main(int argc, char** argv) {
             res.set_content(response.dump(), "application/json");
             return;
         }
+
+        bool needs_vae_encode = request_params.has_init_image || !request_params.ref_images.empty();
+        desired_config.vae_decode_only = !needs_vae_encode;
 
         if (!ensure_context(state, desired_config, context_error)) {
             auto response = make_error_response(context_error, collector);
