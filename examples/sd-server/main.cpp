@@ -1222,6 +1222,22 @@ struct GenerationRequest {
     bool easycache_provided = false;
 };
 
+struct UpscaleRequest {
+    std::string model_path;
+    std::string init_image_path;
+    std::string init_image_url;
+    int width = 0;
+    int height = 0;
+    int repeats = 1;
+    OwnedImage input_image;
+};
+
+struct UpscaleTelemetryData {
+    double load_model_ms = 0.0;
+    std::vector<double> pass_ms;
+    double encode_ms = 0.0;
+};
+
 struct ImageResultGuard {
     sd_image_t* images = nullptr;
     int count = 0;
@@ -1881,11 +1897,12 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             error = "field 'width' must be an integer";
             return false;
         }
-        request.width = static_cast<int>(width_it->get<int64_t>());
-    }
-    if (request.width <= 0) {
-        error = "width must be greater than 0";
-        return false;
+        int value = static_cast<int>(width_it->get<int64_t>());
+        if (value <= 0) {
+            error = "width must be greater than 0";
+            return false;
+        }
+        request.width = value;
     }
 
     auto height_it = body.find("height");
@@ -1894,11 +1911,12 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             error = "field 'height' must be an integer";
             return false;
         }
-        request.height = static_cast<int>(height_it->get<int64_t>());
-    }
-    if (request.height <= 0) {
-        error = "height must be greater than 0";
-        return false;
+        int value = static_cast<int>(height_it->get<int64_t>());
+        if (value <= 0) {
+            error = "height must be greater than 0";
+            return false;
+        }
+        request.height = value;
     }
 
     auto steps_it = body.find("sample_steps");
@@ -2591,6 +2609,145 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
     }
 
     return true;
+}
+
+bool parse_upscale_request(const json& body, UpscaleRequest& request, std::string& error) {
+    request = UpscaleRequest();
+
+    auto model_it = body.find("upscale_model");
+    if (model_it == body.end()) {
+        model_it = body.find("upscale_model_path");
+    }
+    if (model_it == body.end()) {
+        model_it = body.find("esrgan_path");
+    }
+    if (model_it == body.end()) {
+        error = "field 'upscale_model' is required";
+        return false;
+    }
+    if (!model_it->is_string()) {
+        error = "field 'upscale_model' must be a string";
+        return false;
+    }
+    request.model_path = trim_copy(model_it->get<std::string>());
+    if (request.model_path.empty()) {
+        error = "field 'upscale_model' must not be empty";
+        return false;
+    }
+
+    auto width_it = body.find("width");
+    if (width_it != body.end()) {
+        if (!width_it->is_number_integer()) {
+            error = "field 'width' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(width_it->get<int64_t>());
+        if (value <= 0) {
+            error = "width must be greater than 0";
+            return false;
+        }
+        request.width = value;
+    }
+
+    auto height_it = body.find("height");
+    if (height_it != body.end()) {
+        if (!height_it->is_number_integer()) {
+            error = "field 'height' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(height_it->get<int64_t>());
+        if (value <= 0) {
+            error = "height must be greater than 0";
+            return false;
+        }
+        request.height = value;
+    }
+
+    auto repeats_it = body.find("upscale_repeats");
+    if (repeats_it == body.end()) {
+        repeats_it = body.find("repeats");
+    }
+    if (repeats_it != body.end()) {
+        if (!repeats_it->is_number_integer()) {
+            error = "field 'upscale_repeats' must be an integer";
+            return false;
+        }
+        request.repeats = static_cast<int>(repeats_it->get<int64_t>());
+    }
+    if (request.repeats < 1) {
+        error = "upscale_repeats must be at least 1";
+        return false;
+    }
+
+    auto init_path_it = body.find("init_image_path");
+    if (init_path_it == body.end()) {
+        init_path_it = body.find("init_image");
+    }
+    if (init_path_it == body.end()) {
+        init_path_it = body.find("image_path");
+    }
+    if (init_path_it != body.end()) {
+        if (!init_path_it->is_string()) {
+            error = "field 'init_image_path' must be a string";
+            return false;
+        }
+        request.init_image_path = trim_copy(init_path_it->get<std::string>());
+    }
+
+    auto local_path_it = body.find("local_path");
+    if (local_path_it != body.end()) {
+        if (!local_path_it->is_string()) {
+            error = "field 'local_path' must be a string";
+            return false;
+        }
+        std::string local_path = trim_copy(local_path_it->get<std::string>());
+        if (!local_path.empty()) {
+            request.init_image_path = std::move(local_path);
+        }
+    }
+
+    auto url_path_it = body.find("url_path");
+    if (url_path_it == body.end()) {
+        url_path_it = body.find("image_url");
+    }
+    if (url_path_it == body.end()) {
+        url_path_it = body.find("init_image_url");
+    }
+    if (url_path_it != body.end()) {
+        if (!url_path_it->is_string()) {
+            error = "field 'url_path' must be a string";
+            return false;
+        }
+        request.init_image_url = trim_copy(url_path_it->get<std::string>());
+    }
+
+    if (request.init_image_path.empty() && request.init_image_url.empty()) {
+        error = "upscale mode requires either 'local_path' or 'url_path'";
+        return false;
+    }
+
+    return true;
+}
+
+bool prepare_upscale_input(UpscaleRequest& request, std::string& error) {
+    request.input_image = OwnedImage();
+
+    if (!request.init_image_path.empty()) {
+        if (!load_image_file(request.init_image_path, request.width, request.height, 3, request.input_image, error)) {
+            return false;
+        }
+        return true;
+    }
+
+    if (!request.init_image_url.empty()) {
+        if (!load_image_from_url(request.init_image_url, request.width, request.height, 3, request.input_image, error)) {
+            return false;
+        }
+        return true;
+    }
+
+    error = "upscale mode requires either 'local_path' or 'url_path'";
+    return false;
 }
 
 std::optional<double> parse_duration_token_ms(const std::string& text) {
@@ -3517,6 +3674,117 @@ json make_telemetry(const LogCollector& collector,
 
     return telemetry;
 }
+json make_upscale_telemetry(const UpscaleRequest& request,
+                            const CtxConfig& config,
+                            int64_t elapsed_ms,
+                            const UpscaleTelemetryData& metrics,
+                            int input_width,
+                            int input_height,
+                            int output_width,
+                            int output_height,
+                            int repeats,
+                            int scale,
+                            int payload_bytes,
+                            int64_t encoded_bytes) {
+    json summary = json::object();
+    summary["elapsed_ms"] = elapsed_ms;
+    summary["repeats"] = repeats;
+    summary["scale"] = scale;
+    summary["input_width"] = input_width;
+    summary["input_height"] = input_height;
+    summary["output_width"] = output_width;
+    summary["output_height"] = output_height;
+    summary["payload_bytes"] = payload_bytes;
+    summary["encoded_bytes"] = encoded_bytes;
+    summary["upscale_model"] = request.model_path;
+    if (!request.init_image_path.empty()) {
+        summary["input_path"] = request.init_image_path;
+    }
+    if (!request.init_image_url.empty()) {
+        summary["input_url"] = request.init_image_url;
+    }
+    if (metrics.load_model_ms > 0.0) {
+        summary["load_model_ms"] = metrics.load_model_ms;
+    }
+    if (!metrics.pass_ms.empty()) {
+        json passes = json::array();
+        for (double value : metrics.pass_ms) {
+            passes.push_back(value);
+        }
+        summary["per_pass_ms"] = std::move(passes);
+    }
+    if (metrics.encode_ms > 0.0) {
+        summary["encode_ms"] = metrics.encode_ms;
+    }
+
+    json span_attributes = json::object();
+    span_attributes["gen_ai.operation.name"] = "image.upscale";
+    span_attributes["gen_ai.operation.type"] = "upscale";
+    span_attributes["sdcpp.request.upscale_model"] = request.model_path;
+    if (!config.model_path.empty()) {
+        span_attributes["sdcpp.context.model_path"] = config.model_path;
+    }
+    if (!config.diffusion_model_path.empty()) {
+        span_attributes["sdcpp.context.diffusion_model_path"] = config.diffusion_model_path;
+    }
+    span_attributes["sdcpp.context.n_threads"] = config.n_threads;
+    span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
+
+    json spans = json::array();
+    json root_span = json::object();
+    root_span["name"] = "gen_ai.inference.image_upscale";
+    root_span["span_id"] = "span-0";
+    root_span["kind"] = "INTERNAL";
+    root_span["duration_ms"] = static_cast<double>(elapsed_ms);
+    root_span["attributes"] = span_attributes;
+
+    json subspans = json::array();
+    int span_index = 1;
+    auto add_span = [&](const std::string& name, double duration_ms, json attributes) {
+        if (duration_ms <= 0.0) {
+            return;
+        }
+        json span = json::object();
+        span["name"] = name;
+        span["span_id"] = "span-" + std::to_string(span_index++);
+        span["parent_span_id"] = "span-0";
+        span["kind"] = "INTERNAL";
+        span["duration_ms"] = duration_ms;
+        if (!attributes.empty()) {
+            span["attributes"] = std::move(attributes);
+        }
+        subspans.push_back(std::move(span));
+    };
+
+    if (metrics.load_model_ms > 0.0) {
+        json attrs;
+        attrs["gen_ai.component"] = "upscaler";
+        attrs["gen_ai.operation.stage"] = "model.load";
+        add_span("gen_ai.model.load", metrics.load_model_ms, std::move(attrs));
+    }
+    for (std::size_t i = 0; i < metrics.pass_ms.size(); ++i) {
+        json attrs;
+        attrs["gen_ai.operation.stage"] = "upscale.pass";
+        attrs["sdcpp.upscale.pass_index"] = static_cast<int>(i);
+        add_span("gen_ai.image.upscale.pass", metrics.pass_ms[i], std::move(attrs));
+    }
+    if (metrics.encode_ms > 0.0) {
+        json attrs;
+        attrs["gen_ai.operation.stage"] = "encode";
+        add_span("gen_ai.image.encode", metrics.encode_ms, std::move(attrs));
+    }
+
+    if (!subspans.empty()) {
+        root_span["subspans"] = std::move(subspans);
+    }
+    spans.push_back(std::move(root_span));
+
+    json telemetry = json::object();
+    telemetry["summary"] = std::move(summary);
+    telemetry["spans"] = std::move(spans);
+    return telemetry;
+}
+
 json logs_to_json(const LogCollector& collector) {
     json entries = json::array();
     for (const auto& entry : collector.entries) {
@@ -3927,6 +4195,220 @@ int main(int argc, char** argv) {
                 streaming_responder->cancel();
             });
         return;
+    });
+
+    server.Post("/upscale", [&](const httplib::Request& req, httplib::Response& res) {
+        LogCollector collector;
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception& ex) {
+            auto response = make_error_response(std::string("invalid JSON payload: ") + ex.what(), collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        UpscaleRequest request;
+        std::string parse_error;
+        if (!parse_upscale_request(body, request, parse_error)) {
+            auto response = make_error_response(parse_error, collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        if (!prepare_upscale_input(request, parse_error)) {
+            auto response = make_error_response(parse_error, collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        CtxConfig base_config;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!state.ctx_config.model_path.empty() || !state.ctx_config.diffusion_model_path.empty()) {
+                base_config = state.ctx_config;
+            } else {
+                base_config = state.default_config;
+            }
+        }
+
+        CtxConfig execution_config = base_config;
+        std::string context_error;
+        if (!apply_context_overrides(body, execution_config, context_error)) {
+            auto response = make_error_response(context_error, collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        std::unique_ptr<LogCaptureScope> capture_scope = std::make_unique<LogCaptureScope>(state, collector);
+        auto start_time = std::chrono::steady_clock::now();
+        UpscaleTelemetryData telemetry_data;
+
+        upscaler_ctx_t* raw_ctx = new_upscaler_ctx(request.model_path.c_str(),
+                                                   execution_config.offload_params_to_cpu,
+                                                   execution_config.diffusion_conv_direct,
+                                                   execution_config.n_threads);
+        if (raw_ctx == nullptr) {
+            auto response = make_error_response("failed to load upscaler model", collector);
+            res.status = 500;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+        auto load_done = std::chrono::steady_clock::now();
+        telemetry_data.load_model_ms = std::chrono::duration_cast<std::chrono::microseconds>(load_done - start_time).count() / 1000.0;
+        std::unique_ptr<upscaler_ctx_t, decltype(&free_upscaler_ctx)> upscaler_ctx(raw_ctx, free_upscaler_ctx);
+
+        sd_image_t current_image = request.input_image.as_sd_image();
+        bool owns_current_data = false;
+
+        for (int i = 0; i < request.repeats; ++i) {
+            auto pass_start = std::chrono::steady_clock::now();
+            sd_image_t upscaled_image = upscale(upscaler_ctx.get(), current_image, 4);
+            if (upscaled_image.data == nullptr) {
+                if (owns_current_data && current_image.data != nullptr) {
+                    free(current_image.data);
+                    current_image.data = nullptr;
+                }
+                auto response = make_error_response("upscale failed", collector);
+                res.status = 500;
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
+            if (owns_current_data && current_image.data != nullptr) {
+                free(current_image.data);
+            }
+            current_image = upscaled_image;
+            owns_current_data = true;
+            auto pass_end = std::chrono::steady_clock::now();
+            double pass_ms = std::chrono::duration_cast<std::chrono::microseconds>(pass_end - pass_start).count() / 1000.0;
+            telemetry_data.pass_ms.push_back(pass_ms);
+        }
+
+        auto encode_start = std::chrono::steady_clock::now();
+        int png_size = 0;
+        unsigned char* png_data = stbi_write_png_to_mem(current_image.data,
+                                                        0,
+                                                        current_image.width,
+                                                        current_image.height,
+                                                        current_image.channel,
+                                                        &png_size,
+                                                        nullptr);
+        if (png_data == nullptr) {
+            if (owns_current_data && current_image.data != nullptr) {
+                free(current_image.data);
+            }
+            auto response = make_error_response("failed to encode PNG", collector);
+            res.status = 500;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+        std::string encoded = base64_encode(png_data, static_cast<size_t>(png_size));
+        STBIW_FREE(png_data);
+        auto encode_end = std::chrono::steady_clock::now();
+        telemetry_data.encode_ms = std::chrono::duration_cast<std::chrono::microseconds>(encode_end - encode_start).count() / 1000.0;
+
+        if (owns_current_data && current_image.data != nullptr) {
+            free(current_image.data);
+            current_image.data = nullptr;
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        int64_t elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        capture_scope.reset();
+
+        const int input_width = static_cast<int>(request.input_image.width);
+        const int input_height = static_cast<int>(request.input_image.height);
+        const int output_width = static_cast<int>(current_image.width);
+        const int output_height = static_cast<int>(current_image.height);
+        const int payload_bytes = png_size;
+        const int64_t encoded_bytes = static_cast<int64_t>(encoded.size());
+        const int scale = get_upscale_factor(upscaler_ctx.get());
+
+        json image_chunk = json::object();
+        image_chunk["type"] = "image";
+        image_chunk["index"] = 0;
+        image_chunk["width"] = output_width;
+        image_chunk["height"] = output_height;
+        image_chunk["format"] = "png";
+        image_chunk["mime_type"] = "image/png";
+        image_chunk["payload_bytes"] = payload_bytes;
+        image_chunk["encoded_bytes"] = encoded_bytes;
+        image_chunk["encode_ms"] = telemetry_data.encode_ms;
+        image_chunk["data"] = std::move(encoded);
+        auto prepare_end = std::chrono::steady_clock::now();
+        const double dispatch_prepare_ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - encode_start).count() / 1000.0;
+        const double dispatch_total_ms = dispatch_prepare_ms;
+        const double write_ms = 0.0;
+        image_chunk["dispatch_prepare_ms"] = dispatch_prepare_ms;
+
+        const int64_t serialized_bytes = static_cast<int64_t>(image_chunk.dump().size());
+
+        json image_summary = json::object();
+        image_summary["index"] = 0;
+        image_summary["width"] = output_width;
+        image_summary["height"] = output_height;
+        image_summary["format"] = "png";
+        image_summary["mime_type"] = "image/png";
+        image_summary["streamed"] = false;
+        image_summary["encode_ms"] = telemetry_data.encode_ms;
+        image_summary["dispatch_prepare_ms"] = dispatch_prepare_ms;
+        image_summary["dispatch_total_ms"] = dispatch_total_ms;
+        image_summary["write_ms"] = write_ms;
+        image_summary["payload_bytes"] = payload_bytes;
+        image_summary["encoded_bytes"] = encoded_bytes;
+        image_summary["serialized_bytes"] = serialized_bytes;
+        image_summary["input_width"] = input_width;
+        image_summary["input_height"] = input_height;
+        image_summary["repeats"] = request.repeats;
+        image_summary["scale"] = scale;
+
+        json logs = logs_to_json(collector);
+        json telemetry = make_upscale_telemetry(request,
+                                                execution_config,
+                                                elapsed_ms,
+                                                telemetry_data,
+                                                input_width,
+                                                input_height,
+                                                output_width,
+                                                output_height,
+                                                request.repeats,
+                                                scale,
+                                                payload_bytes,
+                                                encoded_bytes);
+
+        json summary = json::object();
+        summary["type"] = "complete";
+        summary["success"] = true;
+        summary["batch_count"] = 1;
+        summary["elapsed_ms"] = elapsed_ms;
+        if (!execution_config.model_path.empty()) {
+            summary["model_path"] = execution_config.model_path;
+        }
+        json summary_images = json::array();
+        summary_images.push_back(std::move(image_summary));
+        summary["images"] = std::move(summary_images);
+        summary["logs"] = std::move(logs);
+        summary["telemetry"] = std::move(telemetry);
+
+        std::string image_chunk_json = image_chunk.dump();
+        std::string summary_json = summary.dump();
+
+        std::string response_body;
+        response_body.reserve(32 + image_chunk_json.size() + summary_json.size());
+        response_body.append("[\n");
+        response_body.append(image_chunk_json);
+        response_body.append(",\n");
+        response_body.append(summary_json);
+        response_body.append("\n]\n");
+        res.status = 200;
+        res.set_content(response_body, "application/json");
     });
 
     server.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
