@@ -197,7 +197,7 @@ struct LoraModel : public GGMLRunner {
         tensor_preprocessed = true;
         // I really hate these hardcoded processes.
         if (model_tensors.find("cond_stage_model.1.transformer.text_model.encoder.layers.0.self_attn.in_proj.weight") != model_tensors.end()) {
-            std::unordered_map<std::string, ggml_tensor*> new_lora_tensors;
+            std::map<std::string, ggml_tensor*> new_lora_tensors;
             for (auto& [old_name, tensor] : lora_tensors) {
                 std::string new_name = old_name;
 
