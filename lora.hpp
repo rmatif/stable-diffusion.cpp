@@ -112,10 +112,17 @@ struct LoraModel : public GGMLRunner {
               ggml_backend_t backend,
               const std::string& file_path = "",
               std::string prefix           = "",
-              SDVersion version            = VERSION_COUNT)
+              SDVersion version            = VERSION_COUNT,
+              bool convert_names           = false)
         : lora_id(lora_id), file_path(file_path), GGMLRunner(backend, false) {
-        (void)version;
-        if (!model_loader.init_from_file(file_path, prefix)) {
+        bool ok = false;
+        if (convert_names) {
+            prefix = "lora." + prefix;
+            ok     = model_loader.init_from_file_and_convert_name(file_path, prefix, version);
+        } else {
+            ok = model_loader.init_from_file(file_path, prefix);
+        }
+        if (!ok) {
             load_failed = true;
         }
     }
