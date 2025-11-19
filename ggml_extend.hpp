@@ -1134,7 +1134,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_conv_3d(struct ggml_context* ctx,
                                                        int d2 = 1) {
     int64_t OC = w->ne[3] / IC;
     int64_t N  = x->ne[3] / IC;
-    x          = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+    x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, IC, N, OC);
 
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
