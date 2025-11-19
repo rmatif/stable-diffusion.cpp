@@ -660,6 +660,7 @@ struct CLIOptions {
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
     prediction_t prediction = DEFAULT_PRED;
+    lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
     bool easycache_provided = false;
     sd_easycache_params_t easycache_params = {false, 0.2f, 0.15f, 0.95f};
 };
@@ -691,6 +692,7 @@ void print_usage() {
         << "      --type <format>                     Weight type override (e.g. f16, q8_0)\n"
         << "      --rng <type>                        RNG, one of [std_default, cuda]\n"
         << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow]\n"
+        << "      --lora-apply-mode <mode>            LoRA apply mode [auto, immediately, at_runtime] (default: immediately)\n"
         << "      --flow-shift <value>                Flow model shift override\n"
         << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
         << "      --chroma-t5-mask-pad <int>          Padding for Chroma T5 mask\n"
@@ -878,6 +880,18 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 return false;
             }
             options.prediction = prediction;
+        } else if (arg == "--lora-apply-mode") {
+            if (i + 1 >= argc) {
+                error = "missing value for --lora-apply-mode";
+                return false;
+            }
+            std::string value = to_lower_copy(argv[++i]);
+            lora_apply_mode_t mode = str_to_lora_apply_mode(value.c_str());
+            if (mode == LORA_APPLY_MODE_COUNT) {
+                error = "invalid lora apply mode '" + value + "'";
+                return false;
+            }
+            options.lora_apply_mode = mode;
         } else if (arg == "--flow-shift") {
             if (i + 1 >= argc) {
                 error = "missing value for --flow-shift";
@@ -1041,6 +1055,7 @@ struct CtxConfig {
     int chroma_t5_mask_pad = 1;
     float flow_shift = std::numeric_limits<float>::infinity();
     prediction_t prediction = DEFAULT_PRED;
+    lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
 
     bool operator==(const CtxConfig& other) const {
         return model_path == other.model_path &&
@@ -1074,7 +1089,8 @@ struct CtxConfig {
                chroma_use_t5_mask == other.chroma_use_t5_mask &&
                chroma_t5_mask_pad == other.chroma_t5_mask_pad &&
                flow_shift == other.flow_shift &&
-               prediction == other.prediction;
+               prediction == other.prediction &&
+               lora_apply_mode == other.lora_apply_mode;
     }
 
     bool operator!=(const CtxConfig& other) const { return !(*this == other); }
@@ -1118,6 +1134,7 @@ struct CtxConfig {
         params.chroma_t5_mask_pad      = chroma_t5_mask_pad;
         params.flow_shift              = flow_shift;
         params.prediction              = prediction;
+        params.lora_apply_mode         = lora_apply_mode;
 
         return params;
     }
@@ -1793,6 +1810,21 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
             return false;
         }
         config.prediction = prediction;
+    }
+
+    auto lora_mode_it = body.find("lora_apply_mode");
+    if (lora_mode_it != body.end()) {
+        if (!lora_mode_it->is_string()) {
+            error = "field 'lora_apply_mode' must be a string";
+            return false;
+        }
+        std::string value = to_lower_copy(lora_mode_it->get<std::string>());
+        lora_apply_mode_t mode = str_to_lora_apply_mode(value.c_str());
+        if (mode == LORA_APPLY_MODE_COUNT) {
+            error = "invalid lora_apply_mode value";
+            return false;
+        }
+        config.lora_apply_mode = mode;
     }
 
     return true;
@@ -3866,7 +3898,8 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.chroma_use_t5_mask != desired.chroma_use_t5_mask ||
                current.chroma_t5_mask_pad != desired.chroma_t5_mask_pad ||
                current.flow_shift != desired.flow_shift ||
-               current.prediction != desired.prediction;
+               current.prediction != desired.prediction ||
+               current.lora_apply_mode != desired.lora_apply_mode;
     };
 
     if (needs_full_reload()) {
@@ -4057,6 +4090,7 @@ int main(int argc, char** argv) {
     state.ctx_config.chroma_t5_mask_pad = options.chroma_t5_mask_pad;
     state.ctx_config.flow_shift = options.flow_shift;
     state.ctx_config.prediction = options.prediction;
+    state.ctx_config.lora_apply_mode = options.lora_apply_mode;
     state.default_config = state.ctx_config;
     sd_easycache_params_init(&state.default_easycache);
     if (options.easycache_provided) {
@@ -4144,6 +4178,7 @@ int main(int argc, char** argv) {
         if (desired_config.model_path.empty()) {
             desired_config = state.default_config;
         }
+        desired_config.lora_apply_mode = state.default_config.lora_apply_mode;
 
         const bool has_vae_override = body.find("vae_path") != body.end();
         if (!has_vae_override) {
@@ -4234,6 +4269,7 @@ int main(int argc, char** argv) {
             } else {
                 base_config = state.default_config;
             }
+            base_config.lora_apply_mode = state.default_config.lora_apply_mode;
         }
 
         CtxConfig execution_config = base_config;
