@@ -1731,7 +1731,6 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_string("clip_vision_path", config.clip_vision_path) ||
         !assign_string("t5xxl_path", config.t5xxl_path) ||
         !assign_string("qwen2vl_path", config.qwen2vl_path) ||
-        !assign_string("qwen2vl_vision_path", config.qwen2vl_vision_path) ||
         !assign_string("diffusion_model_path", config.diffusion_model_path) ||
         !assign_string("high_noise_diffusion_model_path", config.high_noise_diffusion_model_path) ||
         !assign_string("vae_path", config.vae_path) ||
@@ -1741,6 +1740,17 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_string("embedding_dir", config.embedding_dir) ||
         !assign_string("photo_maker_path", config.photo_maker_path)) {
         return false;
+    }
+
+    auto qwen2vl_vision_it = body.find("qwen2vl_vision_path");
+    if (qwen2vl_vision_it != body.end()) {
+        if (!qwen2vl_vision_it->is_string()) {
+            error = "field 'qwen2vl_vision_path' must be a string";
+            return false;
+        }
+        config.qwen2vl_vision_path = qwen2vl_vision_it->get<std::string>();
+    } else {
+        config.qwen2vl_vision_path.clear();
     }
 
     if (!assign_bool("vae_decode_only", config.vae_decode_only) ||
@@ -2394,6 +2404,38 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         }
     }
 
+    auto ref_image_urls_it = body.find("ref_image_urls");
+    if (ref_image_urls_it == body.end()) {
+        ref_image_urls_it = body.find("ref_image_url");
+    }
+    if (ref_image_urls_it != body.end()) {
+        if (ref_image_urls_it->is_array()) {
+            for (const auto& item : *ref_image_urls_it) {
+                if (!item.is_string()) {
+                    error = "elements of 'ref_image_urls' must be strings";
+                    return false;
+                }
+                std::string url = trim_copy(item.get<std::string>());
+                if (!url.empty()) {
+                    request.ref_image_paths.push_back(url);
+                }
+            }
+        } else if (ref_image_urls_it->is_string()) {
+            std::string value = trim_copy(ref_image_urls_it->get<std::string>());
+            if (!value.empty()) {
+                auto urls = split_and_trim(value, ',');
+                for (auto& url : urls) {
+                    if (!url.empty()) {
+                        request.ref_image_paths.push_back(url);
+                    }
+                }
+            }
+        } else {
+            error = "field 'ref_image_urls' must be an array or string";
+            return false;
+        }
+    }
+
     auto pm_dir_it = body.find("pm_id_images_dir");
     if (pm_dir_it != body.end()) {
         if (!pm_dir_it->is_string()) {
@@ -2627,7 +2669,15 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
         request.ref_images.reserve(request.ref_image_paths.size());
         for (const auto& path : request.ref_image_paths) {
             OwnedImage reference;
-            if (!load_image_file(path, 0, 0, 3, reference, error)) {
+            std::string lowered = to_lower_copy(path);
+            bool is_url = lowered.rfind("http://", 0) == 0 || lowered.rfind("https://", 0) == 0;
+            bool ok = false;
+            if (is_url) {
+                ok = load_image_from_url(path, 0, 0, 3, reference, error);
+            } else {
+                ok = load_image_file(path, 0, 0, 3, reference, error);
+            }
+            if (!ok) {
                 return false;
             }
             request.ref_images.push_back(std::move(reference));
