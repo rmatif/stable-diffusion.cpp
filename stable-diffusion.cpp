@@ -45,6 +45,7 @@ const char* model_version_to_str[] = {
     "Wan 2.2 TI2V",
     "Qwen Image",
     "Flux.2",
+    "Z-Image",
 };
 
 const char* sampling_methods_str[] = {
@@ -385,6 +386,9 @@ public:
                    sd_version_is_flux2(version)) {
             scale_factor = 1.0f;
             shift_factor = 0.f;
+        } else if (sd_version_is_zimage(version)) {
+            scale_factor = 0.3611f;
+            shift_factor = 0.1159f;
         }
 
         if (sd_version_is_control(version)) {
@@ -495,6 +499,13 @@ public:
                                                                    tensor_storage_map,
                                                                    "model.diffusion_model",
                                                                    version);
+            } else if (sd_version_is_zimage(version)) {
+                cond_stage_model = std::make_shared<ZImageConditioner>(clip_backend,
+                                                                       offload_params_to_cpu,
+                                                                       tensor_storage_map);
+                diffusion_model  = std::make_shared<ZImageDiffusionModel>(backend,
+                                                                          offload_params_to_cpu,
+                                                                          tensor_storage_map);
             } else {  // SD1.x SD2.x SDXL
                 if (strstr(SAFE_STR(sd_ctx_params->photo_maker_path), "v2")) {
                     cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend,
@@ -868,6 +879,13 @@ public:
                     shift = 3.0;
                 }
                 denoiser = std::make_shared<DiscreteFlowDenoiser>(shift);
+            } else if (sd_version_is_zimage(version)) {
+                LOG_INFO("running in Z-Image FLOW mode");
+                float shift = sd_ctx_params->flow_shift;
+                if (shift == INFINITY) {
+                    shift = 3.0;
+                }
+                denoiser = std::make_shared<FluxFlowDenoiser>(shift);
             } else if (is_using_v_parameterization) {
                 LOG_INFO("running in v-prediction mode");
                 denoiser = std::make_shared<CompVisVDenoiser>();
