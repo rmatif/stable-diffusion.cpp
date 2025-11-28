@@ -1068,7 +1068,10 @@ SDVersion ModelLoader::get_sd_version() {
                 return VERSION_FLUX2;
             }
             if (tensor_storage.name.find("model.diffusion_model.context_refiner.") != std::string::npos ||
-                tensor_storage.name.find("model.diffusion_model.noise_refiner.") != std::string::npos) {
+                tensor_storage.name.find("model.diffusion_model.noise_refiner.") != std::string::npos ||
+                // Also check without prefix for safetensors files exported directly
+                tensor_storage.name.find("context_refiner.") == 0 ||
+                tensor_storage.name.find("noise_refiner.") == 0) {
                 return VERSION_ZIMAGE;
             }
             if (tensor_storage.name.find("model.diffusion_model.blocks.0.cross_attn.norm_k.weight") != std::string::npos) {
