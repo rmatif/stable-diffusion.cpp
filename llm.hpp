@@ -469,6 +469,7 @@ namespace LLM {
 
     enum class LLMArch {
         QWEN2_5_VL,
+        QWEN3_4B,
         MISTRAL_SMALL_3_2,
         ARCH_COUNT,
     };
@@ -503,6 +504,7 @@ namespace LLM {
         bool qkv_bias             = true;
         int64_t vocab_size        = 152064;
         float rms_norm_eps        = 1e-06f;
+        float rope_theta          = 1000000.0f;
         LLMVisionParams vision;
     };
 
@@ -813,14 +815,20 @@ namespace LLM {
         int64_t head_dim;
         int64_t num_heads;
         int64_t num_kv_heads;
+        float rope_theta = 10000.f;
 
     public:
         Attention(const LLMParams& params)
-            : num_heads(params.num_heads), num_kv_heads(params.num_kv_heads), head_dim(params.head_dim), arch(params.arch) {
+            : num_heads(params.num_heads), num_kv_heads(params.num_kv_heads), head_dim(params.head_dim), arch(params.arch), rope_theta(params.rope_theta) {
             blocks["q_proj"] = std::make_shared<Linear>(params.hidden_size, num_heads * head_dim, params.qkv_bias);
             blocks["k_proj"] = std::make_shared<Linear>(params.hidden_size, num_kv_heads * head_dim, params.qkv_bias);
             blocks["v_proj"] = std::make_shared<Linear>(params.hidden_size, num_kv_heads * head_dim, params.qkv_bias);
             blocks["o_proj"] = std::make_shared<Linear>(num_heads * head_dim, params.hidden_size, false);
+
+            if (params.arch == LLMArch::QWEN3_4B) {
+                blocks["q_norm"] = std::make_shared<RMSNorm>(head_dim, params.rms_norm_eps);
+                blocks["k_norm"] = std::make_shared<RMSNorm>(head_dim, params.rms_norm_eps);
+            }
         }
 
         struct ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -845,6 +853,15 @@ namespace LLM {
             if (arch == LLMArch::MISTRAL_SMALL_3_2) {
                 q = ggml_rope_ext(ctx->ggml_ctx, q, input_pos, nullptr, 128, GGML_ROPE_TYPE_NORMAL, 131072, 1000000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
                 k = ggml_rope_ext(ctx->ggml_ctx, k, input_pos, nullptr, 128, GGML_ROPE_TYPE_NORMAL, 131072, 1000000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
+            } else if (arch == LLMArch::QWEN3_4B) {
+                auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+                auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+
+                q = q_norm->forward(ctx, q);
+                k = k_norm->forward(ctx, k);
+
+                q = ggml_rope_ext(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 128000, rope_theta, 1.f, 0.f, 1.f, 32.f, 1.f);
+                k = ggml_rope_ext(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 128000, rope_theta, 1.f, 0.f, 1.f, 32.f, 1.f);
             } else {
                 int sections[4] = {16, 24, 24, 0};
                 q               = ggml_rope_multi(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
@@ -1063,6 +1080,14 @@ namespace LLM {
                 params.qkv_bias          = false;
                 params.vocab_size        = 131072;
                 params.rms_norm_eps      = 1e-5f;
+            } else if (arch == LLMArch::QWEN3_4B) {
+                params.num_layers        = 36;
+                params.hidden_size       = 2560;
+                params.intermediate_size = 9728;
+                params.num_heads         = 32;
+                params.num_kv_heads      = 8;
+                params.qkv_bias          = false;
+                params.vocab_size        = 151936;
             }
             bool have_vision_weight = false;
             bool llama_cpp_style    = false;
@@ -1132,7 +1157,7 @@ namespace LLM {
             }
 
             int64_t n_tokens = input_ids->ne[0];
-            if (params.arch == LLMArch::MISTRAL_SMALL_3_2) {
+            if (params.arch == LLMArch::MISTRAL_SMALL_3_2 || params.arch == LLMArch::QWEN3_4B) {
                 input_pos_vec.resize(n_tokens);
                 for (int i = 0; i < n_tokens; ++i) {
                     input_pos_vec[i] = i;

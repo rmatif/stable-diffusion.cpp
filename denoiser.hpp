@@ -663,38 +663,6 @@ struct Flux2FlowDenoiser : public FluxFlowDenoiser {
     }
 };
 
-struct Flux2FlowDenoiser : public FluxFlowDenoiser {
-    Flux2FlowDenoiser() = default;
-
-    float compute_empirical_mu(uint32_t n, int image_seq_len) {
-        const float a1 = 8.73809524e-05f;
-        const float b1 = 1.89833333f;
-        const float a2 = 0.00016927f;
-        const float b2 = 0.45666666f;
-
-        if (image_seq_len > 4300) {
-            float mu = a2 * image_seq_len + b2;
-            return mu;
-        }
-
-        float m_200 = a2 * image_seq_len + b2;
-        float m_10  = a1 * image_seq_len + b1;
-
-        float a  = (m_200 - m_10) / 190.0f;
-        float b  = m_200 - 200.0f * a;
-        float mu = a * n + b;
-
-        return mu;
-    }
-
-    std::vector<float> get_sigmas(uint32_t n, int image_seq_len, scheduler_t scheduler_type, SDVersion version) override {
-        float mu = compute_empirical_mu(n, image_seq_len);
-        LOG_DEBUG("Flux2FlowDenoiser: set shift to %.3f", mu);
-        set_shift(mu);
-        return Denoiser::get_sigmas(n, image_seq_len, scheduler_type, version);
-    }
-};
-
 // Z-Image flow matching denoiser
 struct ZImageFlowDenoiser : public Denoiser {
     float sigmas[TIMESTEPS];

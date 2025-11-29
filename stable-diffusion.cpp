@@ -500,9 +500,10 @@ public:
                                                                    "model.diffusion_model",
                                                                    version);
             } else if (sd_version_is_zimage(version)) {
-                cond_stage_model = std::make_shared<ZImageConditioner>(clip_backend,
-                                                                       offload_params_to_cpu,
-                                                                       tensor_storage_map);
+                cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend,
+                                                                 offload_params_to_cpu,
+                                                                 tensor_storage_map,
+                                                                 version);
                 diffusion_model  = std::make_shared<ZImageDiffusionModel>(backend,
                                                                           offload_params_to_cpu,
                                                                           tensor_storage_map);
