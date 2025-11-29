@@ -476,6 +476,7 @@ namespace LLM {
 
     static const char* llm_arch_to_str[] = {
         "qwen2.5vl",
+        "qwen3_4b",
         "mistral_small3.2",
     };
 
