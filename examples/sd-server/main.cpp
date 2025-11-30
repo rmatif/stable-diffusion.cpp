@@ -632,8 +632,8 @@ struct CLIOptions {
     std::string clip_g_path;
     std::string clip_vision_path;
     std::string t5xxl_path;
-    std::string qwen2vl_path;
-    std::string qwen2vl_vision_path;
+    std::string llm_path;
+    std::string llm_vision_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string vae_path;
@@ -759,13 +759,13 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 error = "missing value for --qwen2vl";
                 return false;
             }
-            options.qwen2vl_path = argv[++i];
+            options.llm_path = argv[++i];
         } else if (arg == "--qwen2vl_vision") {
             if (i + 1 >= argc) {
                 error = "missing value for --qwen2vl_vision";
                 return false;
             }
-            options.qwen2vl_vision_path = argv[++i];
+            options.llm_vision_path = argv[++i];
         } else if (arg == "--diffusion-model") {
             if (i + 1 >= argc) {
                 error = "missing value for --diffusion-model";
@@ -1027,8 +1027,8 @@ struct CtxConfig {
     std::string clip_g_path;
     std::string clip_vision_path;
     std::string t5xxl_path;
-    std::string qwen2vl_path;
-    std::string qwen2vl_vision_path;
+    std::string llm_path;
+    std::string llm_vision_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string vae_path;
@@ -1063,8 +1063,8 @@ struct CtxConfig {
                clip_g_path == other.clip_g_path &&
                clip_vision_path == other.clip_vision_path &&
                t5xxl_path == other.t5xxl_path &&
-               qwen2vl_path == other.qwen2vl_path &&
-               qwen2vl_vision_path == other.qwen2vl_vision_path &&
+               llm_path == other.llm_path &&
+               llm_vision_path == other.llm_vision_path &&
                diffusion_model_path == other.diffusion_model_path &&
                high_noise_diffusion_model_path == other.high_noise_diffusion_model_path &&
                vae_path == other.vae_path &&
@@ -1104,8 +1104,8 @@ struct CtxConfig {
         params.clip_g_path                     = clip_g_path.c_str();
         params.clip_vision_path                = clip_vision_path.c_str();
         params.t5xxl_path                      = t5xxl_path.c_str();
-        params.qwen2vl_path                    = qwen2vl_path.c_str();
-        params.qwen2vl_vision_path             = qwen2vl_vision_path.c_str();
+        params.llm_path                    = llm_path.c_str();
+        params.llm_vision_path             = llm_vision_path.c_str();
         params.diffusion_model_path            = diffusion_model_path.c_str();
         params.high_noise_diffusion_model_path = high_noise_diffusion_model_path.c_str();
         params.vae_path                        = vae_path.c_str();
@@ -1198,9 +1198,9 @@ struct GenerationRequest {
     bool has_img_cfg_scale = false;
     float img_cfg_scale = 7.0f;
     bool override_sample_method = false;
-    sample_method_t sample_method = SAMPLE_METHOD_DEFAULT;
+    sample_method_t sample_method = SAMPLE_METHOD_COUNT;
     bool override_scheduler = false;
-    scheduler_t scheduler = DEFAULT;
+    scheduler_t scheduler = SCHEDULER_COUNT;
     int batch_count = 1;
     int64_t seed = -1;
     float eta = 0.0f;
@@ -1445,7 +1445,7 @@ class StreamingImageResponder {
         if (request_.override_sample_method) {
             sample_params.sample_method = request_.sample_method;
         }
-        if (sample_params.sample_method == SAMPLE_METHOD_DEFAULT) {
+        if (sample_params.sample_method == SAMPLE_METHOD_COUNT) {
             sample_params.sample_method = default_sample_method_;
         }
         if (request_.override_scheduler) {
@@ -1661,7 +1661,7 @@ class StreamingImageResponder {
     CtxConfig ctx_config_;
     bool random_seed_requested_ = false;
     int64_t effective_seed_ = 0;
-    sample_method_t default_sample_method_ = SAMPLE_METHOD_DEFAULT;
+    sample_method_t default_sample_method_ = SAMPLE_METHOD_COUNT;
     std::chrono::steady_clock::time_point start_time_;
     int next_index_ = 0;
     bool done_ = false;
@@ -1730,7 +1730,7 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_string("clip_g_path", config.clip_g_path) ||
         !assign_string("clip_vision_path", config.clip_vision_path) ||
         !assign_string("t5xxl_path", config.t5xxl_path) ||
-        !assign_string("qwen2vl_path", config.qwen2vl_path) ||
+        !assign_string("llm_path", config.llm_path) ||
         !assign_string("diffusion_model_path", config.diffusion_model_path) ||
         !assign_string("high_noise_diffusion_model_path", config.high_noise_diffusion_model_path) ||
         !assign_string("vae_path", config.vae_path) ||
@@ -1742,15 +1742,15 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         return false;
     }
 
-    auto qwen2vl_vision_it = body.find("qwen2vl_vision_path");
+    auto qwen2vl_vision_it = body.find("llm_vision_path");
     if (qwen2vl_vision_it != body.end()) {
         if (!qwen2vl_vision_it->is_string()) {
-            error = "field 'qwen2vl_vision_path' must be a string";
+            error = "field 'llm_vision_path' must be a string";
             return false;
         }
-        config.qwen2vl_vision_path = qwen2vl_vision_it->get<std::string>();
+        config.llm_vision_path = qwen2vl_vision_it->get<std::string>();
     } else {
-        config.qwen2vl_vision_path.clear();
+        config.llm_vision_path.clear();
     }
 
     if (!assign_bool("vae_decode_only", config.vae_decode_only) ||
@@ -2508,8 +2508,8 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         std::string value = to_lower_copy(scheduler_it->get<std::string>());
-        scheduler_t scheduler = str_to_schedule(value.c_str());
-        if (scheduler == SCHEDULE_COUNT) {
+        scheduler_t scheduler = str_to_scheduler(value.c_str());
+        if (scheduler == SCHEDULER_COUNT) {
             error = "invalid scheduler value";
             return false;
         }
@@ -3656,13 +3656,13 @@ json make_telemetry(const LogCollector& collector,
     if (request.has_img_cfg_scale) {
         span_attributes["sdcpp.request.img_cfg_scale"] = request.img_cfg_scale;
     }
-    if (!request.override_sample_method && request.sample_method != SAMPLE_METHOD_DEFAULT) {
+    if (!request.override_sample_method && request.sample_method != SAMPLE_METHOD_COUNT) {
         span_attributes["sdcpp.request.sample_method"] = sd_sample_method_name(request.sample_method);
     } else if (request.override_sample_method) {
         span_attributes["sdcpp.request.sample_method"] = sd_sample_method_name(request.sample_method);
     }
     if (request.override_scheduler) {
-        span_attributes["sdcpp.request.scheduler"] = sd_schedule_name(request.scheduler);
+        span_attributes["sdcpp.request.scheduler"] = sd_scheduler_name(request.scheduler);
     }
     span_attributes["sdcpp.request.distilled_guidance"] = request.distilled_guidance;
     span_attributes["sdcpp.request.slg_scale"] = request.slg_scale;
@@ -3702,11 +3702,11 @@ json make_telemetry(const LogCollector& collector,
     if (!config.t5xxl_path.empty()) {
         span_attributes["sdcpp.context.t5xxl_path"] = config.t5xxl_path;
     }
-    if (!config.qwen2vl_path.empty()) {
-        span_attributes["sdcpp.context.qwen2vl_path"] = config.qwen2vl_path;
+    if (!config.llm_path.empty()) {
+        span_attributes["sdcpp.context.llm_path"] = config.llm_path;
     }
-    if (!config.qwen2vl_vision_path.empty()) {
-        span_attributes["sdcpp.context.qwen2vl_vision_path"] = config.qwen2vl_vision_path;
+    if (!config.llm_vision_path.empty()) {
+        span_attributes["sdcpp.context.llm_vision_path"] = config.llm_vision_path;
     }
     if (!config.vae_path.empty()) {
         span_attributes["sdcpp.context.vae_path"] = config.vae_path;
@@ -3980,8 +3980,8 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
     bool text_encoders_changed = current.clip_l_path != desired.clip_l_path ||
                                  current.clip_g_path != desired.clip_g_path ||
                                  current.t5xxl_path != desired.t5xxl_path ||
-                                 current.qwen2vl_path != desired.qwen2vl_path ||
-                                 current.qwen2vl_vision_path != desired.qwen2vl_vision_path;
+                                 current.llm_path != desired.llm_path ||
+                                 current.llm_vision_path != desired.llm_vision_path;
 
     if (diffusion_changed) {
         if (!sd_reload_diffusion_model(state.ctx,
@@ -4008,8 +4008,8 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                                      desired.clip_l_path.c_str(),
                                      desired.clip_g_path.c_str(),
                                      desired.t5xxl_path.c_str(),
-                                     desired.qwen2vl_path.c_str(),
-                                     desired.qwen2vl_vision_path.c_str())) {
+                                     desired.llm_path.c_str(),
+                                     desired.llm_vision_path.c_str())) {
             error_message = "failed to reload text encoders";
             return false;
         }
@@ -4112,8 +4112,8 @@ int main(int argc, char** argv) {
     state.ctx_config.clip_g_path = options.clip_g_path;
     state.ctx_config.clip_vision_path = options.clip_vision_path;
     state.ctx_config.t5xxl_path = options.t5xxl_path;
-    state.ctx_config.qwen2vl_path = options.qwen2vl_path;
-    state.ctx_config.qwen2vl_vision_path = options.qwen2vl_vision_path;
+    state.ctx_config.llm_path = options.llm_path;
+    state.ctx_config.llm_vision_path = options.llm_vision_path;
     state.ctx_config.diffusion_model_path = options.diffusion_model_path;
     state.ctx_config.high_noise_diffusion_model_path = options.high_noise_diffusion_model_path;
     state.ctx_config.vae_path = options.vae_path;

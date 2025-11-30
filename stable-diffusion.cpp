@@ -1262,9 +1262,8 @@ public:
             }
         } else if (sd_version_is_wan(version)) {
             cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), true, 1, true);
-        } else if (sd_version_is_qwen_image(version)) {
-            bool enable_vision = !vae_decode_only;
-            cond_stage_model = std::make_shared<Qwen2_5_VLCLIPEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "", enable_vision);
+        } else if (sd_version_is_qwen_image(version) || sd_version_is_flux2(version)) {
+            cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version);
         } else {
             cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "", version);
         }
@@ -1286,53 +1285,6 @@ public:
 
         LOG_INFO("text encoders reloaded successfully, VRAM usage: %.2fMB", cond_stage_model->get_params_buffer_size() / 1024.0 / 1024.0);
         return true;
-    }
-
-    void init_scheduler(scheduler_t scheduler) {
-        switch (scheduler) {
-            case DISCRETE:
-                LOG_INFO("running with discrete scheduler");
-                denoiser->scheduler = std::make_shared<DiscreteSchedule>();
-                break;
-            case KARRAS:
-                LOG_INFO("running with Karras scheduler");
-                denoiser->scheduler = std::make_shared<KarrasSchedule>();
-                break;
-            case EXPONENTIAL:
-                LOG_INFO("running exponential scheduler");
-                denoiser->scheduler = std::make_shared<ExponentialSchedule>();
-                break;
-            case AYS:
-                LOG_INFO("Running with Align-Your-Steps scheduler");
-                denoiser->scheduler          = std::make_shared<AYSSchedule>();
-                denoiser->scheduler->version = version;
-                break;
-            case GITS:
-                LOG_INFO("Running with GITS scheduler");
-                denoiser->scheduler          = std::make_shared<GITSSchedule>();
-                denoiser->scheduler->version = version;
-                break;
-            case SGM_UNIFORM:
-                LOG_INFO("Running with SGM Uniform schedule");
-                denoiser->scheduler          = std::make_shared<SGMUniformSchedule>();
-                denoiser->scheduler->version = version;
-                break;
-            case SIMPLE:
-                LOG_INFO("Running with Simple schedule");
-                denoiser->scheduler          = std::make_shared<SimpleSchedule>();
-                denoiser->scheduler->version = version;
-                break;
-            case SMOOTHSTEP:
-                LOG_INFO("Running with SmoothStep scheduler");
-                denoiser->scheduler = std::make_shared<SmoothStepSchedule>();
-                break;
-            case DEFAULT:
-                // Don't touch anything.
-                break;
-            default:
-                LOG_ERROR("Unknown scheduler %i", scheduler);
-                abort();
-        }
     }
 
     bool is_using_v_parameterization_for_sd2(ggml_context* work_ctx, bool is_inpaint = false) {
@@ -2412,7 +2364,6 @@ public:
                 }
             }
 
-            DiffusionParams diffusion_params;
             diffusion_params.x                  = noised_input;
             diffusion_params.timesteps          = timesteps;
             diffusion_params.guidance           = guidance_tensor;
