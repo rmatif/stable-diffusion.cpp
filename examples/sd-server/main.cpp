@@ -679,8 +679,8 @@ void print_usage() {
         << "      --clip_g <path>                     CLIP-G text encoder\n"
         << "      --clip_vision <path>                CLIP-Vision encoder\n"
         << "      --t5xxl <path>                      T5 XXL text encoder\n"
-        << "      --qwen2vl <path>                    Qwen2VL text encoder\n"
-        << "      --qwen2vl_vision <path>             Qwen2VL vision encoder\n"
+        << "      --llm <path>                        LLM text encoder (Qwen2VL, Flux2, etc.)\n"
+        << "      --llm_vision <path>                 LLM vision encoder\n"
         << "      --control-net <path>                ControlNet model path\n"
         << "      --lora-model-dir <path>             Directory containing LoRA weights\n"
         << "      --embd-dir <path>                   Directory containing textual inversion embeddings\n"
@@ -754,15 +754,15 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 return false;
             }
             options.t5xxl_path = argv[++i];
-        } else if (arg == "--qwen2vl") {
+        } else if (arg == "--llm") {
             if (i + 1 >= argc) {
-                error = "missing value for --qwen2vl";
+                error = "missing value for --llm";
                 return false;
             }
             options.llm_path = argv[++i];
-        } else if (arg == "--qwen2vl_vision") {
+        } else if (arg == "--llm_vision") {
             if (i + 1 >= argc) {
-                error = "missing value for --qwen2vl_vision";
+                error = "missing value for --llm_vision";
                 return false;
             }
             options.llm_vision_path = argv[++i];
@@ -1742,13 +1742,13 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         return false;
     }
 
-    auto qwen2vl_vision_it = body.find("llm_vision_path");
-    if (qwen2vl_vision_it != body.end()) {
-        if (!qwen2vl_vision_it->is_string()) {
+    auto llm_vision_it = body.find("llm_vision_path");
+    if (llm_vision_it != body.end()) {
+        if (!llm_vision_it->is_string()) {
             error = "field 'llm_vision_path' must be a string";
             return false;
         }
-        config.llm_vision_path = qwen2vl_vision_it->get<std::string>();
+        config.llm_vision_path = llm_vision_it->get<std::string>();
     } else {
         config.llm_vision_path.clear();
     }
