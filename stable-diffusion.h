@@ -99,7 +99,8 @@ enum sd_model_version_t {
     SD_MODEL_VERSION_WAN2_2_I2V      = 19,
     SD_MODEL_VERSION_WAN2_2_TI2V     = 20,
     SD_MODEL_VERSION_QWEN_IMAGE      = 21,
-    SD_MODEL_VERSION_COUNT           = 22,
+    SD_MODEL_VERSION_FLUX2           = 22,
+    SD_MODEL_VERSION_COUNT           = 23,
 };
 
 // same as enum ggml_type
