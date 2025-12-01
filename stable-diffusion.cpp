@@ -26,8 +26,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
-#include <cstring>
 #include <algorithm>
+#include <cstring>
+#include <functional>
 #include <unordered_map>
 
 // #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -198,6 +199,76 @@ public:
             ggml_backend_free(vae_backend);
         }
         ggml_backend_free(backend);
+    }
+
+    void offload_to_cpu() {
+        if (!offload_params_to_cpu || ggml_backend_is_cpu(backend)) {
+            return;
+        }
+
+        auto offload_runner = [](auto& module) {
+            if (module) {
+                module->free_compute_buffer();
+            }
+        };
+        auto offload_conditioner = [](const std::shared_ptr<Conditioner>& conditioner) {
+            if (!conditioner) {
+                return;
+            }
+            if (auto clip = std::dynamic_pointer_cast<FrozenCLIPEmbedderWithCustomWords>(conditioner)) {
+                if (clip->text_model) {
+                    clip->text_model->free_compute_buffer();
+                }
+                if (clip->text_model2) {
+                    clip->text_model2->free_compute_buffer();
+                }
+            } else if (auto sd3 = std::dynamic_pointer_cast<SD3CLIPEmbedder>(conditioner)) {
+                if (sd3->clip_l) {
+                    sd3->clip_l->free_compute_buffer();
+                }
+                if (sd3->clip_g) {
+                    sd3->clip_g->free_compute_buffer();
+                }
+                if (sd3->t5) {
+                    sd3->t5->free_compute_buffer();
+                }
+            } else if (auto t5 = std::dynamic_pointer_cast<T5CLIPEmbedder>(conditioner)) {
+                if (t5->t5) {
+                    t5->t5->free_compute_buffer();
+                }
+            } else if (auto flux = std::dynamic_pointer_cast<FluxCLIPEmbedder>(conditioner)) {
+                if (flux->clip_l) {
+                    flux->clip_l->free_compute_buffer();
+                }
+                if (flux->t5) {
+                    flux->t5->free_compute_buffer();
+                }
+            } else if (auto llm = std::dynamic_pointer_cast<LLMEmbedder>(conditioner)) {
+                if (llm->llm) {
+                    llm->llm->free_compute_buffer();
+                }
+            }
+        };
+
+        offload_conditioner(cond_stage_model);
+        offload_runner(clip_vision);
+        offload_runner(diffusion_model);
+        offload_runner(high_noise_diffusion_model);
+        offload_runner(first_stage_model);
+        offload_runner(tae_first_stage);
+        offload_runner(control_net);
+        offload_runner(pmid_model);
+        offload_runner(pmid_lora);
+
+        for (auto& lora : cond_stage_lora_models) {
+            offload_runner(lora);
+        }
+        for (auto& lora : diffusion_lora_models) {
+            offload_runner(lora);
+        }
+        for (auto& lora : first_stage_lora_models) {
+            offload_runner(lora);
+        }
     }
 
     void init_backend() {
@@ -3942,26 +4013,39 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
 }
 
 sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
-    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
-    int width                     = sd_img_gen_params->width;
-    int height                    = sd_img_gen_params->height;
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr) {
+        return nullptr;
+    }
 
-    int vae_scale_factor            = sd_ctx->sd->get_vae_scale_factor();
-    int diffusion_model_down_factor = sd_ctx->sd->get_diffusion_model_down_factor();
-    int spatial_multiple            = vae_scale_factor * diffusion_model_down_factor;
+    StableDiffusionGGML* sd       = sd_ctx->sd;
+    const bool should_offload_run = sd->offload_params_to_cpu;
+    auto offload_guard            = std::unique_ptr<void, std::function<void(void*)>>(nullptr, [sd, should_offload_run](void*) {
+        if (should_offload_run && sd != nullptr) {
+            sd->offload_to_cpu();
+        }
+    });
 
-    int width_offset  = align_up_offset(width, spatial_multiple);
-    int height_offset = align_up_offset(height, spatial_multiple);
-    if (width_offset > 0 || height_offset > 0) {
-        width += width_offset;
-        height += height_offset;
-        LOG_WARN("align up %dx%d to %dx%d (multiple=%d)", sd_img_gen_params->width, sd_img_gen_params->height, width, height, spatial_multiple);
+    sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    int width             = sd_img_gen_params->width;
+    int height            = sd_img_gen_params->height;
+    int vae_scale_factor  = sd->get_vae_scale_factor();
+    if (sd_version_is_dit(sd->version)) {
+        if (width % 16 || height % 16) {
+            LOG_ERROR("Image dimensions must be must be a multiple of 16 on each axis for %s models. (Got %dx%d)",
+                      model_version_to_str[sd->version],
+                      width,
+                      height);
+            return nullptr;
+        }
+    } else if (width % 64 || height % 64) {
+        LOG_ERROR("Image dimensions must be must be a multiple of 64 on each axis for %s models. (Got %dx%d)",
+                  model_version_to_str[sd->version],
+                  width,
+                  height);
+        return nullptr;
     }
 
     LOG_DEBUG("generate_image %dx%d", width, height);
-    if (sd_ctx == nullptr || sd_img_gen_params == nullptr) {
-        return nullptr;
-    }
 
     struct ggml_init_params params;
     params.mem_size   = static_cast<size_t>(1024 * 1024) * 1024;  // 1G
@@ -4233,10 +4317,18 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
 }
 
 SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* sd_vid_gen_params, int* num_frames_out) {
-    if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr) {
         return nullptr;
     }
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+
+    StableDiffusionGGML* sd       = sd_ctx->sd;
+    const bool should_offload_run = sd->offload_params_to_cpu;
+    auto offload_guard            = std::unique_ptr<void, std::function<void(void*)>>(nullptr, [sd, should_offload_run](void*) {
+        if (should_offload_run && sd != nullptr) {
+            sd->offload_to_cpu();
+        }
+    });
 
     std::string prompt          = SAFE_STR(sd_vid_gen_params->prompt);
     std::string negative_prompt = SAFE_STR(sd_vid_gen_params->negative_prompt);
