@@ -185,9 +185,19 @@ public:
     int model_channels  = 320;
     int adm_in_channels = 2816;  // only for VERSION_SDXL/SVD
 
-    // DeepCache state
-    struct ggml_tensor* deepcache_cached_h = nullptr;
-    ggml_context* deepcache_cache_ctx = nullptr;
+    // DeepCache state - stores cache data in CPU memory
+    // We need 2 caches because CFG runs conditional and unconditional passes separately
+    struct DeepCacheState {
+        std::vector<uint8_t> data[2];  // [0] = first pass, [1] = second pass
+        int64_t shape[4] = {0, 0, 0, 0};
+        ggml_type type = GGML_TYPE_F32;
+        bool valid[2] = {false, false};
+        bool pending_save = false;  // Flag to indicate h should be saved after execution
+        int pass_index = 0;  // Tracks which pass we're on (0 or 1), toggles each compute call
+    } deepcache_state;
+
+    // Name for the cache boundary tensor (used to find it after graph execution)
+    static constexpr const char* DEEPCACHE_BOUNDARY_NAME = "deepcache_boundary";
 
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
@@ -480,6 +490,11 @@ public:
         bool use_deepcache = deepcache_params.cache_interval > 0 && deepcache_step >= 0;
         bool step_cache_interval = use_deepcache && (deepcache_step % deepcache_params.cache_interval) != 0;
 
+        // Calculate cache boundaries for DeepCache
+        size_t len_mults = channel_mult.size();
+        int total_output_blocks = (int)(len_mults * (num_res_blocks + 1));
+        int cache_block_id = total_output_blocks - deepcache_params.cache_depth - 1;
+
         // input_blocks
         std::vector<struct ggml_tensor*> hs;
 
@@ -488,13 +503,26 @@ public:
 
         ggml_set_name(h, "bench-start");
         hs.push_back(h);
-        // input block 1-11
-        size_t len_mults    = channel_mult.size();
+
+        // input block 1-N
+        // On non-cache steps, stop after cache_depth+1 blocks (to match output block skipping)
         int input_block_idx = 0;
         int ds              = 1;
-        for (int i = 0; i < len_mults; i++) {
+        bool input_early_stop = false;
+
+        // Only do input early stop when cache_depth > 0 (otherwise we only skip middle block)
+        bool do_input_cache = deepcache_params.cache_depth > 0;
+
+        for (int i = 0; i < len_mults && !input_early_stop; i++) {
             int mult = channel_mult[i];
             for (int j = 0; j < num_res_blocks; j++) {
+                // Check early stop condition for non-cache steps with input caching
+                // We need cache_depth + 1 entries in hs (for output blocks cache_block_id to end)
+                if (step_cache_interval && use_deepcache && do_input_cache && (int)hs.size() > deepcache_params.cache_depth) {
+                    input_early_stop = true;
+                    break;
+                }
+
                 input_block_idx += 1;
                 std::string name = "input_blocks." + std::to_string(input_block_idx) + ".0";
                 h                = resblock_forward(name, ctx, h, emb, num_video_frames);  // [N, mult*model_channels, h, w]
@@ -505,10 +533,18 @@ public:
                 hs.push_back(h);
             }
 
+            if (input_early_stop) break;
+
             if (version == VERSION_SD1_TINY_UNET) {
                 input_block_idx++;
             }
             if (i != len_mults - 1) {
+                // Check early stop before downsample
+                if (step_cache_interval && use_deepcache && do_input_cache && (int)hs.size() > deepcache_params.cache_depth) {
+                    input_early_stop = true;
+                    break;
+                }
+
                 ds *= 2;
                 input_block_idx += 1;
 
@@ -524,10 +560,30 @@ public:
         // middle_block
         if (version != VERSION_SD1_TINY_UNET) {
             if (!step_cache_interval || !use_deepcache) {
+                // Cache step or DeepCache disabled: run middle block
                 h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
                 if (version != VERSION_SDXL_SSD1B) {
                     h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
                     h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
+                }
+                // When cache_depth=0, cache h after middle block
+                if (use_deepcache && !do_input_cache && !step_cache_interval) {
+                    ggml_set_name(h, DEEPCACHE_BOUNDARY_NAME);
+                    deepcache_state.pending_save = true;
+                }
+            } else {
+                // Non-cache step with middle block skip: load cached h
+                if (!do_input_cache && deepcache_state.valid[deepcache_state.pass_index]) {
+                    // When cache_depth=0, create tensor to receive cached middle block output
+                    auto h_src = ggml_new_tensor_4d(ctx->ggml_ctx,
+                                                    deepcache_state.type,
+                                                    deepcache_state.shape[0],
+                                                    deepcache_state.shape[1],
+                                                    deepcache_state.shape[2],
+                                                    deepcache_state.shape[3]);
+                    // Use ggml_scale with 1.0 to force a computation that reads from h_src
+                    h = ggml_scale(ctx->ggml_ctx, h_src, 1.0f);
+                    ggml_set_name(h_src, "deepcache_input");
                 }
             }
         }
@@ -539,11 +595,51 @@ public:
 
         // output_blocks
         int output_block_idx = 0;
-        int total_output_blocks = len_mults * (num_res_blocks + 1);
-        int cache_block_id = total_output_blocks - deepcache_params.cache_depth - 1;
+
+        // Initialize ds for output blocks (should be at max downsample level after input blocks)
+        // Reset ds to initial state for output block attention checks
+        int output_ds = 1;
+        for (int i = 0; i < (int)len_mults - 1; i++) {
+            output_ds *= 2;
+        }
 
         for (int i = (int)len_mults - 1; i >= 0; i--) {
             for (int j = 0; j < num_res_blocks + 1; j++) {
+                // Skip early output blocks on non-cache steps (only when cache_depth > 0)
+                if (step_cache_interval && use_deepcache && do_input_cache && output_block_idx < cache_block_id) {
+                    // Still need to track ds updates for skipped blocks
+                    if (i > 0 && j == num_res_blocks) {
+                        output_ds /= 2;
+                    }
+                    output_block_idx++;
+                    // Don't pop from hs - we don't have entries for skipped blocks
+                    continue;
+                }
+
+                // At cache boundary - mark for save or create input for load (only when cache_depth > 0)
+                if (output_block_idx == cache_block_id && use_deepcache && do_input_cache && cache_block_id >= 0) {
+                    if (!step_cache_interval) {
+                        // Cache step: mark h for saving after execution
+                        ggml_set_name(h, DEEPCACHE_BOUNDARY_NAME);
+                        deepcache_state.pending_save = true;
+                    } else {
+                        // Non-cache step: create tensor to receive cached data
+                        if (deepcache_state.valid[deepcache_state.pass_index]) {
+                            // Create a source tensor with shape info
+                            auto h_src = ggml_new_tensor_4d(ctx->ggml_ctx,
+                                                            deepcache_state.type,
+                                                            deepcache_state.shape[0],
+                                                            deepcache_state.shape[1],
+                                                            deepcache_state.shape[2],
+                                                            deepcache_state.shape[3]);
+                            // Use ggml_scale with 1.0 to force a computation that reads from h_src
+                            h = ggml_scale(ctx->ggml_ctx, h_src, 1.0f);
+                            ggml_set_name(h_src, "deepcache_input");
+                        }
+                    }
+                }
+
+                // Normal output block processing
                 auto h_skip = hs.back();
                 hs.pop_back();
 
@@ -560,7 +656,7 @@ public:
                 h = resblock_forward(name, ctx, h, emb, num_video_frames);
 
                 int up_sample_idx = 1;
-                if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
+                if (std::find(attention_resolutions.begin(), attention_resolutions.end(), output_ds) != attention_resolutions.end()) {
                     std::string name = "output_blocks." + std::to_string(output_block_idx) + ".1";
 
                     h = attention_layer_forward(name, ctx, h, context, num_video_frames);
@@ -580,7 +676,7 @@ public:
 
                     h = block->forward(ctx, h);
 
-                    ds /= 2;
+                    output_ds /= 2;
                 }
 
                 output_block_idx += 1;
@@ -679,11 +775,103 @@ struct UNetModelRunner : public GGMLRunner {
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
+
+        bool use_deepcache = deepcache_params.cache_interval > 0 && deepcache_step >= 0;
+
+        // Build graph lambda
         auto get_graph = [&]() -> struct ggml_cgraph* {
             return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, deepcache_step, deepcache_params);
         };
 
-        GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        // When DeepCache is disabled, use the standard compute path
+        if (!use_deepcache) {
+            GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return;
+        }
+
+        // DeepCache is enabled - use custom compute with caching
+        bool step_cache_interval = (deepcache_step % deepcache_params.cache_interval) != 0;
+
+        // Get current pass index (0 or 1 for CFG cond/uncond)
+        int pass_idx = unet.deepcache_state.pass_index;
+
+        // Reset pending_save flag
+        unet.deepcache_state.pending_save = false;
+
+        // Reserve compute buffer (may or may not call get_graph)
+        alloc_compute_buffer(get_graph);
+
+        // Reset context and rebuild graph
+        reset_compute_ctx();
+        struct ggml_cgraph* gf = get_compute_graph(get_graph);
+
+        // Allocate graph tensors
+        GGML_ASSERT(ggml_gallocr_alloc_graph(compute_allocr, gf));
+
+        // Copy input data to backend tensors
+        copy_data_to_backend_tensor();
+
+        // For non-cache steps, load cached data into the deepcache_input tensor
+        if (step_cache_interval && unet.deepcache_state.valid[pass_idx]) {
+            // Find the deepcache_input tensor by iterating through all tensors in compute context
+            for (struct ggml_tensor* t = ggml_get_first_tensor(compute_ctx); t != nullptr; t = ggml_get_next_tensor(compute_ctx, t)) {
+                if (t->name != nullptr && strcmp(t->name, "deepcache_input") == 0) {
+                    if (t->buffer != nullptr) {
+                        ggml_backend_tensor_set(t,
+                                               unet.deepcache_state.data[pass_idx].data(),
+                                               0,
+                                               unet.deepcache_state.data[pass_idx].size());
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Set thread count for CPU backend
+        if (ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+        }
+
+        // Execute the graph
+        ggml_backend_graph_compute(runtime_backend, gf);
+
+        // For cache steps, save the boundary tensor data
+        if (unet.deepcache_state.pending_save) {
+            // Find the deepcache_boundary tensor and save its data
+            int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; i++) {
+                auto node = ggml_graph_node(gf, i);
+                if (node->name != nullptr && strcmp(node->name, UnetModelBlock::DEEPCACHE_BOUNDARY_NAME) == 0) {
+                    size_t nbytes = ggml_nbytes(node);
+                    unet.deepcache_state.data[pass_idx].resize(nbytes);
+                    ggml_backend_tensor_get(node,
+                                           unet.deepcache_state.data[pass_idx].data(),
+                                           0, nbytes);
+                    // Save shape (same for both passes)
+                    for (int j = 0; j < 4; j++) {
+                        unet.deepcache_state.shape[j] = node->ne[j];
+                    }
+                    unet.deepcache_state.type = node->type;
+                    unet.deepcache_state.valid[pass_idx] = true;
+                    unet.deepcache_state.pending_save = false;
+                    break;
+                }
+            }
+        }
+
+        // Toggle pass index for next compute call (0->1->0->1...)
+        unet.deepcache_state.pass_index = 1 - pass_idx;
+
+        // Copy output if requested (use same approach as GGMLRunner::compute)
+        if (output != nullptr) {
+            auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+            if (*output == nullptr && output_ctx != nullptr) {
+                *output = ggml_dup_tensor(output_ctx, result);
+            }
+            if (*output != nullptr) {
+                ggml_backend_tensor_get(result, (*output)->data, 0, ggml_nbytes(*output));
+            }
+        }
     }
 
     void test() {
