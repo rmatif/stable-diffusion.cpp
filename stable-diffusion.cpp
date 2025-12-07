@@ -15,6 +15,7 @@
 #include "esrgan.hpp"
 #include "lora.hpp"
 #include "pmid.hpp"
+#include "ucache.hpp"
 #include "tae.hpp"
 #include "vae.hpp"
 
@@ -1472,7 +1473,8 @@ public:
                         ggml_tensor* denoise_mask                     = nullptr,
                         ggml_tensor* vace_context                     = nullptr,
                         float vace_strength                           = 1.f,
-                        const sd_easycache_params_t* easycache_params = nullptr) {
+                        const sd_easycache_params_t* easycache_params = nullptr,
+                        const sd_ucache_params_t* ucache_params       = nullptr) {
         if (shifted_timestep > 0 && !sd_version_is_sdxl(version)) {
             LOG_WARN("timestep shifting is only supported for SDXL models!");
             shifted_timestep = 0;
@@ -1521,6 +1523,51 @@ public:
                         LOG_WARN("EasyCache requested but could not be initialized for this run");
                     }
                 }
+            }
+        }
+
+        UCacheState ucache_state;
+        bool ucache_enabled = false;
+        if (ucache_params != nullptr && ucache_params->enabled) {
+            bool ucache_supported = sd_version_is_unet(version) && !sd_version_is_dit(version);
+            if (!ucache_supported) {
+                LOG_WARN("UCache requested but not supported for this model type");
+            } else {
+                UCacheConfig ucache_config;
+                ucache_config.enabled         = true;
+                ucache_config.reuse_threshold = std::max(0.0f, ucache_params->reuse_threshold);
+                ucache_config.start_percent   = ucache_params->start_percent;
+                ucache_config.end_percent     = ucache_params->end_percent;
+                bool percent_valid            = ucache_config.start_percent >= 0.0f &&
+                                     ucache_config.start_percent < 1.0f &&
+                                     ucache_config.end_percent > 0.0f &&
+                                     ucache_config.end_percent <= 1.0f &&
+                                     ucache_config.start_percent < ucache_config.end_percent;
+                if (!percent_valid) {
+                    LOG_WARN("UCache disabled due to invalid percent range (start=%.3f, end=%.3f)",
+                             ucache_config.start_percent,
+                             ucache_config.end_percent);
+                } else {
+                    ucache_state.init(ucache_config, denoiser.get());
+                    if (ucache_state.enabled()) {
+                        ucache_enabled = true;
+                        LOG_INFO("UCache enabled - threshold: %.3f, start_percent: %.2f, end_percent: %.2f",
+                                 ucache_config.reuse_threshold,
+                                 ucache_config.start_percent,
+                                 ucache_config.end_percent);
+                    } else {
+                        LOG_WARN("UCache requested but could not be initialized for this run");
+                    }
+                }
+            }
+        }
+
+        if (easycache_enabled && ucache_enabled) {
+            LOG_WARN("Both EasyCache and UCache are enabled; using the cache that matches the current model family");
+            if (!sd_version_is_dit(version)) {
+                easycache_enabled = false;
+            } else {
+                ucache_enabled = false;
             }
         }
 
@@ -1598,33 +1645,58 @@ public:
             DiffusionParams diffusion_params;
 
             const bool easycache_step_active = easycache_enabled && step > 0;
-            int easycache_step_index         = easycache_step_active ? (step - 1) : -1;
+            const bool ucache_step_active    = ucache_enabled && step > 0;
+            const bool cache_step_active     = easycache_step_active || ucache_step_active;
+            int cache_step_index             = cache_step_active ? (step - 1) : -1;
             if (easycache_step_active) {
-                easycache_state.begin_step(easycache_step_index, sigma);
+                easycache_state.begin_step(cache_step_index, sigma);
+            }
+            if (ucache_step_active) {
+                ucache_state.begin_step(cache_step_index, sigma);
             }
 
-            auto easycache_before_condition = [&](const SDCondition* condition, struct ggml_tensor* output_tensor) -> bool {
-                if (!easycache_step_active || condition == nullptr || output_tensor == nullptr) {
+            auto cache_before_condition = [&](const SDCondition* condition, struct ggml_tensor* output_tensor) -> bool {
+                if (!cache_step_active || condition == nullptr || output_tensor == nullptr) {
                     return false;
                 }
-                return easycache_state.before_condition(condition,
-                                                        diffusion_params.x,
-                                                        output_tensor,
-                                                        sigma,
-                                                        easycache_step_index);
+                if (easycache_step_active) {
+                    return easycache_state.before_condition(condition,
+                                                            diffusion_params.x,
+                                                            output_tensor,
+                                                            sigma,
+                                                            cache_step_index);
+                }
+                return ucache_state.before_condition(condition,
+                                                     diffusion_params.x,
+                                                     output_tensor,
+                                                     sigma,
+                                                     cache_step_index);
             };
 
-            auto easycache_after_condition = [&](const SDCondition* condition, struct ggml_tensor* output_tensor) {
-                if (!easycache_step_active || condition == nullptr || output_tensor == nullptr) {
+            auto cache_after_condition = [&](const SDCondition* condition, struct ggml_tensor* output_tensor) {
+                if (!cache_step_active || condition == nullptr || output_tensor == nullptr) {
                     return;
                 }
-                easycache_state.after_condition(condition,
-                                                diffusion_params.x,
-                                                output_tensor);
+                if (easycache_step_active) {
+                    easycache_state.after_condition(condition,
+                                                    diffusion_params.x,
+                                                    output_tensor);
+                } else {
+                    ucache_state.after_condition(condition,
+                                                 diffusion_params.x,
+                                                 output_tensor,
+                                                 sigma);
+                }
             };
 
-            auto easycache_step_is_skipped = [&]() {
-                return easycache_step_active && easycache_state.is_step_skipped();
+            auto cache_step_is_skipped = [&]() {
+                if (easycache_step_active) {
+                    return easycache_state.is_step_skipped();
+                }
+                if (ucache_step_active) {
+                    return ucache_state.is_step_skipped();
+                }
+                return false;
             };
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -1702,7 +1774,7 @@ public:
                 active_condition          = &id_cond;
             }
 
-            bool skip_model = easycache_before_condition(active_condition, *active_output);
+            bool skip_model = cache_before_condition(active_condition, *active_output);
             if (!skip_model) {
                 if (!work_diffusion_model->compute(n_threads,
                                                    diffusion_params,
@@ -1710,10 +1782,10 @@ public:
                     LOG_ERROR("diffusion model compute failed");
                     return nullptr;
                 }
-                easycache_after_condition(active_condition, *active_output);
+                cache_after_condition(active_condition, *active_output);
             }
 
-            bool current_step_skipped = easycache_step_is_skipped();
+            bool current_step_skipped = cache_step_is_skipped();
 
             float* negative_data = nullptr;
             if (has_unconditioned) {
@@ -1725,12 +1797,12 @@ public:
                         LOG_ERROR("controlnet compute failed");
                     }
                 }
-                current_step_skipped      = easycache_step_is_skipped();
+                current_step_skipped      = cache_step_is_skipped();
                 diffusion_params.controls = controls;
                 diffusion_params.context  = uncond.c_crossattn;
                 diffusion_params.c_concat = uncond.c_concat;
                 diffusion_params.y        = uncond.c_vector;
-                bool skip_uncond          = easycache_before_condition(&uncond, out_uncond);
+                bool skip_uncond          = cache_before_condition(&uncond, out_uncond);
                 if (!skip_uncond) {
                     if (!work_diffusion_model->compute(n_threads,
                                                        diffusion_params,
@@ -1738,7 +1810,7 @@ public:
                         LOG_ERROR("diffusion model compute failed");
                         return nullptr;
                     }
-                    easycache_after_condition(&uncond, out_uncond);
+                    cache_after_condition(&uncond, out_uncond);
                 }
                 negative_data = (float*)out_uncond->data;
             }
@@ -1748,7 +1820,7 @@ public:
                 diffusion_params.context  = img_cond.c_crossattn;
                 diffusion_params.c_concat = img_cond.c_concat;
                 diffusion_params.y        = img_cond.c_vector;
-                bool skip_img_cond        = easycache_before_condition(&img_cond, out_img_cond);
+                bool skip_img_cond        = cache_before_condition(&img_cond, out_img_cond);
                 if (!skip_img_cond) {
                     if (!work_diffusion_model->compute(n_threads,
                                                        diffusion_params,
@@ -1756,7 +1828,7 @@ public:
                         LOG_ERROR("diffusion model compute failed");
                         return nullptr;
                     }
-                    easycache_after_condition(&img_cond, out_img_cond);
+                    cache_after_condition(&img_cond, out_img_cond);
                 }
                 img_cond_data = (float*)out_img_cond->data;
             }
@@ -1766,7 +1838,7 @@ public:
             float* skip_layer_data = has_skiplayer ? (float*)out_skip->data : nullptr;
             if (is_skiplayer_step) {
                 LOG_DEBUG("Skipping layers at step %d\n", step);
-                if (!easycache_step_is_skipped()) {
+                if (!cache_step_is_skipped()) {
                     // skip layer (same as conditioned)
                     diffusion_params.context     = cond.c_crossattn;
                     diffusion_params.c_concat    = cond.c_concat;
@@ -1850,24 +1922,36 @@ public:
             return NULL;
         }
 
-        if (easycache_enabled) {
+        auto log_cache_stats = [&](const char* name, int skipped_steps) {
             size_t total_steps = sigmas.size() > 0 ? sigmas.size() - 1 : 0;
-            if (easycache_state.total_steps_skipped > 0 && total_steps > 0) {
-                if (easycache_state.total_steps_skipped < static_cast<int>(total_steps)) {
+            if (total_steps == 0) {
+                return;
+            }
+            if (skipped_steps > 0) {
+                if (skipped_steps < static_cast<int>(total_steps)) {
                     double speedup = static_cast<double>(total_steps) /
-                                     static_cast<double>(total_steps - easycache_state.total_steps_skipped);
-                    LOG_INFO("EasyCache skipped %d/%zu steps (%.2fx estimated speedup)",
-                             easycache_state.total_steps_skipped,
+                                     static_cast<double>(total_steps - skipped_steps);
+                    LOG_INFO("%s skipped %d/%zu steps (%.2fx estimated speedup)",
+                             name,
+                             skipped_steps,
                              total_steps,
                              speedup);
                 } else {
-                    LOG_INFO("EasyCache skipped %d/%zu steps",
-                             easycache_state.total_steps_skipped,
+                    LOG_INFO("%s skipped %d/%zu steps",
+                             name,
+                             skipped_steps,
                              total_steps);
                 }
-            } else if (total_steps > 0) {
-                LOG_INFO("EasyCache completed without skipping steps");
+            } else {
+                LOG_INFO("%s completed without skipping steps", name);
             }
+        };
+
+        if (easycache_enabled) {
+            log_cache_stats("EasyCache", easycache_state.total_steps_skipped);
+        }
+        if (ucache_enabled) {
+            log_cache_stats("UCache", ucache_state.total_steps_skipped);
         }
 
         if (inverse_noise_scaling) {
@@ -2480,6 +2564,14 @@ void sd_easycache_params_init(sd_easycache_params_t* easycache_params) {
     easycache_params->end_percent     = 0.95f;
 }
 
+void sd_ucache_params_init(sd_ucache_params_t* ucache_params) {
+    *ucache_params                 = {};
+    ucache_params->enabled         = false;
+    ucache_params->reuse_threshold = 0.2f;
+    ucache_params->start_percent   = 0.15f;
+    ucache_params->end_percent     = 0.95f;
+}
+
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     *sd_ctx_params                         = {};
     sd_ctx_params->vae_decode_only         = true;
@@ -2639,6 +2731,7 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     sd_img_gen_params->pm_params         = {nullptr, 0, nullptr, 20.f};
     sd_img_gen_params->vae_tiling_params = {false, 0, 0, 0.5f, 0.0f, 0.0f};
     sd_easycache_params_init(&sd_img_gen_params->easycache);
+    sd_ucache_params_init(&sd_img_gen_params->ucache);
 }
 
 char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
@@ -2688,6 +2781,12 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              sd_img_gen_params->easycache.reuse_threshold,
              sd_img_gen_params->easycache.start_percent,
              sd_img_gen_params->easycache.end_percent);
+    snprintf(buf + strlen(buf), 4096 - strlen(buf),
+             "ucache: %s (threshold=%.3f, start=%.2f, end=%.2f)\n",
+             sd_img_gen_params->ucache.enabled ? "enabled" : "disabled",
+             sd_img_gen_params->ucache.reuse_threshold,
+             sd_img_gen_params->ucache.start_percent,
+             sd_img_gen_params->ucache.end_percent);
     free(sample_params_str);
     return buf;
 }
@@ -2705,6 +2804,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
     sd_easycache_params_init(&sd_vid_gen_params->easycache);
+    sd_ucache_params_init(&sd_vid_gen_params->ucache);
 }
 
 struct sd_ctx_t {
@@ -2782,7 +2882,8 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                     bool increase_ref_index,
                                     ggml_tensor* concat_latent                    = nullptr,
                                     ggml_tensor* denoise_mask                     = nullptr,
-                                    const sd_easycache_params_t* easycache_params = nullptr) {
+                                    const sd_easycache_params_t* easycache_params = nullptr,
+                                    const sd_ucache_params_t* ucache_params       = nullptr) {
     if (seed < 0) {
         // Generally, when using the provided command line, the seed is always >0.
         // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
@@ -3073,7 +3174,8 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                                      denoise_mask,
                                                      nullptr,
                                                      1.0f,
-                                                     easycache_params);
+                                                     easycache_params,
+                                                     ucache_params);
         int64_t sampling_end    = ggml_time_ms();
         if (x_0 != nullptr) {
             // print_ggml_tensor(x_0);
@@ -3397,7 +3499,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
                                                         sd_img_gen_params->increase_ref_index,
                                                         concat_latent,
                                                         denoise_mask,
-                                                        &sd_img_gen_params->easycache);
+                                                        &sd_img_gen_params->easycache,
+                                                        &sd_img_gen_params->ucache);
 
     size_t t2 = ggml_time_ms();
 
@@ -3730,7 +3833,8 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                  denoise_mask,
                                  vace_context,
                                  sd_vid_gen_params->vace_strength,
-                                 &sd_vid_gen_params->easycache);
+                                 &sd_vid_gen_params->easycache,
+                                 &sd_vid_gen_params->ucache);
 
         int64_t sampling_end = ggml_time_ms();
         LOG_INFO("sampling(high noise) completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
@@ -3767,7 +3871,8 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                           denoise_mask,
                                           vace_context,
                                           sd_vid_gen_params->vace_strength,
-                                          &sd_vid_gen_params->easycache);
+                                          &sd_vid_gen_params->easycache,
+                                          &sd_vid_gen_params->ucache);
 
         int64_t sampling_end = ggml_time_ms();
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
