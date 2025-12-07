@@ -10,40 +10,31 @@
 #include "ggml_extend.hpp"
 
 /*
- * UCache: Adaptive caching for UNET diffusion models
+ * UCache: Adaptive step-level caching for UNET diffusion models
  *
- * Inspired by EasyCache (for DiT models), UCache adapts the caching principle
- * to UNET's encoder-decoder architecture.
+ * This implementation mirrors EasyCache (for DiT models) but optimized for UNET architecture.
+ * It tracks input/output changes between denoising steps and skips redundant computations
+ * when the predicted output change is below a threshold.
  *
- * Key insight: During denoising, the UNET's noise prediction becomes increasingly
- * predictable as we move from high noise (early steps) to low noise (later steps).
- * The transformation from input latent to output noise prediction follows a pattern
- * that can be approximated.
+ * Key algorithm:
+ * 1. Track transformation_rate = output_change / input_change between steps
+ * 2. Predict next output change using: predicted = transformation_rate * input_change
+ * 3. Accumulate predicted changes until threshold exceeded
+ * 4. When skipping, apply cached diff: output = input + cached_diff
  *
- * The algorithm tracks:
- * 1. The "diff" between model output and input (the learned transformation)
- * 2. How input changes between steps (input_change)
- * 3. How output changes between steps (output_change)
- * 4. The ratio: relative_transformation_rate = output_change / input_change
- *
- * When the predicted cumulative change stays below a threshold, we can reuse
- * the cached diff instead of running the full UNET forward pass.
- *
- * Parameters:
- * - reuse_threshold: Max cumulative predicted change before recomputing (default: 0.2)
- * - start_percent: Denoising progress % to start caching (default: 0.15)
- * - end_percent: Denoising progress % to stop caching (default: 0.95)
+ * Usage: --ucache [threshold],[start_percent],[end_percent]
+ * Default: --ucache 1.0,0.15,0.95
  */
 
 struct UCacheConfig {
     bool enabled          = false;
-    float reuse_threshold = 0.2f;   // Threshold for accumulated predicted change
+    float reuse_threshold = 1.0f;   // Threshold for accumulated predicted change
     float start_percent   = 0.15f;  // Start caching at 15% through denoising
     float end_percent     = 0.95f;  // Stop caching at 95% through denoising
 };
 
 struct UCacheCacheEntry {
-    std::vector<float> diff;  // Stores (output - input) transformation
+    std::vector<float> diff;  // cached (output - input) for reapplication
 };
 
 struct UCacheState {
@@ -133,12 +124,11 @@ struct UCacheState {
         has_last_input_change = false;
         step_active           = false;
 
-        // Check if we're in the active caching window based on sigma
         if (sigma > start_sigma) {
-            return;  // Too early in denoising (high noise)
+            return;
         }
         if (!(sigma > end_sigma)) {
-            return;  // Too late in denoising (low noise)
+            return;
         }
         step_active = true;
     }
@@ -163,7 +153,6 @@ struct UCacheState {
         float* out_data = (float*)output->data;
         float* in_data  = (float*)input->data;
 
-        // Store the transformation: diff = output - input
         for (size_t i = 0; i < ne; ++i) {
             entry.diff[i] = out_data[i] - in_data[i];
         }
@@ -175,7 +164,6 @@ struct UCacheState {
             return;
         }
 
-        // Apply cached transformation: output = input + cached_diff
         copy_ggml_tensor(output, input);
         float* out_data                = (float*)output->data;
         const std::vector<float>& diff = it->second.diff;
@@ -199,7 +187,6 @@ struct UCacheState {
             return false;
         }
 
-        // First active step establishes the anchor condition
         if (initial_step) {
             anchor_condition = cond;
             initial_step     = false;
@@ -207,7 +194,6 @@ struct UCacheState {
 
         bool is_anchor = (cond == anchor_condition);
 
-        // If we already decided to skip this step, apply cache and return
         if (skip_current_step) {
             if (has_cache(cond)) {
                 apply_cache(cond, input, output);
@@ -216,12 +202,10 @@ struct UCacheState {
             return false;
         }
 
-        // Only consider skipping for the anchor condition
         if (!is_anchor) {
             return false;
         }
 
-        // Need previous data and cache to make skip decision
         if (!has_prev_input || !has_prev_output || !has_cache(cond)) {
             return false;
         }
@@ -231,7 +215,6 @@ struct UCacheState {
             return false;
         }
 
-        // Calculate how much the input changed from the previous step
         float* input_data = (float*)input->data;
         last_input_change = 0.0f;
         for (size_t i = 0; i < ne; ++i) {
@@ -242,22 +225,18 @@ struct UCacheState {
         }
         has_last_input_change = true;
 
-        // Predict whether we can skip this step based on accumulated change
         if (has_output_prev_norm && has_relative_transformation_rate &&
             last_input_change > 0.0f && output_prev_norm > 0.0f) {
 
-            // Estimate output change rate based on input change and transformation rate
             float approx_output_change_rate = (relative_transformation_rate * last_input_change) / output_prev_norm;
             cumulative_change_rate += approx_output_change_rate;
 
             if (cumulative_change_rate < config.reuse_threshold) {
-                // Accumulated change is below threshold - skip this step
                 skip_current_step = true;
                 total_steps_skipped++;
                 apply_cache(cond, input, output);
                 return true;
             } else {
-                // Reset accumulator when we exceed threshold
                 cumulative_change_rate = 0.0f;
             }
         }
@@ -270,15 +249,12 @@ struct UCacheState {
             return;
         }
 
-        // Always update cache with latest transformation
         update_cache(cond, input, output);
 
-        // Only track stats for anchor condition
         if (cond != anchor_condition) {
             return;
         }
 
-        // Store current input for next step comparison
         size_t ne      = static_cast<size_t>(ggml_nelements(input));
         float* in_data = (float*)input->data;
         prev_input.resize(ne);
@@ -287,7 +263,6 @@ struct UCacheState {
         }
         has_prev_input = true;
 
-        // Calculate output change from previous step
         float* out_data     = (float*)output->data;
         float output_change = 0.0f;
         if (has_prev_output && prev_output.size() == ne) {
@@ -299,14 +274,12 @@ struct UCacheState {
             }
         }
 
-        // Store current output for next step comparison
         prev_output.resize(ne);
         for (size_t i = 0; i < ne; ++i) {
             prev_output[i] = out_data[i];
         }
         has_prev_output = true;
 
-        // Calculate mean absolute value of output (for normalization)
         float mean_abs = 0.0f;
         for (size_t i = 0; i < ne; ++i) {
             mean_abs += std::fabs(out_data[i]);
@@ -314,7 +287,6 @@ struct UCacheState {
         output_prev_norm     = (ne > 0) ? (mean_abs / static_cast<float>(ne)) : 0.0f;
         has_output_prev_norm = output_prev_norm > 0.0f;
 
-        // Calculate relative transformation rate: how much output changes per unit input change
         if (has_last_input_change && last_input_change > 0.0f && output_change > 0.0f) {
             float rate = output_change / last_input_change;
             if (std::isfinite(rate)) {
@@ -323,7 +295,6 @@ struct UCacheState {
             }
         }
 
-        // Reset accumulator after full computation
         cumulative_change_rate = 0.0f;
         has_last_input_change  = false;
     }
