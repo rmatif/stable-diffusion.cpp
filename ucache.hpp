@@ -9,32 +9,15 @@
 #include "denoiser.hpp"
 #include "ggml_extend.hpp"
 
-/*
- * UCache: Adaptive step-level caching for UNET diffusion models
- *
- * This implementation mirrors EasyCache (for DiT models) but optimized for UNET architecture.
- * It tracks input/output changes between denoising steps and skips redundant computations
- * when the predicted output change is below a threshold.
- *
- * Key algorithm:
- * 1. Track transformation_rate = output_change / input_change between steps
- * 2. Predict next output change using: predicted = transformation_rate * input_change
- * 3. Accumulate predicted changes until threshold exceeded
- * 4. When skipping, apply cached diff: output = input + cached_diff
- *
- * Usage: --ucache [threshold],[start_percent],[end_percent]
- * Default: --ucache 1.0,0.15,0.95
- */
-
 struct UCacheConfig {
     bool enabled          = false;
-    float reuse_threshold = 1.0f;   // Threshold for accumulated predicted change
-    float start_percent   = 0.15f;  // Start caching at 15% through denoising
-    float end_percent     = 0.95f;  // Stop caching at 95% through denoising
+    float reuse_threshold = 1.0f;
+    float start_percent   = 0.15f;
+    float end_percent     = 0.95f;
 };
 
 struct UCacheCacheEntry {
-    std::vector<float> diff;  // cached (output - input) for reapplication
+    std::vector<float> diff;
 };
 
 struct UCacheState {

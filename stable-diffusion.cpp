@@ -1526,7 +1526,6 @@ public:
             }
         }
 
-        // UCache initialization for UNET models
         UCacheState ucache_state;
         bool ucache_enabled = false;
         if (ucache_params != nullptr && ucache_params->enabled) {
@@ -1666,7 +1665,6 @@ public:
                 return easycache_step_active && easycache_state.is_step_skipped();
             };
 
-            // UCache hooks for UNET models
             const bool ucache_step_active = ucache_enabled && step > 0;
             int ucache_step_index         = ucache_step_active ? (step - 1) : -1;
             if (ucache_step_active) {
@@ -1697,7 +1695,6 @@ public:
                 return ucache_step_active && ucache_state.is_step_skipped();
             };
 
-            // Unified cache hooks - use easycache for DiT, ucache for UNET
             auto cache_before_condition = [&](const SDCondition* condition, struct ggml_tensor* output_tensor) -> bool {
                 if (easycache_step_active) {
                     return easycache_before_condition(condition, output_tensor);
@@ -2595,7 +2592,7 @@ void sd_easycache_params_init(sd_easycache_params_t* easycache_params) {
 void sd_ucache_params_init(sd_ucache_params_t* ucache_params) {
     *ucache_params                 = {};
     ucache_params->enabled         = false;
-    ucache_params->reuse_threshold = 1.0f;   // Higher threshold for UNET (different from DiT's 0.2)
+    ucache_params->reuse_threshold = 1.0f;
     ucache_params->start_percent   = 0.15f;
     ucache_params->end_percent     = 0.95f;
 }
