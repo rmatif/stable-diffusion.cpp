@@ -3995,11 +3995,22 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
     }
 
     if (vae_changed) {
-        if (!sd_reload_vae(state.ctx,
-                          desired.vae_path.c_str(),
-                          desired.vae_conv_direct)) {
-            error_message = "failed to reload VAE";
-            return false;
+        bool skip_vae_reload = desired.vae_path.empty() &&
+                               (state.ctx_model_version == SD_MODEL_VERSION_SD1 ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SD1_INPAINT ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SD1_PIX2PIX ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SD2 ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SD2_INPAINT ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SDXL ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SDXL_INPAINT ||
+                                state.ctx_model_version == SD_MODEL_VERSION_SDXL_PIX2PIX);
+        if (!skip_vae_reload) {
+            if (!sd_reload_vae(state.ctx,
+                              desired.vae_path.c_str(),
+                              desired.vae_conv_direct)) {
+                error_message = "failed to reload VAE";
+                return false;
+            }
         }
     }
 
