@@ -639,7 +639,6 @@ struct CLIOptions {
     std::string vae_path;
     std::string taesd_path;
     std::string control_net_path;
-    std::string lora_model_dir;
     std::string embedding_dir;
     std::string photo_maker_path;
     int port = 8000;
@@ -796,12 +795,6 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 return false;
             }
             options.control_net_path = argv[++i];
-        } else if (arg == "--lora-model-dir") {
-            if (i + 1 >= argc) {
-                error = "missing value for --lora-model-dir";
-                return false;
-            }
-            options.lora_model_dir = argv[++i];
         } else if (arg == "--embd-dir") {
             if (i + 1 >= argc) {
                 error = "missing value for --embd-dir";
@@ -1034,7 +1027,6 @@ struct CtxConfig {
     std::string vae_path;
     std::string taesd_path;
     std::string control_net_path;
-    std::string lora_model_dir;
     std::string embedding_dir;
     std::string photo_maker_path;
     bool vae_decode_only = true;
@@ -1070,7 +1062,6 @@ struct CtxConfig {
                vae_path == other.vae_path &&
                taesd_path == other.taesd_path &&
                control_net_path == other.control_net_path &&
-               lora_model_dir == other.lora_model_dir &&
                embedding_dir == other.embedding_dir &&
                photo_maker_path == other.photo_maker_path &&
                vae_decode_only == other.vae_decode_only &&
@@ -1111,7 +1102,6 @@ struct CtxConfig {
         params.vae_path                        = vae_path.c_str();
         params.taesd_path                      = taesd_path.c_str();
         params.control_net_path                = control_net_path.c_str();
-        params.lora_model_dir                  = lora_model_dir.c_str();
         params.photo_maker_path                = photo_maker_path.c_str();
         params.vae_decode_only                 = vae_decode_only;
         params.free_params_immediately         = free_params_immediately;
@@ -1749,7 +1739,6 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_string("vae_path", config.vae_path) ||
         !assign_string("taesd_path", config.taesd_path) ||
         !assign_string("control_net_path", config.control_net_path) ||
-        !assign_string("lora_model_dir", config.lora_model_dir) ||
         !assign_string("embedding_dir", config.embedding_dir) ||
         !assign_string("photo_maker_path", config.photo_maker_path)) {
         return false;
@@ -3948,7 +3937,6 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.free_params_immediately != desired.free_params_immediately ||
                current.taesd_path != desired.taesd_path ||
                current.control_net_path != desired.control_net_path ||
-               current.lora_model_dir != desired.lora_model_dir ||
                current.embedding_dir != desired.embedding_dir ||
                current.photo_maker_path != desired.photo_maker_path ||
                current.clip_vision_path != desired.clip_vision_path ||
@@ -4139,7 +4127,6 @@ int main(int argc, char** argv) {
     state.ctx_config.vae_path = options.vae_path;
     state.ctx_config.taesd_path = options.taesd_path;
     state.ctx_config.control_net_path = options.control_net_path;
-    state.ctx_config.lora_model_dir = options.lora_model_dir;
     state.ctx_config.embedding_dir = options.embedding_dir;
     state.ctx_config.photo_maker_path = options.photo_maker_path;
     state.ctx_config.vae_decode_only = true;
