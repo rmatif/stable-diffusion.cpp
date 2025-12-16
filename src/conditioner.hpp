@@ -62,6 +62,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> text_model2;
 
     std::string trigger_word = "img";  // should be user settable
+    std::map<std::string, std::string> embedding_map;
     std::string embd_dir;
     int32_t num_custom_embeddings   = 0;
     int32_t num_custom_embeddings_2 = 0;
@@ -71,11 +72,17 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
                                       bool offload_params_to_cpu,
                                       const String2TensorStorage& tensor_storage_map,
-                                      const std::string& embd_dir,
+                                      const std::map<std::string, std::string>& orig_embedding_map,
                                       SDVersion version = VERSION_SD1,
                                       PMVersion pv      = PM_VERSION_1)
-        : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407), embd_dir(embd_dir) {
-        bool force_clip_f32 = true;
+        : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407) {
+        for (const auto& kv : orig_embedding_map) {
+            std::string name = kv.first;
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            embedding_map[name] = kv.second;
+            tokenizer.add_special_token(name);
+        }
+        bool force_clip_f32 = !embedding_map.empty();
         if (sd_version_is_sd1(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
         } else if (sd_version_is_sd2(version)) {
@@ -86,7 +93,18 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         }
     }
 
+    void set_embedding_dir(const std::string& dir) {
+        embd_dir = dir;
+    }
+
     std::string resolve_embedding_path(const std::string& embd_name) {
+        std::string lower_name = embd_name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char c) { return std::tolower(c); });
+        auto iter = embedding_map.find(lower_name);
+        if (iter != embedding_map.end()) {
+            return iter->second;
+        }
+
         bool is_path = contains(embd_name, "/") || contains(embd_name, "\\");
         if (is_path) {
             if (file_exists(embd_name)) {
@@ -98,13 +116,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             } else if (file_exists(embd_name + ".ckpt")) {
                 return embd_name + ".ckpt";
             }
-        } else {
-            std::string path = get_full_path(embd_dir, embd_name + ".pt");
-            if (path.size() > 0) return path;
-            path = get_full_path(embd_dir, embd_name + ".ckpt");
-            if (path.size() > 0) return path;
-            path = get_full_path(embd_dir, embd_name + ".safetensors");
-            if (path.size() > 0) return path;
+        } else if (!embd_dir.empty()) {
+            std::string path = path_join(embd_dir, embd_name + ".pt");
+            if (file_exists(path)) return path;
+            path = path_join(embd_dir, embd_name + ".ckpt");
+            if (file_exists(path)) return path;
+            path = path_join(embd_dir, embd_name + ".safetensors");
+            if (file_exists(path)) return path;
         }
         return "";
     }
@@ -197,26 +215,24 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         int pos_start = num_custom_embeddings;
         if (embd) {
             int64_t hidden_size = text_model->model.hidden_size;
-            token_embed_custom_1.resize(token_embed_custom_1.size() + ggml_nbytes(embd));
-            memcpy((void*)(token_embed_custom_1.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
+            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd));
+            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
                    embd->data,
                    ggml_nbytes(embd));
             for (int i = 0; i < embd->ne[1]; i++) {
                 bpe_tokens.push_back(text_model->model.vocab_size + num_custom_embeddings);
-                // LOG_DEBUG("new custom token: %i", text_model.vocab_size + num_custom_embeddings);
                 num_custom_embeddings++;
             }
             LOG_DEBUG("embedding '%s' applied, custom embeddings: %i", embd_name.c_str(), num_custom_embeddings);
         }
         if (embd2) {
             int64_t hidden_size = text_model2->model.hidden_size;
-            token_embed_custom_2.resize(token_embed_custom_2.size() + ggml_nbytes(embd2));
-            memcpy((void*)(token_embed_custom_2.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
+            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd2));
+            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
                    embd2->data,
                    ggml_nbytes(embd2));
             for (int i = 0; i < embd2->ne[1]; i++) {
                 bpe_tokens.push_back(text_model2->model.vocab_size + num_custom_embeddings_2);
-                // LOG_DEBUG("new custom token: %i", text_model.vocab_size + num_custom_embeddings);
                 num_custom_embeddings_2++;
             }
             LOG_DEBUG("embedding '%s' applied, custom embeddings: %i (text model 2)", embd_name.c_str(), num_custom_embeddings_2);
@@ -664,7 +680,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                 text_model->compute(n_threads,
                                     input_ids,
                                     num_custom_embeddings,
-                                    token_embed_custom_1.data(),
+                                    token_embed_custom.data(),
                                     max_token_idx,
                                     false,
                                     clip_skip,
@@ -674,19 +690,18 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                     text_model2->compute(n_threads,
                                          input_ids2,
                                          num_custom_embeddings,
-                                         token_embed_custom_2.data(),
+                                         token_embed_custom.data(),
                                          max_token_idx,
                                          false,
                                          clip_skip,
                                          &chunk_hidden_states2, work_ctx);
-                    // concat
                     chunk_hidden_states = ggml_ext_tensor_concat(work_ctx, chunk_hidden_states1, chunk_hidden_states2, 0);
 
                     if (chunk_idx == 0) {
                         text_model2->compute(n_threads,
                                              input_ids2,
                                              num_custom_embeddings,
-                                             token_embed_custom_2.data(),
+                                             token_embed_custom.data(),
                                              max_token_idx,
                                              true,
                                              clip_skip,
