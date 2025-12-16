@@ -1455,6 +1455,20 @@ class StreamingImageResponder {
         }
         sample_params.shifted_timestep = request_.shifted_timestep;
 
+        std::vector<sd_lora_t> loras;
+        if (!request_.lora_paths.empty()) {
+            loras.reserve(request_.lora_paths.size());
+            for (size_t i = 0; i < request_.lora_paths.size(); ++i) {
+                sd_lora_t lora;
+                lora.path = request_.lora_paths[i].c_str();
+                lora.multiplier = request_.lora_weights[i];
+                lora.is_high_noise = false;
+                loras.push_back(lora);
+            }
+            params.loras = loras.data();
+            params.lora_count = static_cast<uint32_t>(loras.size());
+        }
+
         sd_image_t* results = generate_image(state_.ctx, &params);
         if (results == nullptr) {
             emit_error(sink, "image generation failed", index);
@@ -1916,10 +1930,6 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
                 return false;
             }
             request.lora_weights.push_back(weight);
-        }
-
-        for (size_t i = 0; i < request.lora_paths.size(); ++i) {
-            request.prompt += "<lora:" + request.lora_paths[i] + ":" + weight_tokens[i] + ">";
         }
     }
 
