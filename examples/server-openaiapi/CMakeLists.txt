@@ -1,4 +1,4 @@
-set(TARGET sd-server)
+set(TARGET sd-server-openaiapi)
 
 add_executable(${TARGET} main.cpp)
 install(TARGETS ${TARGET} RUNTIME)

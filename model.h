@@ -170,6 +170,7 @@ struct TensorStorage {
     std::string name;
     ggml_type type          = GGML_TYPE_F32;
     ggml_type expected_type = GGML_TYPE_COUNT;
+    bool is_bf16            = false;
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
     bool is_f64             = false;
@@ -210,7 +211,7 @@ struct TensorStorage {
     }
 
     int64_t nbytes_to_read() const {
-        if (is_f8_e4m3 || is_f8_e5m2) {
+        if (is_bf16 || is_f8_e4m3 || is_f8_e5m2) {
             return nbytes() / 2;
         } else if (is_f64 || is_i64) {
             return nbytes() * 2;
