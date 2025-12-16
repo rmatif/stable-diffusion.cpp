@@ -659,7 +659,7 @@ struct CLIOptions {
     float flow_shift = std::numeric_limits<float>::infinity();
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
-    prediction_t prediction = DEFAULT_PRED;
+    prediction_t prediction = EPS_PRED;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
     bool easycache_provided = false;
     sd_easycache_params_t easycache_params = {false, 0.2f, 0.15f, 0.95f};
@@ -1054,7 +1054,7 @@ struct CtxConfig {
     bool chroma_use_t5_mask = false;
     int chroma_t5_mask_pad = 1;
     float flow_shift = std::numeric_limits<float>::infinity();
-    prediction_t prediction = DEFAULT_PRED;
+    prediction_t prediction = EPS_PRED;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
 
     bool operator==(const CtxConfig& other) const {
@@ -1112,7 +1112,6 @@ struct CtxConfig {
         params.taesd_path                      = taesd_path.c_str();
         params.control_net_path                = control_net_path.c_str();
         params.lora_model_dir                  = lora_model_dir.c_str();
-        params.embedding_dir                   = embedding_dir.c_str();
         params.photo_maker_path                = photo_maker_path.c_str();
         params.vae_decode_only                 = vae_decode_only;
         params.free_params_immediately         = free_params_immediately;
@@ -4349,7 +4348,8 @@ int main(int argc, char** argv) {
         upscaler_ctx_t* raw_ctx = new_upscaler_ctx(request.model_path.c_str(),
                                                    execution_config.offload_params_to_cpu,
                                                    execution_config.diffusion_conv_direct,
-                                                   execution_config.n_threads);
+                                                   execution_config.n_threads,
+                                                   0);
         if (raw_ctx == nullptr) {
             auto response = make_error_response("failed to load upscaler model", collector);
             res.status = 500;

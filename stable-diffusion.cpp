@@ -1336,7 +1336,7 @@ public:
         } else if (sd_version_is_qwen_image(version) || sd_version_is_flux2(version)) {
             cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version);
         } else {
-            cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "", version);
+            cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), std::map<std::string, std::string>{}, version);
         }
 
         cond_stage_model->alloc_params_buffer();
