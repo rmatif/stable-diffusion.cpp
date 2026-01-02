@@ -704,7 +704,7 @@ struct CLIOptions {
     float flow_shift = std::numeric_limits<float>::infinity();
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
-    prediction_t prediction = EPS_PRED;
+    prediction_t prediction = PREDICTION_COUNT;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
     bool cache_provided = false;
     sd_cache_params_t cache_params = make_cache_defaults();
@@ -736,7 +736,7 @@ void print_usage() {
         << "  -t, --threads <n>                       Number of CPU threads (-1 auto)\n"
         << "      --type <format>                     Weight type override (e.g. f16, q8_0)\n"
         << "      --rng <type>                        RNG, one of [std_default, cuda]\n"
-        << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow]\n"
+        << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow, flux2_flow] (default: auto)\n"
         << "      --lora-apply-mode <mode>            LoRA apply mode [auto, immediately, at_runtime] (default: immediately)\n"
         << "      --flow-shift <value>                Flow model shift override\n"
         << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
@@ -1164,7 +1164,7 @@ struct CtxConfig {
     bool chroma_use_t5_mask = false;
     int chroma_t5_mask_pad = 1;
     float flow_shift = std::numeric_limits<float>::infinity();
-    prediction_t prediction = EPS_PRED;
+    prediction_t prediction = PREDICTION_COUNT;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_IMMEDIATELY;
 
     bool operator==(const CtxConfig& other) const {
