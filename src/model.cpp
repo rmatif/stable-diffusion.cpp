@@ -662,61 +662,6 @@ static std::string convert_tensor_name(std::string name) {
         if (pos != std::string::npos) {
             new_name = name.substr(pos + 1);
         }
-    } else if (starts_with(name, "lora_")) {  // for lora
-        size_t pos = name.find('.');
-        if (pos != std::string::npos) {
-            std::string name_without_network_parts = name.substr(5, pos - 5);
-            std::string network_part               = name.substr(pos + 1);
-
-            // LOG_DEBUG("%s %s", name_without_network_parts.c_str(), network_part.c_str());
-            std::string new_key = convert_diffusers_name_to_compvis(name_without_network_parts, '_');
-            /* For dealing with the new SDXL LoRA tensor naming convention */
-            new_key = convert_sdxl_lora_name(new_key);
-
-            if (new_key.empty()) {
-                new_name = name;
-            } else {
-                new_name = "lora." + new_key + "." + network_part;
-            }
-        } else {
-            new_name = name;
-        }
-    } else if (ends_with(name, ".diff") || ends_with(name, ".diff_b")) {
-        new_name = "lora." + name;
-    } else if (contains(name, "lora_up") || contains(name, "lora_down") ||
-               contains(name, "lora.up") || contains(name, "lora.down") ||
-               contains(name, "lora_linear") || ends_with(name, ".alpha")) {
-        size_t pos = new_name.find(".processor");
-        if (pos != std::string::npos) {
-            new_name.replace(pos, strlen(".processor"), "");
-        }
-        // if (starts_with(new_name, "transformer.transformer_blocks") || starts_with(new_name, "transformer.single_transformer_blocks")) {
-        //     new_name = "model.diffusion_model." + new_name;
-        // }
-        if (ends_with(name, ".alpha")) {
-            pos = new_name.rfind("alpha");
-        } else {
-            pos = new_name.rfind("lora");
-        }
-        if (pos != std::string::npos) {
-            std::string name_without_network_parts = new_name.substr(0, pos - 1);
-            std::string network_part               = new_name.substr(pos);
-            // LOG_DEBUG("%s %s", name_without_network_parts.c_str(), network_part.c_str());
-            std::string new_key = convert_diffusers_name_to_compvis(name_without_network_parts, '.');
-            new_key             = convert_sdxl_lora_name(new_key);
-            replace_all_chars(new_key, '.', '_');
-            size_t npos = network_part.rfind("_linear_layer");
-            if (npos != std::string::npos) {
-                network_part.replace(npos, strlen("_linear_layer"), "");
-            }
-            if (starts_with(network_part, "lora.")) {
-                network_part = "lora_" + network_part.substr(5);
-            }
-            if (new_key.size() > 0) {
-                new_name = "lora." + new_key + "." + network_part;
-            }
-            // LOG_DEBUG("new name: %s", new_name.c_str());
-        }
     } else if (starts_with(name, "unet") || starts_with(name, "vae") || starts_with(name, "te")) {  // for diffuser
         size_t pos = name.find_last_of('.');
         if (pos != std::string::npos) {

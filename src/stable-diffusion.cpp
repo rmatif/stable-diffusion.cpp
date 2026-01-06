@@ -1794,36 +1794,32 @@ public:
     std::shared_ptr<LoraModel> load_lora_model_from_file(const std::string& lora_id,
                                                          float multiplier,
                                                          ggml_backend_t backend,
-                                                         LoraModel::filter_t lora_tensor_filter = nullptr,
-                                                         bool convert_names                    = false) {
-        std::string lora_name      = lora_id;
-        std::string high_noise_tag = "|high_noise|";
-        bool is_high_noise         = false;
-        if (starts_with(lora_name, high_noise_tag)) {
-            lora_name     = lora_name.substr(high_noise_tag.size());
+                                                         LoraModel::filter_t lora_tensor_filter = nullptr) {
+        std::string lora_path             = lora_id;
+        static std::string high_noise_tag = "|high_noise|";
+        bool is_high_noise                = false;
+        if (starts_with(lora_path, high_noise_tag)) {
+            lora_path     = lora_path.substr(high_noise_tag.size());
             is_high_noise = true;
-            LOG_DEBUG("high noise lora: %s", lora_name.c_str());
+            LOG_DEBUG("high noise lora: %s", lora_path.c_str());
         }
-        std::string st_file_path   = lora_name + ".safetensors";
-        std::string ckpt_file_path = lora_name + ".ckpt";
+
+        std::string st_file_path   = lora_path + ".safetensors";
+        std::string ckpt_file_path = lora_path + ".ckpt";
         std::string file_path;
 
-        if (file_exists(lora_name)) {
-            file_path = lora_name;
+        if (file_exists(lora_path)) {
+            file_path = lora_path;
         } else if (file_exists(st_file_path)) {
             file_path = st_file_path;
         } else if (file_exists(ckpt_file_path)) {
             file_path = ckpt_file_path;
         } else {
-            LOG_WARN("can not find lora file %s, %s or %s", lora_name.c_str(), st_file_path.c_str(), ckpt_file_path.c_str());
+            LOG_WARN("can not find lora file %s, %s or %s", lora_path.c_str(), st_file_path.c_str(), ckpt_file_path.c_str());
             return nullptr;
         }
-        auto lora = std::make_shared<LoraModel>(lora_id,
-                                                backend,
-                                                file_path,
-                                                is_high_noise ? "model.high_noise_" : "",
-                                                version,
-                                                convert_names);
+
+        auto lora = std::make_shared<LoraModel>(lora_id, backend, file_path, is_high_noise ? "model.high_noise_" : "", version);
         if (!lora->load_from_file(n_threads, lora_tensor_filter)) {
             LOG_WARN("load lora tensors from %s failed", file_path.c_str());
             return nullptr;
@@ -1894,6 +1890,18 @@ public:
             first_stage_model->set_weight_adapter(nullptr);
         }
         if (lora_state.empty()) {
+            if (cond_stage_model) {
+                cond_stage_model->set_weight_adapter(nullptr);
+            }
+            if (diffusion_model) {
+                diffusion_model->set_weight_adapter(nullptr);
+            }
+            if (high_noise_diffusion_model) {
+                high_noise_diffusion_model->set_weight_adapter(nullptr);
+            }
+            if (first_stage_model) {
+                first_stage_model->set_weight_adapter(nullptr);
+            }
             return;
         }
         LOG_INFO("apply lora at runtime");
@@ -1920,7 +1928,7 @@ public:
                 const std::string& lora_id = kv.first;
                 float multiplier           = kv.second;
 
-                auto lora = load_lora_model_from_file(lora_id, multiplier, clip_backend, lora_tensor_filter, true);
+                auto lora = load_lora_model_from_file(lora_id, multiplier, clip_backend, lora_tensor_filter);
                 if (lora && !lora->lora_tensors.empty()) {
                     lora->preprocess_lora_tensors(tensors);
                     cond_stage_lora_models.push_back(lora);
@@ -1952,7 +1960,7 @@ public:
                 const std::string& lora_name = kv.first;
                 float multiplier             = kv.second;
 
-                auto lora = load_lora_model_from_file(lora_name, multiplier, backend, lora_tensor_filter, true);
+                auto lora = load_lora_model_from_file(lora_name, multiplier, backend, lora_tensor_filter);
                 if (lora && !lora->lora_tensors.empty()) {
                     lora->preprocess_lora_tensors(tensors);
                     diffusion_lora_models.push_back(lora);
@@ -1988,7 +1996,7 @@ public:
                 const std::string& lora_name = kv.first;
                 float multiplier             = kv.second;
 
-                auto lora = load_lora_model_from_file(lora_name, multiplier, vae_backend, lora_tensor_filter, true);
+                auto lora = load_lora_model_from_file(lora_name, multiplier, vae_backend, lora_tensor_filter);
                 if (lora && !lora->lora_tensors.empty()) {
                     lora->preprocess_lora_tensors(tensors);
                     first_stage_lora_models.push_back(lora);
