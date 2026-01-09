@@ -89,6 +89,42 @@ std::vector<std::string> split_and_trim(const std::string& input, char delimiter
     return parts;
 }
 
+std::string trim_trailing_separators(const std::string& input) {
+    std::string trimmed = input;
+    while (!trimmed.empty()) {
+        char tail = trimmed.back();
+        if (tail == '/' || tail == '\\') {
+            trimmed.pop_back();
+        } else {
+            break;
+        }
+    }
+    return trimmed;
+}
+
+bool has_trailing_separator(const std::string& input) {
+    return !input.empty() && (input.back() == '/' || input.back() == '\\');
+}
+
+std::string default_convert_output_path(const std::string& input_path, const std::string& qtype) {
+    std::string trimmed = trim_trailing_separators(input_path);
+    fs::path input_fs = trimmed.empty() ? fs::path(input_path) : fs::path(trimmed);
+    fs::path parent = input_fs.parent_path();
+    std::string stem;
+    if (!input_fs.filename().empty()) {
+        stem = input_fs.stem().string();
+        if (stem.empty()) {
+            stem = input_fs.filename().string();
+        }
+    }
+    if (stem.empty()) {
+        stem = "model";
+    }
+    std::string type_label = qtype.empty() ? "unknown" : qtype;
+    fs::path output = parent / (stem + "_" + type_label + ".gguf");
+    return output.string();
+}
+
 int64_t generate_random_seed() {
     std::random_device rd;
     uint64_t high = static_cast<uint64_t>(rd()) << 32u;
@@ -1354,6 +1390,16 @@ struct UpscaleRequest {
     int height = 0;
     int repeats = 1;
     OwnedImage input_image;
+};
+
+struct ConvertRequest {
+    std::string model_path;
+    std::string vae_path;
+    std::string output_path;
+    std::string tensor_type_rules;
+    std::string qtype;
+    sd_type_t output_type = SD_TYPE_COUNT;
+    bool convert_name = false;
 };
 
 struct UpscaleTelemetryData {
@@ -3314,6 +3360,129 @@ bool parse_upscale_request(const json& body, UpscaleRequest& request, std::strin
     return true;
 }
 
+bool parse_convert_request(const json& body, ConvertRequest& request, std::string& error) {
+    request = ConvertRequest();
+
+    auto model_it = body.find("model_path");
+    if (model_it == body.end()) {
+        model_it = body.find("model");
+    }
+    if (model_it == body.end()) {
+        model_it = body.find("input_path");
+    }
+    if (model_it == body.end()) {
+        error = "field 'model_path' is required";
+        return false;
+    }
+    if (!model_it->is_string()) {
+        error = "field 'model_path' must be a string";
+        return false;
+    }
+    request.model_path = trim_copy(model_it->get<std::string>());
+    if (request.model_path.empty()) {
+        error = "field 'model_path' must not be empty";
+        return false;
+    }
+
+    auto vae_it = body.find("vae_path");
+    if (vae_it != body.end()) {
+        if (!vae_it->is_string()) {
+            error = "field 'vae_path' must be a string";
+            return false;
+        }
+        request.vae_path = trim_copy(vae_it->get<std::string>());
+        if (request.vae_path.empty()) {
+            error = "field 'vae_path' must not be empty";
+            return false;
+        }
+    }
+
+    auto qtype_it = body.find("qtype");
+    if (qtype_it == body.end()) {
+        qtype_it = body.find("type");
+    }
+    if (qtype_it == body.end()) {
+        qtype_it = body.find("wtype");
+    }
+    if (qtype_it == body.end()) {
+        error = "field 'qtype' is required";
+        return false;
+    }
+    if (!qtype_it->is_string()) {
+        error = "field 'qtype' must be a string";
+        return false;
+    }
+    std::string qtype_value = to_lower_copy(trim_copy(qtype_it->get<std::string>()));
+    if (qtype_value.empty()) {
+        error = "field 'qtype' must not be empty";
+        return false;
+    }
+    sd_type_t output_type = str_to_sd_type(qtype_value.c_str());
+    if (output_type == SD_TYPE_COUNT) {
+        error = "invalid qtype value";
+        return false;
+    }
+    request.output_type = output_type;
+    request.qtype = sd_type_name(output_type);
+
+    auto output_it = body.find("output");
+    if (output_it == body.end()) {
+        output_it = body.find("output_path");
+    }
+    if (output_it != body.end()) {
+        if (!output_it->is_string()) {
+            error = "field 'output' must be a string";
+            return false;
+        }
+        std::string output_value = trim_copy(output_it->get<std::string>());
+        if (output_value.empty()) {
+            error = "field 'output' must not be empty";
+            return false;
+        }
+        bool treat_as_dir = has_trailing_separator(output_value);
+        if (!treat_as_dir) {
+            std::error_code ec;
+            if (fs::exists(output_value, ec) && fs::is_directory(output_value, ec)) {
+                treat_as_dir = true;
+            }
+        }
+        if (treat_as_dir) {
+            fs::path output_dir = fs::path(output_value);
+            fs::path output_file = output_dir / fs::path(default_convert_output_path(request.model_path, request.qtype)).filename();
+            request.output_path = output_file.string();
+        } else {
+            request.output_path = std::move(output_value);
+        }
+    }
+
+    auto rules_it = body.find("tensor_type_rules");
+    if (rules_it == body.end()) {
+        rules_it = body.find("tensor-type-rules");
+    }
+    if (rules_it != body.end()) {
+        if (!rules_it->is_string()) {
+            error = "field 'tensor_type_rules' must be a string";
+            return false;
+        }
+        request.tensor_type_rules = trim_copy(rules_it->get<std::string>());
+    }
+
+    auto convert_name_it = body.find("convert_name");
+    if (convert_name_it != body.end()) {
+        if (!convert_name_it->is_boolean()) {
+            error = "field 'convert_name' must be a boolean";
+            return false;
+        }
+        request.convert_name = convert_name_it->get<bool>();
+    }
+
+    if (request.output_path.empty()) {
+        request.output_path = default_convert_output_path(request.model_path, request.qtype);
+    }
+
+    return true;
+}
+
 bool prepare_upscale_input(UpscaleRequest& request, std::string& error) {
     request.input_image = OwnedImage();
 
@@ -4259,6 +4428,118 @@ json make_telemetry(const LogCollector& collector,
 
     return telemetry;
 }
+
+json make_convert_telemetry(const LogCollector& collector,
+                            const ConvertRequest& request,
+                            int64_t elapsed_ms,
+                            int64_t output_bytes) {
+    double load_total_ms = 0.0;
+    int load_count = 0;
+    std::map<std::string, double> breakdown_total;
+
+    for (const auto& entry : collector.entries) {
+        const std::string& message = entry.message;
+        if (message.find("loading tensors completed") == std::string::npos) {
+            continue;
+        }
+        auto duration = extract_duration_ms(message);
+        if (duration) {
+            load_total_ms += *duration;
+            ++load_count;
+        }
+        auto breakdown = extract_duration_breakdown_ms(message);
+        for (const auto& kv : breakdown) {
+            breakdown_total[kv.first] += kv.second;
+        }
+    }
+
+    json summary = json::object();
+    summary["elapsed_ms"] = elapsed_ms;
+    summary["input_path"] = request.model_path;
+    summary["output_path"] = request.output_path;
+    summary["qtype"] = request.qtype;
+    if (!request.vae_path.empty()) {
+        summary["vae_path"] = request.vae_path;
+    }
+    if (!request.tensor_type_rules.empty()) {
+        summary["tensor_type_rules"] = request.tensor_type_rules;
+    }
+    if (request.convert_name) {
+        summary["convert_name"] = true;
+    }
+    if (output_bytes >= 0) {
+        summary["output_bytes"] = output_bytes;
+    }
+    if (load_count > 0) {
+        summary["load_tensors_ms"] = load_total_ms;
+        summary["load_tensors_count"] = load_count;
+        json breakdown_json = breakdown_to_json(breakdown_total);
+        if (!breakdown_json.empty()) {
+            summary["load_tensors_breakdown_ms"] = breakdown_json;
+        }
+    }
+
+    json span_attributes = json::object();
+    span_attributes["gen_ai.operation.name"] = "model.convert";
+    span_attributes["gen_ai.output.type"] = "gguf";
+    span_attributes["sdcpp.request.model_path"] = request.model_path;
+    span_attributes["sdcpp.request.output_path"] = request.output_path;
+    span_attributes["sdcpp.request.qtype"] = request.qtype;
+    if (!request.vae_path.empty()) {
+        span_attributes["sdcpp.request.vae_path"] = request.vae_path;
+    }
+    if (!request.tensor_type_rules.empty()) {
+        span_attributes["sdcpp.request.tensor_type_rules"] = request.tensor_type_rules;
+    }
+    if (request.convert_name) {
+        span_attributes["sdcpp.request.convert_name"] = true;
+    }
+    if (output_bytes >= 0) {
+        span_attributes["sdcpp.response.output_bytes"] = output_bytes;
+    }
+
+    json root_span = json::object();
+    root_span["name"] = "gen_ai.inference.model_conversion";
+    root_span["span_id"] = "span-0";
+    root_span["kind"] = "INTERNAL";
+    root_span["duration_ms"] = static_cast<double>(elapsed_ms);
+    root_span["attributes"] = span_attributes;
+
+    json subspans = json::array();
+    int span_index = 1;
+    auto add_span = [&](const std::string& name, double duration_ms, json attributes) {
+        if (duration_ms <= 0.0) {
+            return;
+        }
+        json span = json::object();
+        span["name"] = name;
+        span["span_id"] = "span-" + std::to_string(span_index++);
+        span["parent_span_id"] = "span-0";
+        span["kind"] = "INTERNAL";
+        span["duration_ms"] = duration_ms;
+        if (!attributes.empty()) {
+            span["attributes"] = std::move(attributes);
+        }
+        subspans.push_back(std::move(span));
+    };
+
+    if (load_count > 0) {
+        json attrs;
+        attrs["gen_ai.operation.stage"] = "model.load";
+        add_span("gen_ai.model.load", load_total_ms, std::move(attrs));
+    }
+    if (!subspans.empty()) {
+        root_span["subspans"] = std::move(subspans);
+    }
+
+    json telemetry = json::object();
+    telemetry["summary"] = std::move(summary);
+    json spans = json::array();
+    spans.push_back(std::move(root_span));
+    telemetry["spans"] = std::move(spans);
+    return telemetry;
+}
+
 json make_upscale_telemetry(const UpscaleRequest& request,
                             const CtxConfig& config,
                             int64_t elapsed_ms,
@@ -5006,6 +5287,80 @@ int main(int argc, char** argv) {
         response_body.append("\n]\n");
         res.status = 200;
         res.set_content(response_body, "application/json");
+    });
+
+    server.Post("/convert", [&](const httplib::Request& req, httplib::Response& res) {
+        LogCollector collector;
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception& ex) {
+            auto response = make_error_response(std::string("invalid JSON payload: ") + ex.what(), collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        ConvertRequest request;
+        std::string parse_error;
+        if (!parse_convert_request(body, request, parse_error)) {
+            auto response = make_error_response(parse_error, collector);
+            res.status = 400;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+        std::unique_ptr<LogCaptureScope> capture_scope = std::make_unique<LogCaptureScope>(state, collector);
+
+        bool success = convert(request.model_path.c_str(),
+                               request.vae_path.c_str(),
+                               request.output_path.c_str(),
+                               request.output_type,
+                               request.tensor_type_rules.c_str(),
+                               request.convert_name);
+
+        auto end_time = std::chrono::steady_clock::now();
+        int64_t elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        capture_scope.reset();
+
+        if (!success) {
+            auto response = make_error_response("convert failed", collector);
+            res.status = 500;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        int64_t output_bytes = -1;
+        if (!request.output_path.empty()) {
+            std::error_code ec;
+            auto size = fs::file_size(request.output_path, ec);
+            if (!ec) {
+                output_bytes = static_cast<int64_t>(size);
+            }
+        }
+
+        json response = json::object();
+        response["success"] = true;
+        response["model_path"] = request.model_path;
+        if (!request.vae_path.empty()) {
+            response["vae_path"] = request.vae_path;
+        }
+        response["output_path"] = request.output_path;
+        response["qtype"] = request.qtype;
+        if (!request.tensor_type_rules.empty()) {
+            response["tensor_type_rules"] = request.tensor_type_rules;
+        }
+        if (request.convert_name) {
+            response["convert_name"] = true;
+        }
+        response["elapsed_ms"] = elapsed_ms;
+        response["logs"] = logs_to_json(collector);
+        response["telemetry"] = make_convert_telemetry(collector, request, elapsed_ms, output_bytes);
+        res.status = 200;
+        res.set_content(response.dump(), "application/json");
     });
 
     server.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
