@@ -1780,19 +1780,13 @@ class StreamingImageResponder {
             array_opened_ = true;
         }
 
-        if (!first_object_) {
-            const char separator[] = ",\n";
-            if (!sink.write(separator, sizeof(separator) - 1)) {
-                return false;
-            }
-            sink.os.flush();
-        }
-
         std::string chunk = std::move(serialized);
         if (final_item) {
             chunk.append("\n]");
+            chunk.push_back('\n');
+        } else {
+            chunk.append(",\n");
         }
-        chunk.push_back('\n');
         bool ok = sink.write(chunk.data(), chunk.size());
         if (ok) {
             sink.os.flush();
@@ -3413,6 +3407,11 @@ bool parse_convert_request(const json& body, ConvertRequest& request, std::strin
         return false;
     }
     std::string qtype_value = to_lower_copy(trim_copy(qtype_it->get<std::string>()));
+    for (size_t i = 0; i + 1 < qtype_value.size(); ++i) {
+        if (qtype_value[i] == '_' && qtype_value[i + 1] == 'k') {
+            qtype_value[i + 1] = 'K';
+        }
+    }
     if (qtype_value.empty()) {
         error = "field 'qtype' must not be empty";
         return false;
