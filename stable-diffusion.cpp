@@ -90,6 +90,7 @@ static_assert(static_cast<int>(SD_MODEL_VERSION_SD1_TINY_UNET) == static_cast<in
 static_assert(static_cast<int>(SD_MODEL_VERSION_SD2) == static_cast<int>(VERSION_SD2), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SD2_INPAINT) == static_cast<int>(VERSION_SD2_INPAINT), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SD2_TINY_UNET) == static_cast<int>(VERSION_SD2_TINY_UNET), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXS) == static_cast<int>(VERSION_SDXS), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL) == static_cast<int>(VERSION_SDXL), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_INPAINT) == static_cast<int>(VERSION_SDXL_INPAINT), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_PIX2PIX) == static_cast<int>(VERSION_SDXL_PIX2PIX), "sd model version mismatch");
@@ -105,6 +106,9 @@ static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2) == static_cast<int>(VERSIO
 static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_I2V) == static_cast<int>(VERSION_WAN2_2_I2V), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_TI2V) == static_cast<int>(VERSION_WAN2_2_TI2V), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_QWEN_IMAGE) == static_cast<int>(VERSION_QWEN_IMAGE), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX2) == static_cast<int>(VERSION_FLUX2), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_Z_IMAGE) == static_cast<int>(VERSION_Z_IMAGE), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_OVIS_IMAGE) == static_cast<int>(VERSION_OVIS_IMAGE), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_COUNT) == static_cast<int>(VERSION_COUNT), "sd model version mismatch");
 struct WeightedConditionRef {
     size_t cond_index;
