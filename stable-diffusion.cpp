@@ -107,6 +107,7 @@ static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_I2V) == static_cast<int>(
 static_assert(static_cast<int>(SD_MODEL_VERSION_WAN2_2_TI2V) == static_cast<int>(VERSION_WAN2_2_TI2V), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_QWEN_IMAGE) == static_cast<int>(VERSION_QWEN_IMAGE), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX2) == static_cast<int>(VERSION_FLUX2), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_FLUX2_KLEIN) == static_cast<int>(VERSION_FLUX2_KLEIN), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_Z_IMAGE) == static_cast<int>(VERSION_Z_IMAGE), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_OVIS_IMAGE) == static_cast<int>(VERSION_OVIS_IMAGE), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_COUNT) == static_cast<int>(VERSION_COUNT), "sd model version mismatch");
@@ -1150,7 +1151,7 @@ public:
             high_noise_diffusion_model.reset();
         }
 
-        if (sd_version_is_flux(version)) {
+        if (sd_version_is_flux(version) || sd_version_is_flux2(version)) {
             diffusion_model = std::make_shared<FluxModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version, false);
         } else if (sd_version_is_wan(version)) {
             diffusion_model = std::make_shared<WanModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.diffusion_model", version);
@@ -1271,6 +1272,8 @@ public:
 
     bool reload_text_encoders(const char* clip_l_path, const char* clip_g_path, const char* t5xxl_path, const char* qwen2vl_path, const char* qwen2vl_vision_path) {
         LOG_INFO("reloading text encoders");
+        const char* llm_path        = qwen2vl_path;
+        const char* llm_vision_path = qwen2vl_vision_path;
 
         ModelLoader model_loader;
         bool is_unet = sd_version_is_unet(version);
@@ -1278,7 +1281,7 @@ public:
         if (strlen(SAFE_STR(clip_l_path)) > 0) {
             LOG_INFO("loading clip_l from '%s'", clip_l_path);
             std::string prefix = is_unet ? "cond_stage_model.transformer." : "text_encoders.clip_l.transformer.";
-            if (!model_loader.init_from_file(clip_l_path, prefix, n_threads)) {
+            if (!model_loader.init_from_file_and_convert_name(clip_l_path, prefix, version, n_threads)) {
                 LOG_ERROR("failed to load clip_l from '%s'", clip_l_path);
                 return false;
             }
@@ -1287,29 +1290,29 @@ public:
         if (strlen(SAFE_STR(clip_g_path)) > 0) {
             LOG_INFO("loading clip_g from '%s'", clip_g_path);
             std::string prefix = is_unet ? "cond_stage_model.1.transformer." : "text_encoders.clip_g.transformer.";
-            if (!model_loader.init_from_file(clip_g_path, prefix, n_threads)) {
+            if (!model_loader.init_from_file_and_convert_name(clip_g_path, prefix, version, n_threads)) {
                 LOG_WARN("failed to load clip_g from '%s'", clip_g_path);
             }
         }
 
         if (strlen(SAFE_STR(t5xxl_path)) > 0) {
             LOG_INFO("loading t5xxl from '%s'", t5xxl_path);
-            if (!model_loader.init_from_file(t5xxl_path, "text_encoders.t5xxl.transformer.", n_threads)) {
+            if (!model_loader.init_from_file_and_convert_name(t5xxl_path, "text_encoders.t5xxl.transformer.", version, n_threads)) {
                 LOG_WARN("failed to load t5xxl from '%s'", t5xxl_path);
             }
         }
 
-        if (strlen(SAFE_STR(qwen2vl_path)) > 0) {
-            LOG_INFO("loading qwen2vl from '%s'", qwen2vl_path);
-            if (!model_loader.init_from_file(qwen2vl_path, "text_encoders.qwen2vl.")) {
-                LOG_WARN("failed to load qwen2vl from '%s'", qwen2vl_path);
+        if (strlen(SAFE_STR(llm_path)) > 0) {
+            LOG_INFO("loading llm from '%s'", llm_path);
+            if (!model_loader.init_from_file_and_convert_name(llm_path, "text_encoders.llm.", version, n_threads)) {
+                LOG_WARN("failed to load llm from '%s'", llm_path);
             }
         }
 
-        if (strlen(SAFE_STR(qwen2vl_vision_path)) > 0) {
-            LOG_INFO("loading qwen2vl vision from '%s'", qwen2vl_vision_path);
-            if (!model_loader.init_from_file(qwen2vl_vision_path, "text_encoders.qwen2vl.visual.")) {
-                LOG_WARN("failed to load qwen2vl vision from '%s'", qwen2vl_vision_path);
+        if (strlen(SAFE_STR(llm_vision_path)) > 0) {
+            LOG_INFO("loading llm vision from '%s'", llm_vision_path);
+            if (!model_loader.init_from_file_and_convert_name(llm_vision_path, "text_encoders.llm.visual.", version, n_threads)) {
+                LOG_WARN("failed to load llm vision from '%s'", llm_vision_path);
             }
         }
 
