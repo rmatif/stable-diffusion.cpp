@@ -1389,6 +1389,7 @@ struct UpscaleRequest {
     int width = 0;
     int height = 0;
     int repeats = 1;
+    int tile_size = 128;
     OwnedImage input_image;
 };
 
@@ -3304,6 +3305,23 @@ bool parse_upscale_request(const json& body, UpscaleRequest& request, std::strin
         return false;
     }
 
+    auto tile_it = body.find("upscale_tile_size");
+    if (tile_it == body.end()) {
+        tile_it = body.find("tile_size");
+    }
+    if (tile_it != body.end()) {
+        if (!tile_it->is_number_integer()) {
+            error = "field 'upscale_tile_size' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(tile_it->get<int64_t>());
+        if (value < 1) {
+            error = "upscale_tile_size must be at least 1";
+            return false;
+        }
+        request.tile_size = value;
+    }
+
     auto init_path_it = body.find("init_image_path");
     if (init_path_it == body.end()) {
         init_path_it = body.find("init_image");
@@ -5125,11 +5143,15 @@ int main(int argc, char** argv) {
         auto start_time = std::chrono::steady_clock::now();
         UpscaleTelemetryData telemetry_data;
 
+        int upscaler_threads = execution_config.n_threads;
+        if (upscaler_threads <= 0) {
+            upscaler_threads = sd_get_num_physical_cores();
+        }
         upscaler_ctx_t* raw_ctx = new_upscaler_ctx(request.model_path.c_str(),
                                                    execution_config.offload_params_to_cpu,
                                                    execution_config.diffusion_conv_direct,
-                                                   execution_config.n_threads,
-                                                   0);
+                                                   upscaler_threads,
+                                                   request.tile_size);
         if (raw_ctx == nullptr) {
             auto response = make_error_response("failed to load upscaler model", collector);
             res.status = 500;
