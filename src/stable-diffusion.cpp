@@ -97,6 +97,7 @@ static_assert(static_cast<int>(SD_MODEL_VERSION_SDXS) == static_cast<int>(VERSIO
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL) == static_cast<int>(VERSION_SDXL), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_INPAINT) == static_cast<int>(VERSION_SDXL_INPAINT), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_PIX2PIX) == static_cast<int>(VERSION_SDXL_PIX2PIX), "sd model version mismatch");
+static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_VEGA) == static_cast<int>(VERSION_SDXL_VEGA), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SDXL_SSD1B) == static_cast<int>(VERSION_SDXL_SSD1B), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SVD) == static_cast<int>(VERSION_SVD), "sd model version mismatch");
 static_assert(static_cast<int>(SD_MODEL_VERSION_SD3) == static_cast<int>(VERSION_SD3), "sd model version mismatch");
