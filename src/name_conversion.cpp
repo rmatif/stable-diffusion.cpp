@@ -898,6 +898,7 @@ std::string convert_sep_to_dot(std::string name) {
         "wi_1",
         "norm1_context",
         "ff_context",
+        "feed_forward",
         "x_embedder",
     };
 
