@@ -1565,7 +1565,7 @@ public:
 
         if (diffusion_flash_attn) {
             LOG_INFO("Using flash attention in the diffusion model");
-            diffusion_model->set_flash_attn_enabled(true);
+            diffusion_model->set_flash_attention_enabled(true);
         }
 
         diffusion_model->alloc_params_buffer();

@@ -726,6 +726,7 @@ struct CLIOptions {
     int port = 8000;
     int n_threads = -1;
     bool verbose = false;
+    bool flash_attn = false;
     bool diffusion_flash_attn = false;
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
@@ -787,7 +788,8 @@ void print_usage() {
         << "      --vae-on-cpu                        Keep VAE on CPU\n"
         << "\n"
         << "Kernel options:\n"
-        << "      --diffusion-fa                      Enable flash attention in diffusion UNet\n"
+        << "      --fa                                 Enable flash attention\n"
+        << "      --diffusion-fa                      Enable flash attention in diffusion UNet only\n"
         << "      --diffusion-conv-direct             Use ggml_conv2d_direct for diffusion\n"
         << "      --vae-conv-direct                   Use ggml_conv2d_direct for VAE\n"
         << "      --force-sdxl-vae-conv-scale         Force conv scale for SDXL VAE\n"
@@ -1112,6 +1114,8 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
             }
         } else if (arg == "-v" || arg == "--verbose") {
             options.verbose = true;
+        } else if (arg == "--fa") {
+            options.flash_attn = true;
         } else if (arg == "--diffusion-fa") {
             options.diffusion_flash_attn = true;
         } else if (arg == "--diffusion-conv-direct") {
@@ -1192,6 +1196,7 @@ struct CtxConfig {
     bool keep_clip_on_cpu = false;
     bool keep_control_net_on_cpu = false;
     bool keep_vae_on_cpu = false;
+    bool flash_attn = false;
     bool diffusion_flash_attn = false;
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
@@ -1226,6 +1231,7 @@ struct CtxConfig {
                keep_clip_on_cpu == other.keep_clip_on_cpu &&
                keep_control_net_on_cpu == other.keep_control_net_on_cpu &&
                keep_vae_on_cpu == other.keep_vae_on_cpu &&
+               flash_attn == other.flash_attn &&
                diffusion_flash_attn == other.diffusion_flash_attn &&
                diffusion_conv_direct == other.diffusion_conv_direct &&
                vae_conv_direct == other.vae_conv_direct &&
@@ -1268,6 +1274,7 @@ struct CtxConfig {
         params.keep_clip_on_cpu        = keep_clip_on_cpu;
         params.keep_control_net_on_cpu = keep_control_net_on_cpu;
         params.keep_vae_on_cpu         = keep_vae_on_cpu;
+        params.flash_attn              = flash_attn;
         params.diffusion_flash_attn    = diffusion_flash_attn;
         params.diffusion_conv_direct   = diffusion_conv_direct;
         params.vae_conv_direct         = vae_conv_direct;
@@ -1920,6 +1927,7 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         !assign_bool("clip_on_cpu", config.keep_clip_on_cpu) ||
         !assign_bool("control_net_cpu", config.keep_control_net_on_cpu) ||
         !assign_bool("vae_on_cpu", config.keep_vae_on_cpu) ||
+        !assign_bool("flash_attn", config.flash_attn) ||
         !assign_bool("diffusion_flash_attn", config.diffusion_flash_attn) ||
         !assign_bool("diffusion_conv_direct", config.diffusion_conv_direct) ||
         !assign_bool("vae_conv_direct", config.vae_conv_direct) ||
@@ -4358,6 +4366,7 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.request.slg_layer_start"] = request.slg_layer_start;
     span_attributes["sdcpp.request.slg_layer_end"] = request.slg_layer_end;
     span_attributes["gen_ai.response.latency_ms"] = elapsed_ms;
+    span_attributes["sdcpp.context.flash_attn"] = config.flash_attn;
     span_attributes["sdcpp.context.diffusion_flash_attn"] = config.diffusion_flash_attn;
     span_attributes["sdcpp.context.diffusion_conv_direct"] = config.diffusion_conv_direct;
     span_attributes["sdcpp.context.vae_conv_direct"] = config.vae_conv_direct;
@@ -4736,6 +4745,7 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.keep_clip_on_cpu != desired.keep_clip_on_cpu ||
                current.keep_control_net_on_cpu != desired.keep_control_net_on_cpu ||
                current.keep_vae_on_cpu != desired.keep_vae_on_cpu ||
+               current.flash_attn != desired.flash_attn ||
                current.vae_decode_only != desired.vae_decode_only ||
                current.free_params_immediately != desired.free_params_immediately ||
                current.taesd_path != desired.taesd_path ||
@@ -4941,6 +4951,7 @@ int main(int argc, char** argv) {
     state.ctx_config.keep_control_net_on_cpu = options.control_net_cpu;
     state.ctx_config.keep_clip_on_cpu = options.clip_on_cpu;
     state.ctx_config.keep_vae_on_cpu = options.vae_on_cpu;
+    state.ctx_config.flash_attn = options.flash_attn;
     state.ctx_config.diffusion_flash_attn = options.diffusion_flash_attn;
     state.ctx_config.diffusion_conv_direct = options.diffusion_conv_direct;
     state.ctx_config.vae_conv_direct = options.vae_conv_direct;
