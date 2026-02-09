@@ -315,6 +315,13 @@ public:
             LOG_WARN("Failed to initialize Vulkan backend");
         }
 #endif
+#ifdef SD_USE_WEBGPU
+        LOG_DEBUG("Using WebGPU backend");
+        backend = ggml_backend_webgpu_init();
+        if (!backend) {
+            LOG_WARN("Failed to initialize WebGPU backend");
+        }
+#endif
 #ifdef SD_USE_OPENCL
         LOG_DEBUG("Using OpenCL backend");
         // ggml_log_set(ggml_log_callback_default, nullptr); // Optional ggml logs
