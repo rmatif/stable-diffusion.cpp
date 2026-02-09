@@ -23,6 +23,10 @@
 #include "latent-preview.h"
 #include "name_conversion.h"
 
+#ifdef SD_USE_WEBGPU
+#include "ggml-webgpu.h"
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
