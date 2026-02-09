@@ -89,6 +89,41 @@ cmake .. -DSD_VULKAN=ON
 cmake --build . --config Release
 ```
 
+## Build with WebGPU (experimental)
+
+This enables the `ggml` WebGPU backend through Dawn.
+
+Prerequisites:
+
+- Install/build Dawn so CMake can find `DawnConfig.cmake`.
+- Export `Dawn_DIR` or add Dawn to `CMAKE_PREFIX_PATH`.
+- On Linux, this project auto-detects Dawn at `/opt/dawn/current/lib64/cmake/Dawn`.
+
+Example install of Dawn prebuilt release (Linux):
+
+```shell
+DAWN_URL=$(curl -s https://api.github.com/repos/google/dawn/releases/latest | jq -r '.assets[] | select(.name|test("ubuntu-latest-Release")) | .browser_download_url')
+mkdir -p /tmp/dawn-prebuilt && cd /tmp/dawn-prebuilt
+curl -L --fail -o dawn-release.tar.gz "$DAWN_URL"
+tar -xzf dawn-release.tar.gz
+sudo mkdir -p /opt/dawn
+sudo rm -rf /opt/dawn/ubuntu-latest-release
+sudo cp -a Dawn-*-ubuntu-latest-Release /opt/dawn/ubuntu-latest-release
+sudo ln -sfn /opt/dawn/ubuntu-latest-release /opt/dawn/current
+```
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_WEBGPU=ON
+cmake --build . --config Release
+```
+
+Optional runtime selection hint on multi-GPU systems:
+
+```shell
+export GGML_WEBGPU_POWER_PREFERENCE=high   # default is high; use low/low-power for iGPU
+```
+
 ## Build with OpenCL (for Adreno GPU)
 
 Currently, it supports only Adreno GPUs and is primarily optimized for Q4_0 type

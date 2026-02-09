@@ -71,6 +71,7 @@ API and command-line option may change frequently.***
   - Metal
   - OpenCL
   - SYCL
+  - WebGPU (experimental)
 - Supported weight formats
   - Pytorch checkpoint (`.ckpt` or `.pth`)
   - Safetensors (`.safetensors`)
