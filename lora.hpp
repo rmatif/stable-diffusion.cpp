@@ -497,6 +497,14 @@ struct LoraModel : public GGMLRunner {
 
             GGML_ASSERT(ggml_nelements(diff) == ggml_nelements(model_tensor));
             diff = ggml_reshape(ctx, diff, model_tensor);
+
+            // WebGPU binary kernels currently require matching input/output dtypes.
+            // Since model weights are ultimately stored in model_tensor->type, casting
+            // the LoRA diff to that type preserves backend correctness.
+            if ((model_tensor->type == GGML_TYPE_F16 || model_tensor->type == GGML_TYPE_F32) &&
+                diff->type != model_tensor->type) {
+                diff = ggml_cast(ctx, diff, model_tensor->type);
+            }
         }
         return diff;
     }
