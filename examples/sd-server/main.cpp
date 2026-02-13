@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "stable-diffusion.h"
 #include "model.h"
 
@@ -46,6 +50,18 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 namespace {
+
+void release_allocator_pages() {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
+void configure_allocator() {
+#if defined(__GLIBC__)
+    mallopt(M_ARENA_MAX, 2);
+#endif
+}
 
 std::string to_lower_copy(const std::string& input) {
     std::string lowered = input;
@@ -4913,6 +4929,8 @@ json make_success_response(const json& images,
 
 }  // namespace
 int main(int argc, char** argv) {
+    configure_allocator();
+
     CLIOptions options;
     bool show_help = false;
     std::string error_message;
@@ -5406,6 +5424,7 @@ int main(int argc, char** argv) {
             free_sd_ctx(state.ctx);
             state.ctx = nullptr;
             state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
+            release_allocator_pages();
         }
         json response = {{"success", true}, {"message", "context released"}, {"model_path", state.ctx_config.model_path}};
         res.status = 200;
@@ -5422,6 +5441,7 @@ int main(int argc, char** argv) {
         free_sd_ctx(state.ctx);
         state.ctx = nullptr;
         state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
+        release_allocator_pages();
     }
 
     return 0;
