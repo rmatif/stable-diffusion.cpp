@@ -1906,7 +1906,7 @@ public:
     }
 
     virtual ~GGMLRunner() {
-        free_params_buffer();
+        free_params_buffer(true);
         free_compute_buffer();
         free_params_ctx();
         free_compute_ctx();
@@ -1951,7 +1951,22 @@ public:
         return true;
     }
 
-    void free_params_buffer() {
+    void free_params_buffer(bool force = false) {
+        if (!force) {
+            // Inference-time release:
+            // - if params are offloaded (params_backend != runtime_backend), drop only
+            //   the transient runtime copy and keep canonical params backend storage.
+            // - if params_backend == runtime_backend (e.g. keep weights on VRAM), keep
+            //   canonical weights resident to avoid stale tensor buffer metadata between
+            //   inferences and avoid expensive reloads.
+            if (params_backend != runtime_backend) {
+                offload_params_to_params_backend();
+            }
+            return;
+        }
+
+        // Teardown-time release: fully free canonical params storage.
+        offload_params_to_params_backend();
         if (params_buffer != nullptr) {
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
