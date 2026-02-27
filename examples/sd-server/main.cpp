@@ -747,6 +747,7 @@ struct CLIOptions {
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
     bool offload_params_to_cpu = false;
+    bool enable_mmap = false;
     bool control_net_cpu = false;
     bool clip_on_cpu = false;
     bool vae_on_cpu = false;
@@ -799,6 +800,7 @@ void print_usage() {
         << "\n"
         << "Device placement:\n"
         << "      --offload-to-cpu                    Offload model weights to CPU RAM\n"
+        << "      --mmap                              Memory-map model weights\n"
         << "      --control-net-cpu                   Keep ControlNet on CPU\n"
         << "      --clip-on-cpu                       Keep CLIP on CPU\n"
         << "      --vae-on-cpu                        Keep VAE on CPU\n"
@@ -1140,6 +1142,8 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
             options.vae_conv_direct = true;
         } else if (arg == "--offload-to-cpu") {
             options.offload_params_to_cpu = true;
+        } else if (arg == "--mmap") {
+            options.enable_mmap = true;
         } else if (arg == "--control-net-cpu") {
             options.control_net_cpu = true;
         } else if (arg == "--clip-on-cpu") {
@@ -1209,6 +1213,7 @@ struct CtxConfig {
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
     bool offload_params_to_cpu = false;
+    bool enable_mmap = false;
     bool keep_clip_on_cpu = false;
     bool keep_control_net_on_cpu = false;
     bool keep_vae_on_cpu = false;
@@ -1244,6 +1249,7 @@ struct CtxConfig {
                wtype == other.wtype &&
                rng_type == other.rng_type &&
                offload_params_to_cpu == other.offload_params_to_cpu &&
+               enable_mmap == other.enable_mmap &&
                keep_clip_on_cpu == other.keep_clip_on_cpu &&
                keep_control_net_on_cpu == other.keep_control_net_on_cpu &&
                keep_vae_on_cpu == other.keep_vae_on_cpu &&
@@ -1287,6 +1293,7 @@ struct CtxConfig {
         params.wtype                   = wtype;
         params.rng_type                = rng_type;
         params.offload_params_to_cpu   = offload_params_to_cpu;
+        params.enable_mmap             = enable_mmap;
         params.keep_clip_on_cpu        = keep_clip_on_cpu;
         params.keep_control_net_on_cpu = keep_control_net_on_cpu;
         params.keep_vae_on_cpu         = keep_vae_on_cpu;
@@ -1940,6 +1947,7 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
     if (!assign_bool("vae_decode_only", config.vae_decode_only) ||
         !assign_bool("free_params_immediately", config.free_params_immediately) ||
         !assign_bool("offload_params_to_cpu", config.offload_params_to_cpu) ||
+        !assign_bool("enable_mmap", config.enable_mmap) ||
         !assign_bool("clip_on_cpu", config.keep_clip_on_cpu) ||
         !assign_bool("control_net_cpu", config.keep_control_net_on_cpu) ||
         !assign_bool("vae_on_cpu", config.keep_vae_on_cpu) ||
@@ -4388,6 +4396,7 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.context.vae_conv_direct"] = config.vae_conv_direct;
     span_attributes["sdcpp.context.force_sdxl_vae_conv_scale"] = config.force_sdxl_vae_conv_scale;
     span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
+    span_attributes["sdcpp.context.enable_mmap"] = config.enable_mmap;
     span_attributes["sdcpp.context.keep_clip_on_cpu"] = config.keep_clip_on_cpu;
     span_attributes["sdcpp.context.keep_control_net_on_cpu"] = config.keep_control_net_on_cpu;
     span_attributes["sdcpp.context.keep_vae_on_cpu"] = config.keep_vae_on_cpu;
@@ -4758,6 +4767,7 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.wtype != desired.wtype ||
                current.rng_type != desired.rng_type ||
                current.offload_params_to_cpu != desired.offload_params_to_cpu ||
+               current.enable_mmap != desired.enable_mmap ||
                current.keep_clip_on_cpu != desired.keep_clip_on_cpu ||
                current.keep_control_net_on_cpu != desired.keep_control_net_on_cpu ||
                current.keep_vae_on_cpu != desired.keep_vae_on_cpu ||
@@ -4966,6 +4976,7 @@ int main(int argc, char** argv) {
     state.ctx_config.wtype = options.wtype;
     state.ctx_config.rng_type = options.rng_type;
     state.ctx_config.offload_params_to_cpu = options.offload_params_to_cpu;
+    state.ctx_config.enable_mmap = options.enable_mmap;
     state.ctx_config.keep_control_net_on_cpu = options.control_net_cpu;
     state.ctx_config.keep_clip_on_cpu = options.clip_on_cpu;
     state.ctx_config.keep_vae_on_cpu = options.vae_on_cpu;
