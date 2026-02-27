@@ -792,10 +792,6 @@ void preprocess_tensor(TensorStorage tensor_storage,
         processed_tensor_storages.push_back(tensor_storage);
     }
 }
-float bf16_to_f32(uint16_t bfloat16) {
-    uint32_t val_bits = (static_cast<uint32_t>(bfloat16) << 16);
-    return *reinterpret_cast<float*>(&val_bits);
-}
 
 uint16_t f8_e4m3_to_f16(uint8_t f8) {
     // do we need to support uz?
@@ -877,13 +873,6 @@ uint16_t f8_e5m2_to_f16(uint8_t fp8) {
     }
 
     return fp16_sign | (fp16_exponent << 10) | fp16_mantissa;
-}
-
-void bf16_to_f32_vec(uint16_t* src, float* dst, int64_t n) {
-    // support inplace op
-    for (int64_t i = n - 1; i >= 0; i--) {
-        dst[i] = bf16_to_f32(src[i]);
-    }
 }
 
 void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
@@ -1201,7 +1190,7 @@ ggml_type str_to_ggml_type(const std::string& dtype) {
     if (dtype == "F16") {
         ttype = GGML_TYPE_F16;
     } else if (dtype == "BF16") {
-        ttype = GGML_TYPE_F32;
+        ttype = GGML_TYPE_BF16;
     } else if (dtype == "F32") {
         ttype = GGML_TYPE_F32;
     } else if (dtype == "I32") {
@@ -1283,7 +1272,6 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         int n_dims = 0;
         size_t offset = 0;
         size_t tensor_data_size = 0;
-        bool is_bf16 = false;
         bool is_f8_e4m3 = false;
         bool is_f8_e5m2 = false;
         bool is_f64 = false;
@@ -1358,7 +1346,6 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         task.n_dims = n_dims;
         task.offset = base_offset + begin;
         task.tensor_data_size = end - begin;
-        task.is_bf16 = (dtype == "BF16");
         task.is_f8_e4m3 = (dtype == "F8_E4M3");
         task.is_f8_e5m2 = (dtype == "F8_E5M2");
         task.is_f64 = (dtype == "F64");
@@ -1419,7 +1406,6 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
                     tensor_storage.name_is_canonical = true;
                 }
 
-                tensor_storage.is_bf16    = task.is_bf16;
                 tensor_storage.is_f8_e4m3 = task.is_f8_e4m3;
                 tensor_storage.is_f8_e5m2 = task.is_f8_e5m2;
                 tensor_storage.is_f64     = task.is_f64;
@@ -1427,9 +1413,7 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
 
                 size_t tensor_data_size = task.tensor_data_size;
 
-                if (tensor_storage.is_bf16) {
-                    GGML_ASSERT(tensor_storage.nbytes() == tensor_data_size * 2);
-                } else if (tensor_storage.is_f8_e4m3) {
+                if (tensor_storage.is_f8_e4m3) {
                     GGML_ASSERT(tensor_storage.nbytes() == tensor_data_size * 2);
                 } else if (tensor_storage.is_f8_e5m2) {
                     GGML_ASSERT(tensor_storage.nbytes() == tensor_data_size * 2);
@@ -2379,9 +2363,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     read_time_ms.fetch_add(t1 - t0);
 
                     t0 = ggml_time_ms();
-                    if (tensor_storage.is_bf16) {
-                        bf16_to_f32_vec((uint16_t*)read_buf, (float*)target_buf, tensor_storage.nelements());
-                    } else if (tensor_storage.is_f8_e4m3) {
+                    if (tensor_storage.is_f8_e4m3) {
                         f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_f8_e5m2) {
                         f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
