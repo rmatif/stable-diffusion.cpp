@@ -29,7 +29,7 @@
 #endif
 
 #include "stable-diffusion.h"
-#include "model.h"
+#include "src/model.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -1261,7 +1261,6 @@ struct CtxConfig {
                chroma_use_dit_mask == other.chroma_use_dit_mask &&
                chroma_use_t5_mask == other.chroma_use_t5_mask &&
                chroma_t5_mask_pad == other.chroma_t5_mask_pad &&
-               flow_shift == other.flow_shift &&
                prediction == other.prediction &&
                lora_apply_mode == other.lora_apply_mode;
     }
@@ -1305,7 +1304,6 @@ struct CtxConfig {
         params.chroma_use_dit_mask     = chroma_use_dit_mask;
         params.chroma_use_t5_mask      = chroma_use_t5_mask;
         params.chroma_t5_mask_pad      = chroma_t5_mask_pad;
-        params.flow_shift              = flow_shift;
         params.prediction              = prediction;
         params.lora_apply_mode         = lora_apply_mode;
 
@@ -1639,6 +1637,7 @@ class StreamingImageResponder {
             sample_params.eta = request_.eta;
         }
         sample_params.shifted_timestep = request_.shifted_timestep;
+        sample_params.flow_shift = ctx_config_.flow_shift;
 
         std::vector<sd_lora_t> loras;
         if (!request_.lora_paths.empty()) {
@@ -4783,7 +4782,6 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.chroma_use_dit_mask != desired.chroma_use_dit_mask ||
                current.chroma_use_t5_mask != desired.chroma_use_t5_mask ||
                current.chroma_t5_mask_pad != desired.chroma_t5_mask_pad ||
-               current.flow_shift != desired.flow_shift ||
                current.prediction != desired.prediction ||
                current.lora_apply_mode != desired.lora_apply_mode;
     };
