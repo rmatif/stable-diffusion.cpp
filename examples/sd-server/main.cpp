@@ -195,6 +195,10 @@ bool parse_cache_mode(const std::string& value, sd_cache_mode_t& mode_out) {
         mode_out = SD_CACHE_CACHE_DIT;
         return true;
     }
+    if (value == "spectrum") {
+        mode_out = SD_CACHE_SPECTRUM;
+        return true;
+    }
     return false;
 }
 
@@ -795,6 +799,8 @@ void print_usage() {
         << "      --flow-shift <value>                Flow model shift override\n"
         << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
         << "      --ucache <thr,start,end>            Enable UCache with threshold/start/end percents\n"
+        << "      --spectrum <w,m,lam,window,flex,warmup,stop>\n"
+        << "                                           Enable Spectrum with optional tuning values\n"
         << "      --cache-dit                         Enable CacheDIT (DBCache + TaylorSeer)\n"
         << "      --chroma-t5-mask-pad <int>          Padding for Chroma T5 mask\n"
         << "\n"
@@ -1126,6 +1132,102 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
             options.cache_params.reuse_threshold = parsed[0];
             options.cache_params.start_percent = parsed[1];
             options.cache_params.end_percent = parsed[2];
+        } else if (arg == "--spectrum") {
+            if (i + 1 >= argc) {
+                error = "missing value for --spectrum";
+                return false;
+            }
+            std::string value = argv[++i];
+            std::string parsed[7];
+            std::stringstream ss(value);
+            std::string token;
+            int idx = 0;
+            auto trim = [](std::string& s) {
+                const char* whitespace = " \t\r\n";
+                auto start = s.find_first_not_of(whitespace);
+                if (start == std::string::npos) {
+                    s.clear();
+                    return;
+                }
+                auto end = s.find_last_not_of(whitespace);
+                s = s.substr(start, end - start + 1);
+            };
+            while (std::getline(ss, token, ',')) {
+                trim(token);
+                if (token.empty()) {
+                    error = "invalid spectrum value";
+                    return false;
+                }
+                if (idx >= 7) {
+                    error = "spectrum expects exactly 7 comma-separated values";
+                    return false;
+                }
+                parsed[idx++] = token;
+            }
+            if (idx != 7) {
+                error = "spectrum expects exactly 7 comma-separated values";
+                return false;
+            }
+
+            float spectrum_w = 0.0f;
+            int spectrum_m = 0;
+            float spectrum_lam = 0.0f;
+            int spectrum_window_size = 0;
+            float spectrum_flex_window = 0.0f;
+            int spectrum_warmup_steps = 0;
+            float spectrum_stop_percent = 0.0f;
+            try {
+                spectrum_w = std::stof(parsed[0]);
+                spectrum_m = std::stoi(parsed[1]);
+                spectrum_lam = std::stof(parsed[2]);
+                spectrum_window_size = std::stoi(parsed[3]);
+                spectrum_flex_window = std::stof(parsed[4]);
+                spectrum_warmup_steps = std::stoi(parsed[5]);
+                spectrum_stop_percent = std::stof(parsed[6]);
+            } catch (const std::exception&) {
+                error = "invalid spectrum value";
+                return false;
+            }
+
+            if (spectrum_w < 0.0f || spectrum_w > 1.0f) {
+                error = "spectrum w must be between 0.0 and 1.0";
+                return false;
+            }
+            if (spectrum_m < 0) {
+                error = "spectrum m must be non-negative";
+                return false;
+            }
+            if (spectrum_lam < 0.0f) {
+                error = "spectrum lam must be non-negative";
+                return false;
+            }
+            if (spectrum_window_size <= 0) {
+                error = "spectrum window must be greater than 0";
+                return false;
+            }
+            if (spectrum_flex_window < 0.0f) {
+                error = "spectrum flex must be non-negative";
+                return false;
+            }
+            if (spectrum_warmup_steps < 0) {
+                error = "spectrum warmup must be non-negative";
+                return false;
+            }
+            if (spectrum_stop_percent < 0.0f || spectrum_stop_percent > 1.0f) {
+                error = "spectrum stop must be between 0.0 and 1.0";
+                return false;
+            }
+
+            if (!set_cache_mode_cli(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+            options.cache_params.spectrum_w = spectrum_w;
+            options.cache_params.spectrum_m = spectrum_m;
+            options.cache_params.spectrum_lam = spectrum_lam;
+            options.cache_params.spectrum_window_size = spectrum_window_size;
+            options.cache_params.spectrum_flex_window = spectrum_flex_window;
+            options.cache_params.spectrum_warmup_steps = spectrum_warmup_steps;
+            options.cache_params.spectrum_stop_percent = spectrum_stop_percent;
         } else if (arg == "--cache-dit") {
             if (!set_cache_mode_cli(SD_CACHE_CACHE_DIT)) {
                 return false;
@@ -2165,6 +2267,7 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
     bool cache_mode_set = false;
     bool easycache_flag_explicit = false;
     bool ucache_flag_explicit = false;
+    bool spectrum_flag_explicit = false;
     bool cache_dit_flag_explicit = false;
     sd_cache_mode_t cache_dit_mode = SD_CACHE_CACHE_DIT;
 
@@ -2233,6 +2336,100 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         return apply_cache_triplet(label, parsed[0], parsed[1], parsed[2]);
+    };
+
+    auto apply_spectrum_params = [&](float w, int m, float lam, int window_size, float flex_window, int warmup_steps, float stop_percent) -> bool {
+        if (w < 0.0f || w > 1.0f) {
+            error = "spectrum_w must be between 0.0 and 1.0";
+            return false;
+        }
+        if (m < 0) {
+            error = "spectrum_m must be non-negative";
+            return false;
+        }
+        if (lam < 0.0f) {
+            error = "spectrum_lam must be non-negative";
+            return false;
+        }
+        if (window_size <= 0) {
+            error = "spectrum_window_size must be greater than 0";
+            return false;
+        }
+        if (flex_window < 0.0f) {
+            error = "spectrum_flex_window must be non-negative";
+            return false;
+        }
+        if (warmup_steps < 0) {
+            error = "spectrum_warmup_steps must be non-negative";
+            return false;
+        }
+        if (stop_percent < 0.0f || stop_percent > 1.0f) {
+            error = "spectrum_stop_percent must be between 0.0 and 1.0";
+            return false;
+        }
+        request.cache.spectrum_w = w;
+        request.cache.spectrum_m = m;
+        request.cache.spectrum_lam = lam;
+        request.cache.spectrum_window_size = window_size;
+        request.cache.spectrum_flex_window = flex_window;
+        request.cache.spectrum_warmup_steps = warmup_steps;
+        request.cache.spectrum_stop_percent = stop_percent;
+        request.cache_provided = true;
+        return true;
+    };
+
+    auto parse_spectrum_params = [&](const std::string& value) -> bool {
+        std::string parsed[7];
+        std::stringstream ss(value);
+        std::string token;
+        int idx = 0;
+        auto trim = [](std::string& s) {
+            const char* whitespace = " \t\r\n";
+            auto start = s.find_first_not_of(whitespace);
+            if (start == std::string::npos) {
+                s.clear();
+                return;
+            }
+            auto end = s.find_last_not_of(whitespace);
+            s = s.substr(start, end - start + 1);
+        };
+        while (std::getline(ss, token, ',')) {
+            trim(token);
+            if (token.empty()) {
+                error = "invalid spectrum value";
+                return false;
+            }
+            if (idx >= 7) {
+                error = "spectrum expects exactly 7 comma-separated values";
+                return false;
+            }
+            parsed[idx++] = token;
+        }
+        if (idx != 7) {
+            error = "spectrum expects exactly 7 comma-separated values";
+            return false;
+        }
+
+        float w = 0.0f;
+        int m = 0;
+        float lam = 0.0f;
+        int window_size = 0;
+        float flex_window = 0.0f;
+        int warmup_steps = 0;
+        float stop_percent = 0.0f;
+        try {
+            w = std::stof(parsed[0]);
+            m = std::stoi(parsed[1]);
+            lam = std::stof(parsed[2]);
+            window_size = std::stoi(parsed[3]);
+            flex_window = std::stof(parsed[4]);
+            warmup_steps = std::stoi(parsed[5]);
+            stop_percent = std::stof(parsed[6]);
+        } catch (const std::exception&) {
+            error = "invalid spectrum value";
+            return false;
+        }
+        return apply_spectrum_params(w, m, lam, window_size, flex_window, warmup_steps, stop_percent);
     };
 
     auto easycache_it = body.find("easycache");
@@ -2499,6 +2696,200 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         }
     }
 
+    auto spectrum_it = body.find("spectrum");
+    if (spectrum_it != body.end()) {
+        spectrum_flag_explicit = true;
+        if (spectrum_it->is_boolean()) {
+            if (spectrum_it->get<bool>()) {
+                if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                    return false;
+                }
+            } else {
+                request.cache_provided = true;
+            }
+        } else if (spectrum_it->is_string()) {
+            if (!parse_spectrum_params(spectrum_it->get<std::string>())) {
+                return false;
+            }
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        } else if (spectrum_it->is_array()) {
+            if (spectrum_it->size() != 7) {
+                error = "field 'spectrum' array must contain exactly 7 values";
+                return false;
+            }
+            for (size_t i = 0; i < 7; ++i) {
+                const bool is_int_field = (i == 1 || i == 3 || i == 5);
+                if (is_int_field) {
+                    if (!(*spectrum_it)[i].is_number_integer()) {
+                        error = "field 'spectrum' integer positions (m, window, warmup) must be integers";
+                        return false;
+                    }
+                } else if (!(*spectrum_it)[i].is_number_float() && !(*spectrum_it)[i].is_number_integer()) {
+                    error = "field 'spectrum' array must contain numeric values";
+                    return false;
+                }
+            }
+            float w = static_cast<float>((*spectrum_it)[0].get<double>());
+            int m = static_cast<int>((*spectrum_it)[1].get<int64_t>());
+            float lam = static_cast<float>((*spectrum_it)[2].get<double>());
+            int window_size = static_cast<int>((*spectrum_it)[3].get<int64_t>());
+            float flex_window = static_cast<float>((*spectrum_it)[4].get<double>());
+            int warmup_steps = static_cast<int>((*spectrum_it)[5].get<int64_t>());
+            float stop_percent = static_cast<float>((*spectrum_it)[6].get<double>());
+            if (!apply_spectrum_params(w, m, lam, window_size, flex_window, warmup_steps, stop_percent)) {
+                return false;
+            }
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        } else {
+            error = "field 'spectrum' must be boolean, string, or array";
+            return false;
+        }
+    }
+
+    auto spectrum_w_it = body.find("spectrum_w");
+    if (spectrum_w_it != body.end()) {
+        if (!spectrum_w_it->is_number_float() && !spectrum_w_it->is_number_integer()) {
+            error = "field 'spectrum_w' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(spectrum_w_it->get<double>());
+        if (value < 0.0f || value > 1.0f) {
+            error = "spectrum_w must be between 0.0 and 1.0";
+            return false;
+        }
+        request.cache.spectrum_w = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_m_it = body.find("spectrum_m");
+    if (spectrum_m_it != body.end()) {
+        if (!spectrum_m_it->is_number_integer()) {
+            error = "field 'spectrum_m' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(spectrum_m_it->get<int64_t>());
+        if (value < 0) {
+            error = "spectrum_m must be non-negative";
+            return false;
+        }
+        request.cache.spectrum_m = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_lam_it = body.find("spectrum_lam");
+    if (spectrum_lam_it != body.end()) {
+        if (!spectrum_lam_it->is_number_float() && !spectrum_lam_it->is_number_integer()) {
+            error = "field 'spectrum_lam' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(spectrum_lam_it->get<double>());
+        if (value < 0.0f) {
+            error = "spectrum_lam must be non-negative";
+            return false;
+        }
+        request.cache.spectrum_lam = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_window_it = body.find("spectrum_window_size");
+    if (spectrum_window_it != body.end()) {
+        if (!spectrum_window_it->is_number_integer()) {
+            error = "field 'spectrum_window_size' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(spectrum_window_it->get<int64_t>());
+        if (value <= 0) {
+            error = "spectrum_window_size must be greater than 0";
+            return false;
+        }
+        request.cache.spectrum_window_size = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_flex_it = body.find("spectrum_flex_window");
+    if (spectrum_flex_it != body.end()) {
+        if (!spectrum_flex_it->is_number_float() && !spectrum_flex_it->is_number_integer()) {
+            error = "field 'spectrum_flex_window' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(spectrum_flex_it->get<double>());
+        if (value < 0.0f) {
+            error = "spectrum_flex_window must be non-negative";
+            return false;
+        }
+        request.cache.spectrum_flex_window = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_warmup_it = body.find("spectrum_warmup_steps");
+    if (spectrum_warmup_it != body.end()) {
+        if (!spectrum_warmup_it->is_number_integer()) {
+            error = "field 'spectrum_warmup_steps' must be an integer";
+            return false;
+        }
+        int value = static_cast<int>(spectrum_warmup_it->get<int64_t>());
+        if (value < 0) {
+            error = "spectrum_warmup_steps must be non-negative";
+            return false;
+        }
+        request.cache.spectrum_warmup_steps = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
+    auto spectrum_stop_it = body.find("spectrum_stop_percent");
+    if (spectrum_stop_it != body.end()) {
+        if (!spectrum_stop_it->is_number_float() && !spectrum_stop_it->is_number_integer()) {
+            error = "field 'spectrum_stop_percent' must be numeric";
+            return false;
+        }
+        float value = static_cast<float>(spectrum_stop_it->get<double>());
+        if (value < 0.0f || value > 1.0f) {
+            error = "spectrum_stop_percent must be between 0.0 and 1.0";
+            return false;
+        }
+        request.cache.spectrum_stop_percent = value;
+        request.cache_provided = true;
+        if (!spectrum_flag_explicit) {
+            if (!set_cache_mode_if_allowed(SD_CACHE_SPECTRUM)) {
+                return false;
+            }
+        }
+    }
+
     auto cache_dit_mode_it = body.find("cache_dit_mode");
     if (cache_dit_mode_it != body.end()) {
         if (!cache_dit_mode_it->is_string()) {
@@ -2701,6 +3092,36 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
         const char* cache_label = request.cache.mode == SD_CACHE_UCACHE ? "ucache" : "easycache";
         error = std::string(cache_label) + "_start_percent must be less than " + cache_label + "_end_percent";
         return false;
+    }
+    if (request.cache.mode == SD_CACHE_SPECTRUM) {
+        if (request.cache.spectrum_w < 0.0f || request.cache.spectrum_w > 1.0f) {
+            error = "spectrum_w must be between 0.0 and 1.0";
+            return false;
+        }
+        if (request.cache.spectrum_m < 0) {
+            error = "spectrum_m must be non-negative";
+            return false;
+        }
+        if (request.cache.spectrum_lam < 0.0f) {
+            error = "spectrum_lam must be non-negative";
+            return false;
+        }
+        if (request.cache.spectrum_window_size <= 0) {
+            error = "spectrum_window_size must be greater than 0";
+            return false;
+        }
+        if (request.cache.spectrum_flex_window < 0.0f) {
+            error = "spectrum_flex_window must be non-negative";
+            return false;
+        }
+        if (request.cache.spectrum_warmup_steps < 0) {
+            error = "spectrum_warmup_steps must be non-negative";
+            return false;
+        }
+        if (request.cache.spectrum_stop_percent < 0.0f || request.cache.spectrum_stop_percent > 1.0f) {
+            error = "spectrum_stop_percent must be between 0.0 and 1.0";
+            return false;
+        }
     }
 
     auto cfg_it = body.find("cfg_scale");
