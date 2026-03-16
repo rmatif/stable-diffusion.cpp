@@ -571,7 +571,14 @@ public:
                     std::string name = "output_blocks." + std::to_string(output_block_idx) + "." + std::to_string(up_sample_idx);
                     auto block       = std::dynamic_pointer_cast<UpSampleBlock>(blocks[name]);
 
-                    h = block->forward(ctx, h);
+                    int target_width = 0;
+                    int target_height = 0;
+                    if (!hs.empty()) {
+                        target_width = static_cast<int>(hs.back()->ne[0]);
+                        target_height = static_cast<int>(hs.back()->ne[1]);
+                    }
+
+                    h = block->forward(ctx, h, target_width, target_height);
 
                     ds /= 2;
                 }

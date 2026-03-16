@@ -418,6 +418,8 @@ SD_API bool sd_reload_text_encoders(sd_ctx_t* sd_ctx,
                                     const char* qwen2vl_path,
                                     const char* qwen2vl_vision_path);
 SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx);
+SD_API int sd_get_vae_scale_factor(const sd_ctx_t* sd_ctx);
+SD_API int sd_get_image_size_multiple(const sd_ctx_t* sd_ctx);
 
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
 SD_API char* sd_sample_params_to_str(const sd_sample_params_t* sample_params);

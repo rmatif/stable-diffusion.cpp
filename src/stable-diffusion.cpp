@@ -2837,6 +2837,13 @@ public:
         return first_stage_model->get_scale_factor();
     }
 
+    int get_image_size_multiple() {
+        if (sd_version_is_dit(version)) {
+            return 16;
+        }
+        return get_vae_scale_factor();
+    }
+
     int get_diffusion_model_down_factor() {
         int down_factor = 8;  // unet
         if (sd_version_is_dit(version)) {
@@ -3466,6 +3473,20 @@ SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx) {
     return static_cast<sd_model_version_t>(sd_ctx->sd->version);
 }
 
+SD_API int sd_get_vae_scale_factor(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return 0;
+    }
+    return sd_ctx->sd->get_vae_scale_factor();
+}
+
+SD_API int sd_get_image_size_multiple(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return 0;
+    }
+    return sd_ctx->sd->get_image_size_multiple();
+}
+
 sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
                                     ggml_context* work_ctx,
                                     ggml_tensor* init_latent,
@@ -3815,16 +3836,14 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
     int width             = sd_img_gen_params->width;
     int height            = sd_img_gen_params->height;
     int vae_scale_factor  = sd->get_vae_scale_factor();
-    if (sd_version_is_dit(sd->version)) {
-        if (width % 16 || height % 16) {
-            LOG_ERROR("Image dimensions must be must be a multiple of 16 on each axis for %s models. (Got %dx%d)",
-                      model_version_to_str[sd->version],
-                      width,
-                      height);
-            return nullptr;
-        }
-    } else if (width % 64 || height % 64) {
-        LOG_ERROR("Image dimensions must be must be a multiple of 64 on each axis for %s models. (Got %dx%d)",
+    int spatial_multiple  = sd->get_image_size_multiple();
+    if (spatial_multiple <= 0) {
+        LOG_ERROR("invalid spatial multiple for %s models", model_version_to_str[sd->version]);
+        return nullptr;
+    }
+    if (width % spatial_multiple || height % spatial_multiple) {
+        LOG_ERROR("Image dimensions must be a multiple of %d on each axis for %s models. (Got %dx%d)",
+                  spatial_multiple,
                   model_version_to_str[sd->version],
                   width,
                   height);

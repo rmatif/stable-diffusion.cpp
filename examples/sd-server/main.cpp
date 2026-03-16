@@ -378,6 +378,107 @@ struct OwnedImage {
     }
 };
 
+int align_down(int value, int multiple) {
+    if (multiple <= 1) {
+        return value;
+    }
+    return value - (value % multiple);
+}
+
+bool crop_owned_image(const OwnedImage& input,
+                      int crop_x,
+                      int crop_y,
+                      int crop_width,
+                      int crop_height,
+                      OwnedImage& output,
+                      std::string& error) {
+    if (!input.valid()) {
+        error = "cannot crop an empty image";
+        return false;
+    }
+    if (crop_width <= 0 || crop_height <= 0) {
+        error = "crop dimensions must be positive";
+        return false;
+    }
+    if (crop_x < 0 || crop_y < 0 ||
+        crop_x + crop_width > static_cast<int>(input.width) ||
+        crop_y + crop_height > static_cast<int>(input.height)) {
+        error = "crop bounds exceed image dimensions";
+        return false;
+    }
+
+    std::vector<uint8_t> cropped(static_cast<size_t>(crop_width) * crop_height * input.channel);
+    for (int row = 0; row < crop_height; ++row) {
+        const uint8_t* src = input.data.data() +
+                             (static_cast<size_t>(crop_y + row) * input.width + crop_x) * input.channel;
+        uint8_t* dst = cropped.data() + static_cast<size_t>(row) * crop_width * input.channel;
+        std::memcpy(dst, src, static_cast<size_t>(crop_width) * input.channel);
+    }
+
+    output.width = static_cast<uint32_t>(crop_width);
+    output.height = static_cast<uint32_t>(crop_height);
+    output.channel = input.channel;
+    output.data = std::move(cropped);
+    return true;
+}
+
+bool resize_image_buffer(const uint8_t* input_data,
+                         int input_width,
+                         int input_height,
+                         int channel_count,
+                         int output_width,
+                         int output_height,
+                         OwnedImage& output,
+                         std::string& error) {
+    if (input_data == nullptr || input_width <= 0 || input_height <= 0 || channel_count <= 0) {
+        error = "invalid source image for resize";
+        return false;
+    }
+    if (output_width <= 0 || output_height <= 0) {
+        error = "output resize dimensions must be positive";
+        return false;
+    }
+
+    std::vector<uint8_t> resized(static_cast<size_t>(output_width) * output_height * channel_count);
+    if (!stbir_resize_uint8(input_data,
+                            input_width,
+                            input_height,
+                            0,
+                            resized.data(),
+                            output_width,
+                            output_height,
+                            0,
+                            channel_count)) {
+        error = "failed to resize image buffer";
+        return false;
+    }
+
+    output.width = static_cast<uint32_t>(output_width);
+    output.height = static_cast<uint32_t>(output_height);
+    output.channel = static_cast<uint32_t>(channel_count);
+    output.data = std::move(resized);
+    return true;
+}
+
+bool resize_owned_image(const OwnedImage& input,
+                        int output_width,
+                        int output_height,
+                        OwnedImage& output,
+                        std::string& error) {
+    if (!input.valid()) {
+        error = "cannot resize an empty image";
+        return false;
+    }
+    return resize_image_buffer(input.data.data(),
+                               static_cast<int>(input.width),
+                               static_cast<int>(input.height),
+                               static_cast<int>(input.channel),
+                               output_width,
+                               output_height,
+                               output,
+                               error);
+}
+
 bool process_loaded_pixels(const std::string& source_label,
                            int expected_width,
                            int expected_height,
@@ -1466,6 +1567,10 @@ struct GenerationRequest {
     int clip_skip = -1;
     int width = 512;
     int height = 512;
+    bool width_provided = false;
+    bool height_provided = false;
+    int working_width = 0;
+    int working_height = 0;
     int sample_steps = 20;
     float cfg_scale = 7.0f;
     bool has_img_cfg_scale = false;
@@ -1662,8 +1767,8 @@ class StreamingImageResponder {
         params.prompt = request_.prompt.c_str();
         params.negative_prompt = request_.negative_prompt.c_str();
         params.clip_skip = request_.clip_skip;
-        params.width = request_.width;
-        params.height = request_.height;
+        params.width = request_.working_width > 0 ? request_.working_width : request_.width;
+        params.height = request_.working_height > 0 ? request_.working_height : request_.height;
         params.batch_count = 1;
         params.seed = effective_seed_ + index;
         params.auto_resize_ref_image = request_.auto_resize_ref_image;
@@ -1763,16 +1868,42 @@ class StreamingImageResponder {
 
         ImageResultGuard guard{results, params.batch_count};
 
-        sd_image_t& image = results[0];
-        if (image.data == nullptr) {
+        sd_image_t& generated_image = results[0];
+        if (generated_image.data == nullptr) {
             emit_error(sink, "image data is empty", index);
             return false;
+        }
+
+        OwnedImage resized_output;
+        sd_image_t output_image = generated_image;
+        if ((generated_image.width != static_cast<uint32_t>(request_.width) ||
+             generated_image.height != static_cast<uint32_t>(request_.height)) &&
+            request_.width > 0 && request_.height > 0) {
+            std::string resize_error;
+            if (!resize_image_buffer(generated_image.data,
+                                     static_cast<int>(generated_image.width),
+                                     static_cast<int>(generated_image.height),
+                                     static_cast<int>(generated_image.channel),
+                                     request_.width,
+                                     request_.height,
+                                     resized_output,
+                                     resize_error)) {
+                emit_error(sink, resize_error, index);
+                return false;
+            }
+            output_image = resized_output.as_sd_image();
         }
 
         auto encode_start = std::chrono::steady_clock::now();
 
         int png_size = 0;
-        unsigned char* png_data = stbi_write_png_to_mem(image.data, 0, image.width, image.height, image.channel, &png_size, nullptr);
+        unsigned char* png_data = stbi_write_png_to_mem(output_image.data,
+                                                        0,
+                                                        output_image.width,
+                                                        output_image.height,
+                                                        output_image.channel,
+                                                        &png_size,
+                                                        nullptr);
         if (png_data == nullptr) {
             emit_error(sink, "failed to encode PNG", index);
             return false;
@@ -1793,8 +1924,8 @@ class StreamingImageResponder {
         image_chunk["index"] = index;
         image_chunk["seed"] = reported_seed;
         image_chunk["actual_seed"] = actual_seed;
-        image_chunk["width"] = image.width;
-        image_chunk["height"] = image.height;
+        image_chunk["width"] = output_image.width;
+        image_chunk["height"] = output_image.height;
         image_chunk["format"] = "png";
         image_chunk["mime_type"] = "image/png";
         image_chunk["payload_bytes"] = png_size;
@@ -1821,8 +1952,8 @@ class StreamingImageResponder {
         summary_entry["index"] = index;
         summary_entry["seed"] = reported_seed;
         summary_entry["actual_seed"] = actual_seed;
-        summary_entry["width"] = image.width;
-        summary_entry["height"] = image.height;
+        summary_entry["width"] = output_image.width;
+        summary_entry["height"] = output_image.height;
         summary_entry["format"] = "png";
         summary_entry["mime_type"] = "image/png";
         summary_entry["streamed"] = true;
@@ -1833,6 +1964,12 @@ class StreamingImageResponder {
         summary_entry["payload_bytes"] = png_size;
         summary_entry["encoded_bytes"] = static_cast<int64_t>(encoded_size);
         summary_entry["serialized_bytes"] = static_cast<int64_t>(serialized_bytes);
+        if (params.width != request_.width || params.height != request_.height) {
+            summary_entry["requested_width"] = request_.width;
+            summary_entry["requested_height"] = request_.height;
+            summary_entry["internal_width"] = params.width;
+            summary_entry["internal_height"] = params.height;
+        }
         image_summaries_.push_back(std::move(summary_entry));
 
         return true;
@@ -2235,6 +2372,7 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         request.width = value;
+        request.width_provided = true;
     }
 
     auto height_it = body.find("height");
@@ -2249,6 +2387,7 @@ bool parse_generation_request(const json& body, GenerationRequest& request, std:
             return false;
         }
         request.height = value;
+        request.height_provided = true;
     }
 
     auto steps_it = body.find("sample_steps");
@@ -3596,6 +3735,8 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
     request.has_init_image = false;
     request.has_mask_image = false;
     request.has_control_image = false;
+    request.working_width = 0;
+    request.working_height = 0;
     request.ref_images.clear();
     request.pm_id_images.clear();
 
@@ -3606,8 +3747,9 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
         }
     }
 
-    const int init_expected_width = request.width;
-    const int init_expected_height = request.height;
+    const bool use_init_native_size = request.image2image && !request.width_provided && !request.height_provided;
+    const int init_expected_width = use_init_native_size ? 0 : request.width;
+    const int init_expected_height = use_init_native_size ? 0 : request.height;
 
     if (!request.init_image_path.empty()) {
         OwnedImage init;
@@ -3623,6 +3765,11 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
         }
         request.init_image = std::move(init);
         request.has_init_image = true;
+    }
+
+    if (use_init_native_size && request.has_init_image) {
+        request.width = static_cast<int>(request.init_image.width);
+        request.height = static_cast<int>(request.init_image.height);
     }
 
     if (!request.mask_image_path.empty()) {
@@ -3686,6 +3833,63 @@ bool prepare_generation_inputs(GenerationRequest& request, std::string& error) {
         }
     }
 
+    return true;
+}
+
+bool adapt_img2img_request_to_context(sd_ctx_t* ctx, GenerationRequest& request, std::string& error) {
+    request.working_width = 0;
+    request.working_height = 0;
+
+    if (!request.image2image || !request.has_init_image) {
+        return true;
+    }
+
+    const int spatial_multiple = sd_get_image_size_multiple(ctx);
+    if (spatial_multiple <= 1) {
+        return true;
+    }
+
+    const int working_width = align_down(request.width, spatial_multiple);
+    const int working_height = align_down(request.height, spatial_multiple);
+    if (working_width <= 0 || working_height <= 0) {
+        error = "image dimensions must be at least " + std::to_string(spatial_multiple) + " pixels on each axis";
+        return false;
+    }
+
+    if (working_width == request.width && working_height == request.height) {
+        return true;
+    }
+
+    const int crop_x = (request.width - working_width) / 2;
+    const int crop_y = (request.height - working_height) / 2;
+
+    OwnedImage cropped_init;
+    if (!crop_owned_image(request.init_image, crop_x, crop_y, working_width, working_height, cropped_init, error)) {
+        error = "failed to crop init image: " + error;
+        return false;
+    }
+    request.init_image = std::move(cropped_init);
+
+    if (request.has_mask_image) {
+        OwnedImage cropped_mask;
+        if (!crop_owned_image(request.mask_image, crop_x, crop_y, working_width, working_height, cropped_mask, error)) {
+            error = "failed to crop mask image: " + error;
+            return false;
+        }
+        request.mask_image = std::move(cropped_mask);
+    }
+
+    if (request.has_control_image) {
+        OwnedImage cropped_control;
+        if (!crop_owned_image(request.control_image, crop_x, crop_y, working_width, working_height, cropped_control, error)) {
+            error = "failed to crop control image: " + error;
+            return false;
+        }
+        request.control_image = std::move(cropped_control);
+    }
+
+    request.working_width = working_width;
+    request.working_height = working_height;
     return true;
 }
 
@@ -4751,6 +4955,10 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.request.batch_count"] = request.batch_count;
     span_attributes["sdcpp.request.width"] = request.width;
     span_attributes["sdcpp.request.height"] = request.height;
+    if (request.working_width > 0 && request.working_height > 0) {
+        span_attributes["sdcpp.request.internal_width"] = request.working_width;
+        span_attributes["sdcpp.request.internal_height"] = request.working_height;
+    }
     span_attributes["sdcpp.request.sample_steps"] = request.sample_steps;
     span_attributes["sdcpp.request.cfg_scale"] = request.cfg_scale;
     span_attributes["sdcpp.request.clip_skip"] = request.clip_skip;
@@ -5516,6 +5724,14 @@ int main(int argc, char** argv) {
         if (!ensure_context(state, desired_config, context_error)) {
             auto response = make_error_response(context_error, collector);
             res.status = 500;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
+        std::string sizing_error;
+        if (!adapt_img2img_request_to_context(state.ctx, request_params, sizing_error)) {
+            auto response = make_error_response(sizing_error, collector);
+            res.status = 400;
             res.set_content(response.dump(), "application/json");
             return;
         }

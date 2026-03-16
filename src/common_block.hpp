@@ -52,12 +52,24 @@ public:
         blocks["conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
     }
 
-    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    ggml_tensor* forward(GGMLRunnerContext* ctx,
+                         ggml_tensor* x,
+                         int target_width = 0,
+                         int target_height = 0) {
         // x: [N, channels, h, w]
         auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["conv"]);
 
-        x = ggml_upscale(ctx->ggml_ctx, x, 2, GGML_SCALE_MODE_NEAREST);  // [N, channels, h*2, w*2]
-        x = conv->forward(ctx, x);                                       // [N, out_channels, h*2, w*2]
+        const int64_t output_width = target_width > 0 ? target_width : x->ne[0] * 2;
+        const int64_t output_height = target_height > 0 ? target_height : x->ne[1] * 2;
+
+        x = ggml_interpolate(ctx->ggml_ctx,
+                             x,
+                             output_width,
+                             output_height,
+                             x->ne[2],
+                             x->ne[3],
+                             GGML_SCALE_MODE_NEAREST);
+        x = conv->forward(ctx, x);
         return x;
     }
 };
