@@ -644,7 +644,6 @@ public:
         offload_runner(diffusion_model);
         offload_runner(high_noise_diffusion_model);
         offload_runner(first_stage_model);
-        offload_runner(tae_first_stage);
         offload_runner(control_net);
         offload_runner(pmid_model);
         offload_runner(pmid_lora);
@@ -1630,7 +1629,7 @@ public:
         if (sd_version_is_wan(version) || sd_version_is_qwen_image(version)) {
             first_stage_model = std::make_shared<WAN::WanVAERunner>(vae_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "first_stage_model", vae_decode_only, version);
         } else if (version == VERSION_CHROMA_RADIANCE) {
-            first_stage_model = std::make_shared<FakeVAE>(vae_backend, offload_params_to_cpu);
+            first_stage_model = std::make_shared<FakeVAE>(version, vae_backend, offload_params_to_cpu);
         } else {
             first_stage_model = std::make_shared<AutoEncoderKL>(vae_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "first_stage_model", vae_decode_only, false, version);
             if (vae_conv_direct) {
