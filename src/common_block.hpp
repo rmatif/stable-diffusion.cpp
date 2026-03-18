@@ -234,6 +234,16 @@ public:
         x         = ggml_ext_linear(ctx->ggml_ctx, x_in, x_w, x_b);
         auto gate = ggml_ext_linear(ctx->ggml_ctx, x_in, gate_w, gate_b);
 
+        if (prefix.rfind("model.diffusion_model.", 0) == 0 &&
+            (x_in->type == GGML_TYPE_F16 || x_in->type == GGML_TYPE_BF16)) {
+            if (x->type != x_in->type) {
+                x = ggml_cast(ctx->ggml_ctx, x, x_in->type);
+            }
+            if (gate->type != x_in->type) {
+                gate = ggml_cast(ctx->ggml_ctx, gate, x_in->type);
+            }
+        }
+
         gate = ggml_cont(ctx->ggml_ctx, gate);
         gate = ggml_ext_gelu(ctx->ggml_ctx, gate, true);
 

@@ -1330,6 +1330,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       bool flash_attn   = false,
                                                       float kv_scale    = 1.0f,
                                                       ggml_type kv_type = GGML_TYPE_F16) {  // avoid overflow
+    const ggml_type q_type = q->type;
+
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -1368,6 +1370,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* kqv = nullptr;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
+        if (q_in->type != GGML_TYPE_F32) {
+            q_in = ggml_cast(ctx, q_in, GGML_TYPE_F32);
+        }
         if (kv_pad != 0) {
             k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
         }
@@ -1469,6 +1474,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
     kqv = ggml_ext_cont(ctx, kqv);
     kqv = ggml_reshape_3d(ctx, kqv, d_head * n_head, L_q, N);  // [N, L_q, C]
+    if ((q_type == GGML_TYPE_F16 || q_type == GGML_TYPE_BF16) && kqv->type != q_type) {
+        kqv = ggml_cast(ctx, kqv, q_type);
+    }
 
     return kqv;
 }
@@ -2333,14 +2341,23 @@ public:
         if (bias) {
             b = params["bias"];
         }
+        ggml_tensor* result = nullptr;
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
-            return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, x, w, b, prefix, forward_params);
+            result = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, x, w, b, prefix, forward_params);
+        } else {
+            result = ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32, scale);
         }
-        return ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32, scale);
+        if (!force_prec_f32 &&
+            starts_with(prefix, "model.diffusion_model.") &&
+            (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16) &&
+            result->type != x->type) {
+            result = ggml_cast(ctx->ggml_ctx, result, x->type);
+        }
+        return result;
     }
 };
 
