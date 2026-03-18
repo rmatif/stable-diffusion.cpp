@@ -2468,6 +2468,13 @@ public:
         bool has_unconditioned = img_cfg_scale != 1.0 && uncond.c_crossattn != nullptr;
         bool has_img_cond      = cfg_scale != img_cfg_scale && img_cond.c_crossattn != nullptr;
         bool has_skiplayer     = slg_scale != 0.0 && skip_layers.size() > 0;
+        bool can_freeze_graph  = !has_unconditioned &&
+                                !has_img_cond &&
+                                !has_skiplayer &&
+                                control_hint == nullptr &&
+                                control_net == nullptr &&
+                                cfg_scale <= 1.0f &&
+                                img_cfg_scale <= 1.0f;
 
         // denoise wrapper
         ggml_tensor* out_cond     = ggml_dup_tensor(work_ctx, x);
@@ -2611,6 +2618,7 @@ public:
             diffusion_params.control_strength   = control_strength;
             diffusion_params.vace_context       = vace_context;
             diffusion_params.vace_strength      = vace_strength;
+            diffusion_params.freeze_graph       = can_freeze_graph && step > 0 && step < static_cast<int>(steps);
 
             auto run_diffusion_condition = [&](const SDCondition* condition, ggml_tensor** output_tensor) -> bool {
                 if (step_cache.before_condition(condition, diffusion_params.x, *output_tensor)) {

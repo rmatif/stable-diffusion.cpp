@@ -113,7 +113,12 @@ public:
 
         auto num_frames = ggml_arange(ctx->ggml_ctx, 0.f, static_cast<float>(timesteps), 1.f);
         // since b is 1, no need to do repeat
-        auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, num_frames, static_cast<int>(in_channels), max_time_embed_period);  // [N, in_channels]
+        auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx,
+                                                 num_frames,
+                                                 static_cast<int>(in_channels),
+                                                 max_time_embed_period,
+                                                 1.0f,
+                                                 GGML_TYPE_F16);  // [N, in_channels]
 
         auto emb = time_pos_embed_0->forward(ctx, t_emb);
         emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
@@ -439,6 +444,9 @@ public:
             if (context->ne[2] != x->ne[3]) {
                 context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, context->ne[0], context->ne[1], x->ne[3]));
             }
+            if (context->type == GGML_TYPE_F32) {
+                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_F16);
+            }
         }
 
         if (c_concat != nullptr) {
@@ -452,6 +460,9 @@ public:
             if (y->ne[1] != x->ne[3]) {
                 y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, y->ne[0], x->ne[3]));
             }
+            if (y->type == GGML_TYPE_F32) {
+                y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_F16);
+            }
         }
 
         auto time_embed_0     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.0"]);
@@ -461,7 +472,12 @@ public:
         auto out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
         auto out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
 
-        auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);  // [N, model_channels]
+        auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx,
+                                                 timesteps,
+                                                 model_channels,
+                                                 10000,
+                                                 1.0f,
+                                                 GGML_TYPE_F16);  // [N, model_channels]
 
         auto emb = time_embed_0->forward(ctx, t_emb);
         emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
@@ -651,6 +667,9 @@ struct UNetModelRunner : public GGMLRunner {
                                         num_video_frames,
                                         controls,
                                         control_strength);
+        if (out->type != GGML_TYPE_F32) {
+            out = ggml_cast(runner_ctx.ggml_ctx, out, GGML_TYPE_F32);
+        }
 
         ggml_build_forward_expand(gf, out);
 
@@ -667,7 +686,8 @@ struct UNetModelRunner : public GGMLRunner {
                  std::vector<ggml_tensor*> controls = {},
                  float control_strength             = 0.f,
                  ggml_tensor** output               = nullptr,
-                 ggml_context* output_ctx           = nullptr) {
+                 ggml_context* output_ctx           = nullptr,
+                 bool freeze_graph                  = false) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
@@ -677,7 +697,7 @@ struct UNetModelRunner : public GGMLRunner {
             return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength);
         };
 
-        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx, freeze_graph);
     }
 
     void test() {

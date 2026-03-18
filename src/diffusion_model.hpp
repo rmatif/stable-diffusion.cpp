@@ -24,6 +24,7 @@ struct DiffusionParams {
     ggml_tensor* vace_context             = nullptr;
     float vace_strength                   = 1.f;
     std::vector<int> skip_layers          = {};
+    bool freeze_graph                     = false;
 };
 
 struct DiffusionModel {
@@ -37,6 +38,7 @@ struct DiffusionModel {
     virtual void free_compute_buffer()                                           = 0;
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) = 0;
     virtual size_t get_params_buffer_size()                                      = 0;
+    virtual void preprocess(int nthreads) {}
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter){};
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
@@ -89,6 +91,10 @@ struct UNetModel : public DiffusionModel {
         unet.set_flash_attention_enabled(enabled);
     }
 
+    void preprocess(int nthreads) override {
+        unet.preprocess(nthreads);
+    }
+
     void set_circular_axes(bool circular_x, bool circular_y) override {
         unet.set_circular_axes(circular_x, circular_y);
     }
@@ -105,7 +111,10 @@ struct UNetModel : public DiffusionModel {
                             diffusion_params.y,
                             diffusion_params.num_video_frames,
                             diffusion_params.controls,
-                            diffusion_params.control_strength, output, output_ctx);
+                            diffusion_params.control_strength,
+                            output,
+                            output_ctx,
+                            diffusion_params.freeze_graph);
     }
 };
 
