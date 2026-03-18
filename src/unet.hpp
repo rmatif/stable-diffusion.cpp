@@ -49,7 +49,8 @@ public:
                                                                                     n_time_mix_heads,
                                                                                     time_mix_d_head,
                                                                                     time_context_dim,
-                                                                                    true));
+                                                                                    true,
+                                                                                    kv_type));
         }
 
         int64_t time_embed_dim     = in_channels * 4;
@@ -245,7 +246,7 @@ public:
         }
 
         // input_blocks
-        blocks["input_blocks.0.0"] = std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, model_channels, {3, 3}, {1, 1}, {1, 1}));
+        blocks["input_blocks.0.0"] = std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, model_channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, true, true));
 
         std::vector<int> input_block_chans;
         input_block_chans.push_back(model_channels);
@@ -255,9 +256,9 @@ public:
 
         auto get_resblock = [&](int64_t channels, int64_t emb_channels, int64_t out_channels) -> ResBlock* {
             if (version == VERSION_SVD) {
-                return new VideoResBlock(channels, emb_channels, out_channels);
+                return new VideoResBlock(channels, emb_channels, out_channels, {3, 3}, 3, 2, true);
             } else {
-                return new ResBlock(channels, emb_channels, out_channels);
+                return new ResBlock(channels, emb_channels, out_channels, {3, 3}, 2, false, false, true);
             }
         };
 
@@ -378,7 +379,7 @@ public:
                         }
                     }
                     std::string name = "output_blocks." + std::to_string(output_block_idx) + "." + std::to_string(up_sample_idx);
-                    blocks[name]     = std::shared_ptr<GGMLBlock>(new UpSampleBlock(ch, ch));
+                    blocks[name]     = std::shared_ptr<GGMLBlock>(new UpSampleBlock(ch, ch, true));
 
                     ds /= 2;
                 }
@@ -390,7 +391,7 @@ public:
         // out
         blocks["out.0"] = std::shared_ptr<GGMLBlock>(new GroupNorm32(ch));  // ch == model_channels
         // out_1 is nn.SiLU()
-        blocks["out.2"] = std::shared_ptr<GGMLBlock>(new Conv2d(model_channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
+        blocks["out.2"] = std::shared_ptr<GGMLBlock>(new Conv2d(model_channels, out_channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, true, true));
     }
 
     ggml_tensor* resblock_forward(std::string name,
@@ -440,12 +441,16 @@ public:
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         // return: [N, out_channels, h, w]
+        if (x->type == GGML_TYPE_F32) {
+            x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+        }
+
         if (context != nullptr) {
-            if (context->ne[2] != x->ne[3]) {
-                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, context->ne[0], context->ne[1], x->ne[3]));
-            }
             if (context->type == GGML_TYPE_F32) {
                 context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_F16);
+            }
+            if (context->ne[2] != x->ne[3]) {
+                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, context->type, context->ne[0], context->ne[1], x->ne[3]));
             }
         }
 
@@ -453,15 +458,18 @@ public:
             if (c_concat->ne[3] != x->ne[3]) {
                 c_concat = ggml_repeat(ctx->ggml_ctx, c_concat, x);
             }
+            if (c_concat->type != x->type) {
+                c_concat = ggml_cast(ctx->ggml_ctx, c_concat, x->type);
+            }
             x = ggml_concat(ctx->ggml_ctx, x, c_concat, 2);
         }
 
         if (y != nullptr) {
-            if (y->ne[1] != x->ne[3]) {
-                y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, y->ne[0], x->ne[3]));
-            }
             if (y->type == GGML_TYPE_F32) {
                 y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_F16);
+            }
+            if (y->ne[1] != x->ne[3]) {
+                y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, y->type, y->ne[0], x->ne[3]));
             }
         }
 
@@ -562,6 +570,10 @@ public:
                     control_offset--;
                 }
 
+                if (h_skip->type != h->type) {
+                    h_skip = ggml_cast(ctx->ggml_ctx, h_skip, h->type);
+                }
+
                 h = ggml_concat(ctx->ggml_ctx, h, h_skip, 2);
 
                 std::string name = "output_blocks." + std::to_string(output_block_idx) + ".0";
@@ -614,6 +626,7 @@ public:
 
 struct UNetModelRunner : public GGMLRunner {
     UnetModelBlock unet;
+    bool preprocessed_weight = false;
 
     UNetModelRunner(ggml_backend_t backend,
                     bool offload_params_to_cpu,
@@ -658,6 +671,10 @@ struct UNetModelRunner : public GGMLRunner {
 
         auto runner_ctx = get_context();
 
+        if (x->type == GGML_TYPE_F32) {
+            x = ggml_cast(runner_ctx.ggml_ctx, x, GGML_TYPE_F16);
+        }
+
         ggml_tensor* out = unet.forward(&runner_ctx,
                                         x,
                                         timesteps,
@@ -698,6 +715,54 @@ struct UNetModelRunner : public GGMLRunner {
         };
 
         return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx, freeze_graph);
+    }
+
+    ggml_cgraph* build_preprocess_graph() {
+#ifdef SD_USE_CUDA
+        ggml_cgraph* gf = ggml_new_graph_custom(params_ctx, UNET_GRAPH_SIZE, false);
+
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (strcmp(t->name, "conv2d_weight_nhwc") == 0) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+
+        return gf;
+#else
+        return nullptr;
+#endif
+    }
+
+    void preprocess(int n_threads) {
+#ifdef SD_USE_CUDA
+        if (preprocessed_weight) {
+            return;
+        }
+
+        ggml_cgraph* gf = build_preprocess_graph();
+        if (gf == nullptr) {
+            return;
+        }
+
+        if (ggml_backend_is_cpu(params_backend)) {
+            ggml_backend_cpu_set_n_threads(params_backend, n_threads);
+        }
+
+        ggml_backend_graph_compute(params_backend, gf);
+
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (strcmp(t->name, "conv2d_weight_nhwc") == 0) {
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    t->src[i] = nullptr;
+                }
+                t->op = GGML_OP_NONE;
+            }
+        }
+
+        preprocessed_weight = true;
+#else
+        SD_UNUSED(n_threads);
+#endif
     }
 
     void test() {

@@ -3746,6 +3746,8 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
             LOG_INFO("PHOTOMAKER: start_merge_step: %d", start_merge_step);
         }
 
+        sd_ctx->sd->diffusion_model->preprocess(sd_ctx->sd->n_threads);
+
         ggml_tensor* x_0 = sd_ctx->sd->sample(work_ctx,
                                               sd_ctx->sd->diffusion_model,
                                               true,

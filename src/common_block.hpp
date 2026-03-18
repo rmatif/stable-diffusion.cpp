@@ -19,7 +19,7 @@ public:
         if (vae_downsample) {
             blocks["conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {2, 2}, {0, 0}));
         } else {
-            blocks["op"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {2, 2}, {1, 1}));
+            blocks["op"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {2, 2}, {1, 1}, {1, 1}, true, true));
         }
     }
 
@@ -46,10 +46,15 @@ protected:
 
 public:
     UpSampleBlock(int channels,
-                  int out_channels)
+                  int out_channels,
+                  bool nhwc = false)
         : channels(channels),
           out_channels(out_channels) {
-        blocks["conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
+        if (nhwc) {
+            blocks["conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {1, 1}, {1, 1}, {1, 1}, true, true));
+        } else {
+            blocks["conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
+        }
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -84,6 +89,7 @@ protected:
     int dims;
     bool skip_t_emb;
     bool exchange_temb_dims;
+    bool nhwc;
 
     std::shared_ptr<GGMLBlock> conv_nd(int dims,
                                        int64_t in_channels,
@@ -94,7 +100,7 @@ protected:
         if (dims == 3) {
             return std::shared_ptr<GGMLBlock>(new Conv3d(in_channels, out_channels, {kernel_size.first, 1, 1}, {1, 1, 1}, {padding.first, 0, 0}));
         } else {
-            return std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, out_channels, kernel_size, {1, 1}, padding));
+            return std::shared_ptr<GGMLBlock>(new Conv2d(in_channels, out_channels, kernel_size, {1, 1}, padding, {1, 1}, true, nhwc));
         }
     }
 
@@ -105,14 +111,16 @@ public:
              std::pair<int, int> kernel_size = {3, 3},
              int dims                        = 2,
              bool exchange_temb_dims         = false,
-             bool skip_t_emb                 = false)
+             bool skip_t_emb                 = false,
+             bool nhwc                       = false)
         : channels(channels),
           emb_channels(emb_channels),
           out_channels(out_channels),
           kernel_size(kernel_size),
           dims(dims),
           skip_t_emb(skip_t_emb),
-          exchange_temb_dims(exchange_temb_dims) {
+          exchange_temb_dims(exchange_temb_dims),
+          nhwc(nhwc) {
         std::pair<int, int> padding = {kernel_size.first / 2, kernel_size.second / 2};
         blocks["in_layers.0"]       = std::shared_ptr<GGMLBlock>(new GroupNorm32(channels));
         // in_layer_1 is nn.SILU()
@@ -193,25 +201,40 @@ class GEGLU : public UnaryBlock {
 protected:
     int64_t dim_in;
     int64_t dim_out;
+    std::string prefix;
+
+    void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+        this->prefix          = prefix;
+        enum ggml_type wtype  = get_type(prefix + "proj.weight", tensor_storage_map, GGML_TYPE_F32);
+        enum ggml_type btype  = GGML_TYPE_F32;
+        params["proj.weight"] = ggml_new_tensor_2d(ctx, wtype, dim_in, dim_out * 2);
+        params["proj.bias"]   = ggml_new_tensor_1d(ctx, btype, dim_out * 2);
+    }
 
 public:
     GEGLU(int64_t dim_in, int64_t dim_out)
-        : dim_in(dim_in), dim_out(dim_out) {
-        blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim_in, dim_out * 2));
-    }
+        : dim_in(dim_in), dim_out(dim_out) {}
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         // x: [ne3, ne2, ne1, dim_in]
         // return: [ne3, ne2, ne1, dim_out]
-        auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
+        ggml_tensor* w = params["proj.weight"];
+        ggml_tensor* b = params["proj.bias"];
+        if (ctx->weight_adapter) {
+            w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, w, prefix + "proj.weight");
+            b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, b, prefix + "proj.bias");
+        }
 
-        x          = proj->forward(ctx, x);  // [ne3, ne2, ne1, dim_out*2]
-        auto x_vec = ggml_ext_chunk(ctx->ggml_ctx, x, 2, 0, false);
-        x          = x_vec[0];  // [ne3, ne2, ne1, dim_out]
-        auto gate  = x_vec[1];  // [ne3, ne2, ne1, dim_out]
+        auto x_w    = ggml_view_2d(ctx->ggml_ctx, w, w->ne[0], w->ne[1] / 2, w->nb[1], 0);
+        auto x_b    = ggml_view_1d(ctx->ggml_ctx, b, b->ne[0] / 2, 0);
+        auto gate_w = ggml_view_2d(ctx->ggml_ctx, w, w->ne[0], w->ne[1] / 2, w->nb[1], w->nb[1] * w->ne[1] / 2);
+        auto gate_b = ggml_view_1d(ctx->ggml_ctx, b, b->ne[0] / 2, b->nb[0] * b->ne[0] / 2);
+
+        auto x_in = x;
+        x         = ggml_ext_linear(ctx->ggml_ctx, x_in, x_w, x_b);
+        auto gate = ggml_ext_linear(ctx->ggml_ctx, x_in, gate_w, gate_b);
 
         gate = ggml_cont(ctx->ggml_ctx, gate);
-
         gate = ggml_ext_gelu(ctx->ggml_ctx, gate, true);
 
         x = ggml_mul(ctx->ggml_ctx, x, gate);  // [ne3, ne2, ne1, dim_out]
@@ -289,16 +312,19 @@ protected:
     int64_t context_dim;
     int64_t n_head;
     int64_t d_head;
+    ggml_type kv_type;
 
 public:
     CrossAttention(int64_t query_dim,
                    int64_t context_dim,
                    int64_t n_head,
-                   int64_t d_head)
+                   int64_t d_head,
+                   ggml_type kv_t = GGML_TYPE_F16)
         : n_head(n_head),
           d_head(d_head),
           query_dim(query_dim),
-          context_dim(context_dim) {
+          context_dim(context_dim),
+          kv_type(kv_t) {
         int64_t inner_dim = d_head * n_head;
 
         blocks["to_q"] = std::shared_ptr<GGMLBlock>(new Linear(query_dim, inner_dim, false));
@@ -329,7 +355,7 @@ public:
         auto k = to_k->forward(ctx, context);  // [N, n_context, inner_dim]
         auto v = to_v->forward(ctx, context);  // [N, n_context, inner_dim]
 
-        x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, inner_dim]
+        x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, nullptr, false, ctx->flash_attn_enabled, 1.0f, kv_type);  // [N, n_token, inner_dim]
 
         x = to_out_0->forward(ctx, x);  // [N, n_token, query_dim]
         return x;
@@ -341,21 +367,23 @@ protected:
     int64_t n_head;
     int64_t d_head;
     bool ff_in;
+    ggml_type kv_type;
 
 public:
     BasicTransformerBlock(int64_t dim,
                           int64_t n_head,
                           int64_t d_head,
                           int64_t context_dim,
-                          bool ff_in = false)
-        : n_head(n_head), d_head(d_head), ff_in(ff_in) {
+                          bool ff_in = false,
+                          ggml_type kv_t = GGML_TYPE_F16)
+        : n_head(n_head), d_head(d_head), ff_in(ff_in), kv_type(kv_t) {
         // disable_self_attn is always False
         // disable_temporal_crossattention is always False
         // switch_temporal_ca_to_sa is always False
         // inner_dim is always None or equal to dim
         // gated_ff is always True
-        blocks["attn1"] = std::shared_ptr<GGMLBlock>(new CrossAttention(dim, dim, n_head, d_head));
-        blocks["attn2"] = std::shared_ptr<GGMLBlock>(new CrossAttention(dim, context_dim, n_head, d_head));
+        blocks["attn1"] = std::shared_ptr<GGMLBlock>(new CrossAttention(dim, dim, n_head, d_head, kv_type));
+        blocks["attn2"] = std::shared_ptr<GGMLBlock>(new CrossAttention(dim, context_dim, n_head, d_head, kv_type));
         blocks["ff"]    = std::shared_ptr<GGMLBlock>(new FeedForward(dim, dim));
         blocks["norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(dim));
         blocks["norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(dim));
@@ -417,6 +445,7 @@ protected:
     int64_t depth       = 1;    // 1
     int64_t context_dim = 768;  // hidden_size, 1024 for VERSION_SD2
     bool use_linear     = false;
+    ggml_type kv_type;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {
         auto iter = tensor_storage_map.find(prefix + "proj_out.weight");
@@ -440,13 +469,15 @@ public:
                        int64_t d_head,
                        int64_t depth,
                        int64_t context_dim,
-                       bool use_linear)
+                       bool use_linear,
+                       ggml_type kv_t = GGML_TYPE_F16)
         : in_channels(in_channels),
           n_head(n_head),
           d_head(d_head),
           depth(depth),
           context_dim(context_dim),
-          use_linear(use_linear) {
+          use_linear(use_linear),
+          kv_type(kv_t) {
         // disable_self_attn is always False
         int64_t inner_dim = n_head * d_head;  // in_channels
         blocks["norm"]    = std::shared_ptr<GGMLBlock>(new GroupNorm32(in_channels));
@@ -458,7 +489,7 @@ public:
 
         for (int i = 0; i < depth; i++) {
             std::string name = "transformer_blocks." + std::to_string(i);
-            blocks[name]     = std::shared_ptr<GGMLBlock>(new BasicTransformerBlock(inner_dim, n_head, d_head, context_dim, false));
+            blocks[name]     = std::shared_ptr<GGMLBlock>(new BasicTransformerBlock(inner_dim, n_head, d_head, context_dim, false, kv_type));
         }
 
         if (use_linear) {
@@ -561,9 +592,10 @@ public:
                   int64_t out_channels,
                   std::pair<int, int> kernel_size = {3, 3},
                   int64_t video_kernel_size       = 3,
-                  int dims                        = 2)  // always 2
-        : ResBlock(channels, emb_channels, out_channels, kernel_size, dims) {
-        blocks["time_stack"] = std::shared_ptr<GGMLBlock>(new ResBlock(out_channels, emb_channels, out_channels, kernel_size, 3, true));
+                  int dims                        = 2,
+                  bool nhwc                       = false)  // always 2
+        : ResBlock(channels, emb_channels, out_channels, kernel_size, dims, false, false, nhwc) {
+        blocks["time_stack"] = std::shared_ptr<GGMLBlock>(new ResBlock(out_channels, emb_channels, out_channels, kernel_size, 3, true, false, nhwc));
         blocks["time_mixer"] = std::shared_ptr<GGMLBlock>(new AlphaBlender());
     }
 

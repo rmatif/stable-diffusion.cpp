@@ -1134,11 +1134,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
                                                 bool direct     = false,
                                                 bool circular_x = false,
                                                 bool circular_y = false,
-                                                float scale     = 1.f) {
+                                                float scale     = 1.f,
+                                                bool NHWC       = false) {
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
-    if (w->ne[2] != x->ne[2] && ggml_n_dims(w) == 2) {
+    if (NHWC || (w != nullptr && (w->layout & GGML_TENSOR_LAYOUT_NHWC))) {
+        NHWC = true;
+    }
+
+    if (!NHWC && w->ne[2] != x->ne[2] && ggml_n_dims(w) == 2) {
         w = ggml_reshape_4d(ctx, w, 1, 1, w->ne[0], w->ne[1]);
     }
 
@@ -1158,7 +1163,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
     }
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
-        x = ggml_add_inplace(ctx, x, b);
+        x = ggml_add(ctx, x, b);
     }
     return x;
 }
@@ -1187,7 +1192,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
 
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
-        x = ggml_add_inplace(ctx, x, b);
+        x = ggml_add(ctx, x, b);
     }
     return x;
 }
@@ -1389,8 +1394,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             mask_in = ggml_transpose(ctx, mask_in);
         } else {
             if (kv_pad > 0) {
-                mask_in         = ggml_ext_zeros(ctx, L_k, L_q, 1, 1);
-                auto pad_tensor = ggml_ext_full(ctx, -INFINITY, kv_pad, L_q, 1, 1);
+                mask_in         = ggml_ext_zeros(ctx, L_k, L_q, 1, 1, GGML_TYPE_F16);
+                auto pad_tensor = ggml_ext_full(ctx, -INFINITY, kv_pad, L_q, 1, 1, GGML_TYPE_F16);
                 mask_in         = ggml_concat(ctx, mask_in, pad_tensor, 0);
             }
         }
@@ -1475,9 +1480,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_layer_norm(ggml_context* ctx,
                                                    float eps = EPS) {
     x = ggml_norm(ctx, x, eps);
     if (w != nullptr) {
-        x = ggml_mul_inplace(ctx, x, w);
+        x = ggml_mul(ctx, x, w);
         if (b != nullptr) {
-            x = ggml_add_inplace(ctx, x, b);
+            x = ggml_add(ctx, x, b);
         }
     }
     return x;
@@ -1496,9 +1501,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
     const float eps = 1e-6f;  // default eps parameter
     x               = ggml_group_norm(ctx, x, num_groups, eps);
     if (w != nullptr && b != nullptr) {
-        x = ggml_mul_inplace(ctx, x, w);
-        // b = ggml_repeat(ctx, b, x);
-        x = ggml_add_inplace(ctx, x, b);
+        x = ggml_mul(ctx, x, w);
+        x = ggml_add(ctx, x, b);
     }
     return x;
 }
@@ -2394,6 +2398,7 @@ protected:
     std::pair<int, int> padding;
     std::pair<int, int> dilation;
     bool bias;
+    bool to_NHWC_layout;
     float scale = 1.f;
     std::string prefix;
 
@@ -2401,6 +2406,15 @@ protected:
         this->prefix         = prefix;
         enum ggml_type wtype = GGML_TYPE_F16;
         params["weight"]     = ggml_new_tensor_4d(ctx, wtype, kernel_size.second, kernel_size.first, in_channels, out_channels);
+#ifdef SD_USE_CUDA
+        if (to_NHWC_layout) {
+            ggml_tensor* t = params["weight"];
+            t = ggml_cont(ctx, ggml_permute(ctx, t, 1, 2, 0, 3));
+            params["weight_nhwc"] = t;
+            ggml_set_NHWC_layout(t);
+            ggml_set_name(t, "conv2d_weight_nhwc");
+        }
+#endif
         if (bias) {
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_channels);
@@ -2414,14 +2428,16 @@ public:
            std::pair<int, int> stride   = {1, 1},
            std::pair<int, int> padding  = {0, 0},
            std::pair<int, int> dilation = {1, 1},
-           bool bias                    = true)
+           bool bias                    = true,
+           bool nhwc                    = false)
         : in_channels(in_channels),
           out_channels(out_channels),
           kernel_size(kernel_size),
           stride(stride),
           padding(padding),
           dilation(dilation),
-          bias(bias) {}
+          bias(bias),
+          to_NHWC_layout(nhwc) {}
 
     void set_scale(float scale_value) {
         scale = scale_value;
@@ -2433,6 +2449,16 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
         ggml_tensor* w = params["weight"];
+        bool use_nhwc = false;
+#ifdef SD_USE_CUDA
+        if (to_NHWC_layout && !ctx->weight_adapter) {
+            auto iter = params.find("weight_nhwc");
+            if (iter != params.end()) {
+                w = iter->second;
+            }
+        }
+        use_nhwc = to_NHWC_layout;
+#endif
         ggml_tensor* b = nullptr;
         if (bias) {
             b = params["bias"];
@@ -2465,7 +2491,8 @@ public:
                                 ctx->conv2d_direct_enabled,
                                 ctx->circular_x_enabled,
                                 ctx->circular_y_enabled,
-                                scale);
+                                scale,
+                                use_nhwc);
     }
 };
 
