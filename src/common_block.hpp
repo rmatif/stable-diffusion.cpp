@@ -67,13 +67,17 @@ public:
         const int64_t output_width = target_width > 0 ? target_width : x->ne[0] * 2;
         const int64_t output_height = target_height > 0 ? target_height : x->ne[1] * 2;
 
-        x = ggml_interpolate(ctx->ggml_ctx,
-                             x,
-                             output_width,
-                             output_height,
-                             x->ne[2],
-                             x->ne[3],
-                             GGML_SCALE_MODE_NEAREST);
+        if (output_width == x->ne[0] * 2 && output_height == x->ne[1] * 2) {
+            x = ggml_upscale(ctx->ggml_ctx, x, 2, GGML_SCALE_MODE_NEAREST);
+        } else {
+            x = ggml_interpolate(ctx->ggml_ctx,
+                                 x,
+                                 output_width,
+                                 output_height,
+                                 x->ne[2],
+                                 x->ne[3],
+                                 GGML_SCALE_MODE_NEAREST);
+        }
         x = conv->forward(ctx, x);
         return x;
     }
@@ -207,12 +211,6 @@ protected:
         this->prefix          = prefix;
         enum ggml_type wtype  = get_type(prefix + "proj.weight", tensor_storage_map, GGML_TYPE_F32);
         enum ggml_type btype  = GGML_TYPE_F32;
-        if (prefix.rfind("model.diffusion_model.", 0) == 0) {
-            btype = wtype;
-            if (btype > GGML_TYPE_F16 && btype != GGML_TYPE_BF16) {
-                btype = GGML_TYPE_F32;
-            }
-        }
         params["proj.weight"] = ggml_new_tensor_2d(ctx, wtype, dim_in, dim_out * 2);
         params["proj.bias"]   = ggml_new_tensor_1d(ctx, btype, dim_out * 2);
     }
@@ -240,18 +238,7 @@ public:
         x         = ggml_ext_linear(ctx->ggml_ctx, x_in, x_w, x_b);
         auto gate = ggml_ext_linear(ctx->ggml_ctx, x_in, gate_w, gate_b);
 
-        if (prefix.rfind("model.diffusion_model.", 0) == 0 &&
-            (x_in->type == GGML_TYPE_F16 || x_in->type == GGML_TYPE_BF16)) {
-            if (x->type != x_in->type) {
-                x = ggml_cast(ctx->ggml_ctx, x, x_in->type);
-            }
-            if (gate->type != x_in->type) {
-                gate = ggml_cast(ctx->ggml_ctx, gate, x_in->type);
-            }
-        }
-
-        gate = ggml_cont(ctx->ggml_ctx, gate);
-        gate = ggml_ext_gelu(ctx->ggml_ctx, gate, true);
+        gate = ggml_gelu_inplace(ctx->ggml_ctx, gate);
 
         x = ggml_mul(ctx->ggml_ctx, x, gate);  // [ne3, ne2, ne1, dim_out]
 
@@ -271,7 +258,7 @@ public:
         auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
 
         x = proj->forward(ctx, x);
-        x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
+        x = ggml_gelu_inplace(ctx->ggml_ctx, x);
         return x;
     }
 };
