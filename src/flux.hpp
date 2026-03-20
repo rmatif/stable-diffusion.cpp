@@ -103,13 +103,11 @@ namespace Flux {
             auto norm     = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
 
             auto qkv         = qkv_proj->forward(ctx, x);
-            int64_t head_dim = qkv->ne[0] / 3 / num_heads;
-            auto q           = ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_heads, qkv->ne[1], qkv->ne[2],
-                                            qkv->nb[0] * head_dim, qkv->nb[1], qkv->nb[2], 0);
-            auto k           = ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_heads, qkv->ne[1], qkv->ne[2],
-                                            qkv->nb[0] * head_dim, qkv->nb[1], qkv->nb[2], (qkv->nb[0]) * qkv->ne[0] / 3);
-            auto v           = ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_heads, qkv->ne[1], qkv->ne[2],
-                                            qkv->nb[0] * head_dim, qkv->nb[1], qkv->nb[2], (qkv->nb[0]) * 2 * qkv->ne[0] / 3);
+            auto qkv_vec     = ggml_ext_chunk(ctx->ggml_ctx, qkv, 3, 0, true);
+            int64_t head_dim = qkv_vec[0]->ne[0] / num_heads;
+            auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[0], head_dim, num_heads, qkv_vec[0]->ne[1], qkv_vec[0]->ne[2]);
+            auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[1], head_dim, num_heads, qkv_vec[1]->ne[1], qkv_vec[1]->ne[2]);
+            auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[2], head_dim, num_heads, qkv_vec[2]->ne[1], qkv_vec[2]->ne[2]);
             q                = norm->query_norm(ctx, q);
             k                = norm->key_norm(ctx, k);
             return {q, k, v};
@@ -155,7 +153,7 @@ namespace Flux {
             if (use_mlp_silu_act) {
                 x = ggml_ext_silu_act(ctx->ggml_ctx, x);
             } else {
-                x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
+                x = ggml_gelu_inplace(ctx->ggml_ctx, x);
             }
             x = mlp_2->forward(ctx, x);
             return x;
@@ -495,24 +493,27 @@ namespace Flux {
 
             int64_t head_dim = hidden_size / num_heads;
 
-            auto q = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], 0);
-            auto k = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], (qkv_mlp->nb[0]) * hidden_size);
-            auto v = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
-                                  qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], (qkv_mlp->nb[0]) * 2 * hidden_size);
+            auto q = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, hidden_size, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], 0);
+            auto k = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, hidden_size, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * qkv_mlp->nb[0]);
+            auto v = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, hidden_size, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * 2 * qkv_mlp->nb[0]);
 
+            q         = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, q), head_dim, num_heads, q->ne[1], q->ne[2]);
+            k         = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, k), head_dim, num_heads, k->ne[1], k->ne[2]);
+            v         = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, v), head_dim, num_heads, v->ne[1], v->ne[2]);
             q         = norm->query_norm(ctx, q);
             k         = norm->key_norm(ctx, k);
             auto attn = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, hidden_size]
 
             auto mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * 3 * qkv_mlp->nb[0]);
+            if (!ggml_is_contiguous(mlp)) {
+                mlp = ggml_cont(ctx->ggml_ctx, mlp);
+            }
             if (use_yak_mlp) {
                 mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp, false);
             } else if (use_mlp_silu_act) {
                 mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp);
             } else {
-                mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
+                mlp = ggml_gelu_inplace(ctx->ggml_ctx, mlp);
             }
             auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
             auto output   = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
@@ -869,13 +870,13 @@ namespace Flux {
             if (params.is_chroma) {
                 int64_t mod_index_length = 344;
                 auto approx              = std::dynamic_pointer_cast<ChromaApproximator>(blocks["distilled_guidance_layer"]);
-                auto distill_timestep    = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 16, 10000, 1000.f);
-                auto distill_guidance    = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 16, 10000, 1000.f);
+                auto distill_timestep    = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 16, 10000, 1000.f, GGML_TYPE_BF16);
+                auto distill_guidance    = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 16, 10000, 1000.f, GGML_TYPE_BF16);
 
                 // auto mod_index_arange  = ggml_arange(ctx, 0, (float)mod_index_length, 1);
                 // ggml_arange tot working on a lot of backends, precomputing it on CPU instead
                 GGML_ASSERT(mod_index_arange != nullptr);
-                auto modulation_index = ggml_ext_timestep_embedding(ctx->ggml_ctx, mod_index_arange, 32, 10000, 1000.f);  // [1, 344, 32]
+                auto modulation_index = ggml_ext_timestep_embedding(ctx->ggml_ctx, mod_index_arange, 32, 10000, 1000.f, GGML_TYPE_BF16);  // [1, 344, 32]
 
                 // Batch broadcast (will it ever be useful)
                 modulation_index = ggml_repeat(ctx->ggml_ctx, modulation_index, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, modulation_index->ne[0], modulation_index->ne[1], img->ne[2]));  // [N, 344, 32]
@@ -893,12 +894,12 @@ namespace Flux {
                 }
             } else {
                 auto time_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["time_in"]);
-                vec          = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f));
+                vec          = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f, GGML_TYPE_BF16));
                 if (params.guidance_embed) {
                     GGML_ASSERT(guidance != nullptr);
                     auto guidance_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["guidance_in"]);
                     // bf16 and fp16 result is different
-                    auto g_in = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 256, 10000, 1000.f);
+                    auto g_in = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 256, 10000, 1000.f, GGML_TYPE_BF16);
                     vec       = ggml_add(ctx->ggml_ctx, vec, guidance_in->forward(ctx, g_in));
                 }
 
@@ -1140,6 +1141,28 @@ namespace Flux {
             // guidance: (N,)
             // pe: (L, d_head/2, 2, 2)
             // return: (N, C, H, W)
+
+            if (x->type == GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_BF16);
+            }
+            if (y != nullptr && y->type == GGML_TYPE_F32) {
+                y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_BF16);
+            }
+            if (context->type == GGML_TYPE_F32) {
+                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+            }
+            if (pe != nullptr && pe->type == GGML_TYPE_F32) {
+                pe = ggml_cast(ctx->ggml_ctx, pe, GGML_TYPE_BF16);
+            }
+            if (guidance != nullptr && guidance->type == GGML_TYPE_F32) {
+                guidance = ggml_cast(ctx->ggml_ctx, guidance, GGML_TYPE_BF16);
+            }
+            if (mod_index_arange != nullptr && mod_index_arange->type == GGML_TYPE_F32) {
+                mod_index_arange = ggml_cast(ctx->ggml_ctx, mod_index_arange, GGML_TYPE_BF16);
+            }
+            if (dct != nullptr && dct->type == GGML_TYPE_F32) {
+                dct = ggml_cast(ctx->ggml_ctx, dct, GGML_TYPE_BF16);
+            }
 
             if (params.version == VERSION_CHROMA_RADIANCE) {
                 return forward_chroma_radiance(ctx,
@@ -1450,6 +1473,10 @@ namespace Flux {
                                             ref_latents,
                                             skip_layers);
 
+            if (out->type != GGML_TYPE_F32) {
+                out = ggml_cast(runner_ctx.ggml_ctx, out, GGML_TYPE_F32);
+            }
+
             ggml_build_forward_expand(gf, out);
 
             return gf;
@@ -1466,7 +1493,8 @@ namespace Flux {
                      bool increase_ref_index               = false,
                      ggml_tensor** output                  = nullptr,
                      ggml_context* output_ctx              = nullptr,
-                     std::vector<int> skip_layers          = std::vector<int>()) {
+                     std::vector<int> skip_layers          = std::vector<int>(),
+                     bool freeze_graph                     = false) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
@@ -1476,7 +1504,7 @@ namespace Flux {
                 return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers);
             };
 
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx, freeze_graph);
         }
 
         void test() {

@@ -248,7 +248,8 @@ struct FluxModel : public DiffusionModel {
                             diffusion_params.increase_ref_index,
                             output,
                             output_ctx,
-                            diffusion_params.skip_layers);
+                            diffusion_params.skip_layers,
+                            diffusion_params.freeze_graph);
     }
 };
 

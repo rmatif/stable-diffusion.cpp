@@ -1048,7 +1048,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                                                bool force_prec_f32 = false,
                                                float scale         = 1.f) {
     if (scale != 1.f) {
-        x = ggml_ext_scale(ctx, x, scale);
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx, x);
+        }
+        x = ggml_scale(ctx, x, scale);
     }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
@@ -1056,18 +1059,15 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
         int64_t ne3 = x->ne[3];
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
         x           = ggml_mul_mat(ctx, w, x);
-        if (force_prec_f32) {
-            ggml_mul_mat_set_prec(x, GGML_PREC_F32);
-        }
         x = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
     } else {
         x = ggml_mul_mat(ctx, w, x);
-        if (force_prec_f32) {
-            ggml_mul_mat_set_prec(x, GGML_PREC_F32);
-        }
+    }
+    if (force_prec_f32) {
+        ggml_mul_mat_set_prec(x, GGML_PREC_F32);
     }
     if (scale != 1.f) {
-        x = ggml_ext_scale(ctx, x, 1.f / scale);
+        x = ggml_scale(ctx, x, 1.f / scale);
     }
     if (b != nullptr) {
         x = ggml_add(ctx, x, b);
@@ -1448,7 +1448,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
 
         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
         kq = ggml_scale_inplace(ctx, kq, scale);
         if (mask) {
             kq = ggml_add_inplace(ctx, kq, mask);
@@ -1463,9 +1462,6 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
     kqv = ggml_ext_cont(ctx, kqv);
     kqv = ggml_reshape_3d(ctx, kqv, d_head * n_head, L_q, N);  // [N, L_q, C]
-    if ((q_type == GGML_TYPE_F16 || q_type == GGML_TYPE_BF16) && kqv->type != q_type) {
-        kqv = ggml_cast(ctx, kqv, q_type);
-    }
 
     return kqv;
 }

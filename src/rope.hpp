@@ -7,6 +7,19 @@
 #include "ggml_extend.hpp"
 
 namespace Rope {
+    struct RopeParams {
+        int64_t n_rot = 0;
+        int sections[4] = {0};
+        int rope_type = 0;
+        int32_t n_ctx_orig = 128000;
+        float freq_base = 1.f;
+        const float freq_scale = 1.f;
+        const float ext_factor = 0.f;
+        const float attn_factor = 1.f;
+        const float beta_fast = 32.f;
+        const float beta_slow = 1.f;
+    };
+
     template <class T>
     __STATIC_INLINE__ std::vector<T> linspace(T start, T end, int num) {
         std::vector<T> result(num);
@@ -33,8 +46,28 @@ namespace Rope {
         return transposed;
     }
 
+    __STATIC_INLINE__ std::vector<std::vector<int>> transpose_2(const std::vector<std::vector<int>>& mat) {
+        size_t rows = mat.size();
+        size_t cols = mat[0].size();
+        std::vector<std::vector<int>> transposed(cols, std::vector<int>(rows));
+        for (size_t i = 0; i < rows; ++i) {
+            for (size_t j = 0; j < cols; ++j) {
+                transposed[j][i] = mat[i][j];
+            }
+        }
+        return transposed;
+    }
+
     __STATIC_INLINE__ std::vector<float> flatten(const std::vector<std::vector<float>>& vec) {
         std::vector<float> flat_vec;
+        for (const auto& sub_vec : vec) {
+            flat_vec.insert(flat_vec.end(), sub_vec.begin(), sub_vec.end());
+        }
+        return flat_vec;
+    }
+
+    __STATIC_INLINE__ std::vector<int> flatten_2(const std::vector<std::vector<int>>& vec) {
+        std::vector<int> flat_vec;
         for (const auto& sub_vec : vec) {
             flat_vec.insert(flat_vec.end(), sub_vec.begin(), sub_vec.end());
         }
@@ -148,12 +181,68 @@ namespace Rope {
         return img_ids_repeated;
     }
 
+    __STATIC_INLINE__ std::vector<std::vector<int>> gen_flux_img_ids_2(int h,
+                                                                       int w,
+                                                                       int patch_size,
+                                                                       int bs,
+                                                                       int axes_dim_num,
+                                                                       int index       = 0,
+                                                                       int h_offset    = 0,
+                                                                       int w_offset    = 0,
+                                                                       bool scale_rope = false) {
+        int h_len = (h + (patch_size / 2)) / patch_size;
+        int w_len = (w + (patch_size / 2)) / patch_size;
+
+        std::vector<std::vector<int>> img_ids(h_len * w_len, std::vector<int>(axes_dim_num, 0));
+
+        int h_start = h_offset;
+        int w_start = w_offset;
+
+        if (scale_rope) {
+            h_start -= h_len / 2;
+            w_start -= w_len / 2;
+        }
+
+        for (int i = 0; i < h_len; ++i) {
+            for (int j = 0; j < w_len; ++j) {
+                img_ids[i * w_len + j][0] = index;
+                img_ids[i * w_len + j][1] = i + h_start;
+                img_ids[i * w_len + j][2] = j + w_start;
+            }
+        }
+
+        std::vector<std::vector<int>> img_ids_repeated(bs * img_ids.size(), std::vector<int>(axes_dim_num));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < img_ids.size(); ++j) {
+                img_ids_repeated[i * img_ids.size() + j] = img_ids[j];
+            }
+        }
+        return img_ids_repeated;
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> concat_ids(const std::vector<std::vector<float>>& a,
                                                                  const std::vector<std::vector<float>>& b,
                                                                  int bs) {
         size_t a_len = a.size() / bs;
         size_t b_len = b.size() / bs;
         std::vector<std::vector<float>> ids(a.size() + b.size(), std::vector<float>(3));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < a_len; ++j) {
+                ids[i * (a_len + b_len) + j] = a[i * a_len + j];
+            }
+            for (int j = 0; j < b_len; ++j) {
+                ids[i * (a_len + b_len) + a_len + j] = b[i * b_len + j];
+            }
+        }
+        return ids;
+    }
+
+    __STATIC_INLINE__ std::vector<std::vector<int>> concat_ids_2(const std::vector<std::vector<int>>& a,
+                                                                 const std::vector<std::vector<int>>& b,
+                                                                 int bs) {
+        size_t a_len = a.size() / bs;
+        size_t b_len = b.size() / bs;
+        std::vector<std::vector<int>> ids(a.size() + b.size(), std::vector<int>(4));
         for (int i = 0; i < bs; ++i) {
             for (int j = 0; j < a_len; ++j) {
                 ids[i * (a_len + b_len) + j] = a[i * a_len + j];
@@ -531,73 +620,56 @@ namespace Rope {
         return (m - (a % m)) % m;
     }
 
-    __STATIC_INLINE__ std::vector<std::vector<float>> gen_z_image_ids(int h,
-                                                                      int w,
-                                                                      int patch_size,
-                                                                      int bs,
-                                                                      int context_len,
-                                                                      int seq_multi_of,
-                                                                      const std::vector<ggml_tensor*>& ref_latents,
-                                                                      bool increase_ref_index) {
+    __STATIC_INLINE__ std::vector<std::vector<int>> gen_z_image_ids(int h,
+                                                                    int w,
+                                                                    int patch_size,
+                                                                    int bs,
+                                                                    int context_len,
+                                                                    int seq_multi_of,
+                                                                    const std::vector<ggml_tensor*>& ref_latents,
+                                                                    bool increase_ref_index) {
         int padded_context_len = context_len + bound_mod(context_len, seq_multi_of);
-        auto txt_ids           = std::vector<std::vector<float>>(bs * padded_context_len, std::vector<float>(3, 0.0f));
+        auto txt_ids           = std::vector<std::vector<int>>(bs * padded_context_len, std::vector<int>(4, 0));
         for (int i = 0; i < bs * padded_context_len; i++) {
-            txt_ids[i][0] = (i % padded_context_len) + 1.f;
+            txt_ids[i][0] = (i % padded_context_len) + 1;
         }
 
-        int axes_dim_num = 3;
+        int axes_dim_num = 4;
         int index        = padded_context_len + 1;
-        auto img_ids     = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, index);
+        auto img_ids     = gen_flux_img_ids_2(h, w, patch_size, bs, axes_dim_num, index);
 
         int img_pad_len = bound_mod(static_cast<int>(img_ids.size() / bs), seq_multi_of);
         if (img_pad_len > 0) {
-            std::vector<std::vector<float>> img_pad_ids(bs * img_pad_len, std::vector<float>(3, 0.f));
-            img_ids = concat_ids(img_ids, img_pad_ids, bs);
+            std::vector<std::vector<int>> img_pad_ids(bs * img_pad_len, std::vector<int>(4, 0));
+            img_ids = concat_ids_2(img_ids, img_pad_ids, bs);
         }
 
-        auto ids = concat_ids(txt_ids, img_ids, bs);
+        auto ids = concat_ids_2(txt_ids, img_ids, bs);
 
         // ignore ref_latents for now
         return ids;
     }
 
     // Generate z_image positional embeddings
-    __STATIC_INLINE__ std::vector<float> gen_z_image_pe(int h,
-                                                        int w,
-                                                        int patch_size,
-                                                        int bs,
-                                                        int context_len,
-                                                        int seq_multi_of,
-                                                        const std::vector<ggml_tensor*>& ref_latents,
-                                                        bool increase_ref_index,
-                                                        int theta,
-                                                        bool circular_h,
-                                                        bool circular_w,
-                                                        const std::vector<int>& axes_dim) {
-        std::vector<std::vector<float>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index);
-        std::vector<std::vector<int>> wrap_dims;
-        if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
-            int pad_h = (patch_size - (h % patch_size)) % patch_size;
-            int pad_w = (patch_size - (w % patch_size)) % patch_size;
-            int h_len = (h + pad_h) / patch_size;
-            int w_len = (w + pad_w) / patch_size;
-            if (h_len > 0 && w_len > 0) {
-                size_t pos_len = ids.size() / bs;
-                wrap_dims.assign(axes_dim.size(), std::vector<int>(pos_len, 0));
-                size_t cursor     = context_len + bound_mod(context_len, seq_multi_of);  // skip text (and its padding)
-                size_t img_tokens = static_cast<size_t>(h_len) * static_cast<size_t>(w_len);
-                for (size_t token_i = 0; token_i < img_tokens; ++token_i) {
-                    if (circular_h) {
-                        wrap_dims[1][cursor + token_i] = h_len;
-                    }
-                    if (circular_w) {
-                        wrap_dims[2][cursor + token_i] = w_len;
-                    }
-                }
-            }
-        }
-
-        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims);
+    __STATIC_INLINE__ std::vector<int> gen_z_image_pe(int h,
+                                                      int w,
+                                                      int patch_size,
+                                                      int bs,
+                                                      int context_len,
+                                                      int seq_multi_of,
+                                                      const std::vector<ggml_tensor*>& ref_latents,
+                                                      bool increase_ref_index,
+                                                      int theta,
+                                                      bool circular_h,
+                                                      bool circular_w,
+                                                      const std::vector<int>& axes_dim) {
+        (void)theta;
+        (void)circular_h;
+        (void)circular_w;
+        (void)axes_dim;
+        std::vector<std::vector<int>> ids = gen_z_image_ids(h, w, patch_size, bs, context_len, seq_multi_of, ref_latents, increase_ref_index);
+        std::vector<std::vector<int>> trans_ids = transpose_2(ids);
+        return flatten_2(trans_ids);
     }
 
     __STATIC_INLINE__ ggml_tensor* apply_rope(ggml_context* ctx,
@@ -655,7 +727,47 @@ namespace Rope {
         q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
         k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
 
-        auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
+        auto x = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                        ctx->backend,
+                                        q,
+                                        k,
+                                        v,
+                                        v->ne[1],
+                                        mask,
+                                        true,
+                                        ctx->flash_attn_enabled,
+                                        kv_scale,
+                                        GGML_TYPE_BF16);  // [N, L, n_head*d_head]
+        return x;
+    }
+
+    __STATIC_INLINE__ ggml_tensor* attention_2(GGMLRunnerContext* ctx,
+                                               ggml_tensor* q,
+                                               ggml_tensor* k,
+                                               ggml_tensor* v,
+                                               ggml_tensor* pe,
+                                               ggml_tensor* mask,
+                                               RopeParams& param,
+                                               float kv_scale        = 1.0f,
+                                               bool rope_interleaved = true) {
+        (void)rope_interleaved;
+        q = ggml_rope_multi(
+            ctx->ggml_ctx, q, pe, nullptr,
+            param.n_rot, param.sections, param.rope_type, param.n_ctx_orig,
+            param.freq_base, param.freq_scale,
+            param.ext_factor, param.attn_factor, param.beta_fast, param.beta_slow);
+        q = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));
+        q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);
+
+        k = ggml_rope_multi(
+            ctx->ggml_ctx, k, pe, nullptr,
+            param.n_rot, param.sections, param.rope_type, param.n_ctx_orig,
+            param.freq_base, param.freq_scale,
+            param.ext_factor, param.attn_factor, param.beta_fast, param.beta_slow);
+        k = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));
+        k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);
+
+        auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale, GGML_TYPE_BF16);
         return x;
     }
 };  // namespace Rope
