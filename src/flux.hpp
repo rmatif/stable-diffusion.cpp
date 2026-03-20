@@ -1303,7 +1303,7 @@ namespace Flux {
                 flux_params.out_channels     = 128;
                 flux_params.mlp_ratio        = 3.f;
                 flux_params.theta            = 2000;
-                flux_params.axes_dim         = {32, 32, 32, 32};
+                flux_params.axes_dim         = {16, 16, 16, 16};
                 flux_params.vec_in_dim       = 0;
                 flux_params.qkv_bias         = false;
                 flux_params.disable_bias     = true;
