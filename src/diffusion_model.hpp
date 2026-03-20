@@ -520,7 +520,8 @@ struct ZImageModel : public DiffusionModel {
                                diffusion_params.ref_latents,
                                true,  // increase_ref_index
                                output,
-                               output_ctx);
+                               output_ctx,
+                               diffusion_params.freeze_graph);
     }
 };
 

@@ -437,6 +437,68 @@ namespace Rope {
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims);
     }
 
+    __STATIC_INLINE__ std::vector<std::vector<int>> gen_flux_txt_ids_2(int bs, int context_len, int axes_dim_num, std::set<int> arange_dims) {
+        auto txt_ids = std::vector<std::vector<int>>(bs * context_len, std::vector<int>(axes_dim_num, 0));
+        for (int dim = 0; dim < axes_dim_num; dim++) {
+            if (arange_dims.find(dim) != arange_dims.end()) {
+                for (int i = 0; i < bs * context_len; i++) {
+                    txt_ids[i][dim] = (i % context_len);
+                }
+            }
+        }
+        return txt_ids;
+    }
+
+    __STATIC_INLINE__ std::vector<std::vector<int>> gen_flux_ids_2(int h,
+                                                                   int w,
+                                                                   int patch_size,
+                                                                   int bs,
+                                                                   int axes_dim_num,
+                                                                   int context_len,
+                                                                   std::set<int> txt_arange_dims,
+                                                                   const std::vector<ggml_tensor*>& ref_latents,
+                                                                   bool increase_ref_index,
+                                                                   float ref_index_scale) {
+        auto txt_ids = gen_flux_txt_ids_2(bs, context_len, axes_dim_num, txt_arange_dims);
+        auto img_ids = gen_flux_img_ids_2(h, w, patch_size, bs, axes_dim_num);
+
+        auto ids = concat_ids_2(txt_ids, img_ids, bs);
+        (void) ref_latents;
+        (void) increase_ref_index;
+        (void) ref_index_scale;
+        return ids;
+    }
+
+    __STATIC_INLINE__ std::vector<int> gen_flux_pe_2(int h,
+                                                     int w,
+                                                     int patch_size,
+                                                     int bs,
+                                                     int context_len,
+                                                     std::set<int> txt_arange_dims,
+                                                     const std::vector<ggml_tensor*>& ref_latents,
+                                                     bool increase_ref_index,
+                                                     float ref_index_scale,
+                                                     int theta,
+                                                     bool circular_h,
+                                                     bool circular_w,
+                                                     const std::vector<int>& axes_dim) {
+        (void) theta;
+        (void) circular_h;
+        (void) circular_w;
+        std::vector<std::vector<int>> ids = gen_flux_ids_2(h,
+                                                           w,
+                                                           patch_size,
+                                                           bs,
+                                                           static_cast<int>(axes_dim.size()) >= 4 ? static_cast<int>(axes_dim.size()) : static_cast<int>(axes_dim.size()) + 1,
+                                                           context_len,
+                                                           txt_arange_dims,
+                                                           ref_latents,
+                                                           increase_ref_index,
+                                                           ref_index_scale);
+        std::vector<std::vector<int>> trans_ids = transpose_2(ids);
+        return flatten_2(trans_ids);
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_qwen_image_ids(int h,
                                                                          int w,
                                                                          int patch_size,
@@ -525,6 +587,52 @@ namespace Rope {
         }
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims);
     }
+
+    __STATIC_INLINE__ std::vector<std::vector<int>> gen_qwen_image_ids_2(int h,
+                                                                         int w,
+                                                                         int patch_size,
+                                                                         int bs,
+                                                                         int context_len,
+                                                                         const std::vector<ggml_tensor*>& ref_latents,
+                                                                         bool increase_ref_index) {
+        (void) ref_latents;
+        (void) increase_ref_index;
+        int h_len        = (h + (patch_size / 2)) / patch_size;
+        int w_len        = (w + (patch_size / 2)) / patch_size;
+        int txt_id_start = std::max(h_len, w_len);
+        std::vector<std::vector<int>> txt_ids_repeated(bs * context_len, std::vector<int>(4));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < context_len; ++j) {
+                int txt_id = j + txt_id_start;
+                txt_ids_repeated[i * context_len + j] = {txt_id, txt_id, txt_id, 0};
+            }
+        }
+        int axes_dim_num = 4;
+        auto img_ids     = gen_flux_img_ids_2(h, w, patch_size, bs, axes_dim_num);
+        return concat_ids_2(txt_ids_repeated, img_ids, bs);
+    }
+
+    __STATIC_INLINE__ std::vector<int> gen_qwen_image_pe_2(int h,
+                                                           int w,
+                                                           int patch_size,
+                                                           int bs,
+                                                           int context_len,
+                                                           const std::vector<ggml_tensor*>& ref_latents,
+                                                           bool increase_ref_index,
+                                                           int theta,
+                                                           bool circular_h,
+                                                           bool circular_w,
+                                                           const std::vector<int>& axes_dim) {
+        (void) theta;
+        (void) circular_h;
+        (void) circular_w;
+        (void) axes_dim;
+        std::vector<std::vector<int>> ids =
+            gen_qwen_image_ids_2(h, w, patch_size, bs, context_len, ref_latents, increase_ref_index);
+        std::vector<std::vector<int>> trans_ids = transpose_2(ids);
+        return flatten_2(trans_ids);
+    }
+
 
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_vid_ids(int t,
                                                                   int h,

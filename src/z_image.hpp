@@ -348,6 +348,55 @@ namespace ZImage {
             blocks["final_layer"] = std::make_shared<FinalLayer>(z_image_params.hidden_size, z_image_params.patch_size, z_image_params.out_channels);
         }
 
+        ggml_tensor* pad_to_patch_size(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            int64_t W = x->ne[0];
+            int64_t H = x->ne[1];
+
+            int pad_h = (z_image_params.patch_size - H % z_image_params.patch_size) % z_image_params.patch_size;
+            int pad_w = (z_image_params.patch_size - W % z_image_params.patch_size) % z_image_params.patch_size;
+            return ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+        }
+
+        ggml_tensor* patchify(ggml_context* ctx, ggml_tensor* x) {
+            int64_t N = x->ne[3];
+            int64_t C = x->ne[2];
+            int64_t H = x->ne[1];
+            int64_t W = x->ne[0];
+            int64_t p = z_image_params.patch_size;
+            int64_t h = H / p;
+            int64_t w = W / p;
+
+            GGML_ASSERT(h * p == H && w * p == W);
+
+            x = ggml_reshape_4d(ctx, x, p, w, p, h * C * N);
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+            x = ggml_reshape_4d(ctx, x, p * p, w * h, C, N);
+            x = ggml_cont(ctx, ggml_ext_torch_permute(ctx, x, 2, 0, 1, 3));
+            x = ggml_reshape_3d(ctx, x, C * p * p, w * h, N);
+            return x;
+        }
+
+        ggml_tensor* process_img(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            return patchify(ctx->ggml_ctx, pad_to_patch_size(ctx, x));
+        }
+
+        ggml_tensor* unpatchify(ggml_context* ctx, ggml_tensor* x, int64_t h, int64_t w) {
+            int64_t N = x->ne[2];
+            int64_t p = z_image_params.patch_size;
+            int64_t C = x->ne[0] / (p * p);
+            int64_t H = h * p;
+            int64_t W = w * p;
+
+            GGML_ASSERT(C * p * p == x->ne[0]);
+
+            x = ggml_reshape_4d(ctx, x, C, p * p, w * h, N);
+            x = ggml_cont(ctx, ggml_ext_torch_permute(ctx, x, 1, 2, 0, 3));
+            x = ggml_reshape_4d(ctx, x, p, p, w, h * C * N);
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+            x = ggml_reshape_4d(ctx, x, W, H, C, N);
+            return x;
+        }
+
         ggml_tensor* forward_core(GGMLRunnerContext* ctx,
                                   ggml_tensor* x,
                                   ggml_tensor* timestep,
@@ -425,12 +474,6 @@ namespace ZImage {
                 txt_img = block->forward(ctx, txt_img, pe, rpar, nullptr, t_emb);
             }
 
-            if (txt_img->type != GGML_TYPE_F32) {
-                txt_img = ggml_cast(ctx->ggml_ctx, txt_img, GGML_TYPE_F32);
-            }
-            if (t_emb->type != GGML_TYPE_F32) {
-                t_emb = ggml_cast(ctx->ggml_ctx, t_emb, GGML_TYPE_F32);
-            }
             txt_img = final_layer->forward(ctx, txt_img, t_emb);  // [N, n_txt_token + n_txt_pad_token + n_img_token + n_img_pad_token, ph*pw*C]
 
             img = ggml_ext_slice(ctx->ggml_ctx, txt_img, 1, n_txt_token + n_txt_pad_token, n_txt_token + n_txt_pad_token + n_img_token);  // [N, n_img_token, ph*pw*C]
@@ -456,13 +499,14 @@ namespace ZImage {
             int64_t C = x->ne[2];
             int64_t N = x->ne[3];
 
-            int patch_size       = z_image_params.patch_size;
-            auto img             = DiT::pad_and_patchify(ctx, x, patch_size, patch_size, false);
+            auto img             = process_img(ctx, x);
             uint64_t n_img_token = img->ne[1];
+            int64_t h_len        = (H + (z_image_params.patch_size / 2)) / z_image_params.patch_size;
+            int64_t w_len        = (W + (z_image_params.patch_size / 2)) / z_image_params.patch_size;
 
             if (ref_latents.size() > 0) {
                 for (ggml_tensor* ref : ref_latents) {
-                    ref = DiT::pad_and_patchify(ctx, ref, patch_size, patch_size, false);
+                    ref = process_img(ctx, ref);
                     img = ggml_concat(ctx->ggml_ctx, img, ref, 1);
                 }
             }
@@ -477,7 +521,9 @@ namespace ZImage {
             auto out = forward_core(ctx, img, timestep, context, pe);
 
             out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, n_img_token);
-            out = DiT::unpatchify_and_crop(ctx->ggml_ctx, out, H, W, patch_size, patch_size, false);
+            out = unpatchify(ctx->ggml_ctx, out, h_len, w_len);
+            out = ggml_ext_slice(ctx->ggml_ctx, out, 1, 0, H);
+            out = ggml_ext_slice(ctx->ggml_ctx, out, 0, 0, W);
 
             out = ggml_ext_scale(ctx->ggml_ctx, out, -1.f);
 
@@ -566,7 +612,8 @@ namespace ZImage {
                      std::vector<ggml_tensor*> ref_latents = {},
                      bool increase_ref_index               = false,
                      ggml_tensor** output                  = nullptr,
-                     ggml_context* output_ctx              = nullptr) {
+                     ggml_context* output_ctx              = nullptr,
+                     bool freeze_graph                     = false) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
@@ -574,7 +621,7 @@ namespace ZImage {
                 return build_graph(x, timesteps, context, ref_latents, increase_ref_index);
             };
 
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx, freeze_graph);
         }
 
         void test() {

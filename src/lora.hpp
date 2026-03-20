@@ -12,6 +12,8 @@ struct LoraModel : public GGMLRunner {
     std::unordered_map<std::string, ggml_tensor*> lora_tensors;
     std::map<ggml_tensor*, ggml_tensor*> original_tensor_to_final_tensor;
     std::set<std::string> applied_lora_tensors;
+    std::vector<int> zero_index_vec = {0};
+    ggml_tensor* zero_index         = nullptr;
     std::string file_path;
     ModelLoader model_loader;
     bool load_failed         = false;
@@ -127,6 +129,13 @@ struct LoraModel : public GGMLRunner {
 
             lora_tensors = std::move(new_lora_tensors);
         }
+    }
+
+    ggml_tensor* to_f32(ggml_context* ctx, ggml_tensor* a) {
+        auto out = ggml_reshape_1d(ctx, a, ggml_nelements(a));
+        out      = ggml_get_rows(ctx, out, zero_index);
+        out      = ggml_reshape(ctx, out, a);
+        return out;
     }
 
     ggml_tensor* get_lora_weight_diff(const std::string& model_tensor_name, ggml_context* ctx) {
@@ -756,6 +765,10 @@ struct LoraModel : public GGMLRunner {
         original_tensor_to_final_tensor.clear();
         applied_lora_tensors.clear();
 
+        zero_index = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, 1);
+        set_backend_tensor_data(zero_index, zero_index_vec.data());
+        ggml_build_forward_expand(gf, zero_index);
+
         for (auto it : model_tensors) {
             std::string model_tensor_name = it.first;
             ggml_tensor* model_tensor     = it.second;
@@ -767,21 +780,25 @@ struct LoraModel : public GGMLRunner {
             }
 
             ggml_tensor* original_tensor = model_tensor;
-            if (!ggml_backend_is_cpu(runtime_backend) && ggml_backend_buffer_is_host(original_tensor->buffer)) {
+            if (!ggml_backend_is_cpu(runtime_backend) &&
+                original_tensor->buffer != nullptr &&
+                ggml_backend_buffer_is_host(original_tensor->buffer)) {
                 model_tensor = ggml_dup_tensor(compute_ctx, model_tensor);
                 set_backend_tensor_data(model_tensor, original_tensor->data);
             }
 
             ggml_tensor* final_tensor;
             if (model_tensor->type != GGML_TYPE_F32 && model_tensor->type != GGML_TYPE_F16) {
-                final_tensor = ggml_ext_cast_f32(compute_ctx, model_tensor);
+                final_tensor = to_f32(compute_ctx, model_tensor);
                 final_tensor = ggml_add_inplace(compute_ctx, final_tensor, diff);
                 final_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
             } else {
                 final_tensor = ggml_add_inplace(compute_ctx, model_tensor, diff);
             }
             ggml_build_forward_expand(gf, final_tensor);
-            if (!ggml_backend_is_cpu(runtime_backend) && ggml_backend_buffer_is_host(original_tensor->buffer)) {
+            if (!ggml_backend_is_cpu(runtime_backend) &&
+                original_tensor->buffer != nullptr &&
+                ggml_backend_buffer_is_host(original_tensor->buffer)) {
                 original_tensor_to_final_tensor[original_tensor] = final_tensor;
             }
         }

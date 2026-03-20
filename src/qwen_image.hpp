@@ -55,7 +55,7 @@ namespace Qwen {
             // return: [N, embedding_dim]
             auto timestep_embedder = std::dynamic_pointer_cast<TimestepEmbedding>(blocks["timestep_embedder"]);
 
-            auto timesteps_proj = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1.f);
+            auto timesteps_proj = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1.f, GGML_TYPE_BF16);
             auto timesteps_emb  = timestep_embedder->forward(ctx, timesteps_proj);
             return timesteps_emb;
         }
@@ -93,19 +93,17 @@ namespace Qwen {
             blocks["norm_added_q"] = std::shared_ptr<GGMLBlock>(new RMSNorm(dim_head, eps));
             blocks["norm_added_k"] = std::shared_ptr<GGMLBlock>(new RMSNorm(dim_head, eps));
 
-            float scale = 1.f / 32.f;
-            // The purpose of the scale here is to prevent NaN issues in certain situations.
-            // For example when using CUDA but the weights are k-quants (not all prompts).
-            blocks["to_out.0"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, out_dim, out_bias, false, false, scale));
+            blocks["to_out.0"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, out_dim, out_bias));
             // to_out.1 is nn.Dropout
 
-            blocks["to_add_out"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, out_context_dim, out_bias, false, false, scale));
+            blocks["to_add_out"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, out_context_dim, out_bias));
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
                                                       ggml_tensor* img,
                                                       ggml_tensor* txt,
                                                       ggml_tensor* pe,
+                                                      Rope::RopeParams& par,
                                                       ggml_tensor* mask = nullptr) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
@@ -157,26 +155,65 @@ namespace Qwen {
             auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
             auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
 
-            auto attn         = Rope::attention(ctx, q, k, v, pe, mask, (1.0f / 128.f));                  // [N, n_txt_token + n_img_token, n_head*d_head]
-            attn              = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, attn, 0, 2, 1, 3));  // [n_txt_token + n_img_token, N, hidden_size]
+            q = ggml_rope_multi(ctx->ggml_ctx,
+                                q,
+                                pe,
+                                nullptr,
+                                par.n_rot,
+                                par.sections,
+                                par.rope_type,
+                                par.n_ctx_orig,
+                                par.freq_base,
+                                par.freq_scale,
+                                par.ext_factor,
+                                par.attn_factor,
+                                par.beta_fast,
+                                par.beta_slow);
+            q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);
+
+            k = ggml_rope_multi(ctx->ggml_ctx,
+                                k,
+                                pe,
+                                nullptr,
+                                par.n_rot,
+                                par.sections,
+                                par.rope_type,
+                                par.n_ctx_orig,
+                                par.freq_base,
+                                par.freq_scale,
+                                par.ext_factor,
+                                par.attn_factor,
+                                par.beta_fast,
+                                par.beta_slow);
+            k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);
+
+            auto attn         = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                               ctx->backend,
+                                               q,
+                                               k,
+                                               v,
+                                               v->ne[1],
+                                               mask,
+                                               true,
+                                               ctx->flash_attn_enabled,
+                                               (1.0f / 128.f),
+                                               GGML_TYPE_BF16);
             auto txt_attn_out = ggml_view_3d(ctx->ggml_ctx,
                                              attn,
                                              attn->ne[0],
-                                             attn->ne[1],
                                              txt->ne[1],
+                                             attn->ne[2],
                                              attn->nb[1],
                                              attn->nb[2],
-                                             0);                                                                  // [n_txt_token, N, hidden_size]
+                                             0);
             auto img_attn_out = ggml_view_3d(ctx->ggml_ctx,
                                              attn,
                                              attn->ne[0],
-                                             attn->ne[1],
                                              img->ne[1],
+                                             attn->ne[2],
                                              attn->nb[1],
                                              attn->nb[2],
-                                             attn->nb[2] * txt->ne[1]);                                           // [n_img_token, N, hidden_size]
-            txt_attn_out      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, txt_attn_out, 0, 2, 1, 3));  // [N, n_txt_token, hidden_size]
-            img_attn_out      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, img_attn_out, 0, 2, 1, 3));  // [N, n_img_token, hidden_size]
+                                             txt->ne[1] * attn->nb[1]);
 
             img_attn_out = to_out_0->forward(ctx, img_attn_out);
             txt_attn_out = to_add_out->forward(ctx, txt_attn_out);
@@ -196,7 +233,7 @@ namespace Qwen {
 
             blocks["img_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(dim, eps, false));
             blocks["img_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(dim, eps, false));
-            blocks["img_mlp"]   = std::shared_ptr<GGMLBlock>(new FeedForward(dim, dim, 4, FeedForward::Activation::GELU, true));
+            blocks["img_mlp"]   = std::shared_ptr<GGMLBlock>(new FeedForward(dim, dim, 4, FeedForward::Activation::GELU));
 
             // txt_mod.0 is nn.SiLU()
             blocks["txt_mod.1"] = std::shared_ptr<GGMLBlock>(new Linear(dim, 6 * dim, true));
@@ -219,7 +256,8 @@ namespace Qwen {
                                                               ggml_tensor* img,
                                                               ggml_tensor* txt,
                                                               ggml_tensor* t_emb,
-                                                              ggml_tensor* pe) {
+                                                              ggml_tensor* pe,
+                                                              Rope::RopeParams& par) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -253,7 +291,7 @@ namespace Qwen {
             auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_param_vec[0], txt_mod_param_vec[1]);
             auto txt_gate1     = txt_mod_param_vec[2];
 
-            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe);
+            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe, par);
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
@@ -318,7 +356,7 @@ namespace Qwen {
         int64_t num_attention_heads = 24;
         int64_t joint_attention_dim = 3584;
         float theta                 = 10000;
-        std::vector<int> axes_dim   = {16, 56, 56};
+        std::vector<int> axes_dim   = {8, 28, 28};
         int64_t axes_dim_sum        = 128;
     };
 
@@ -420,6 +458,12 @@ namespace Qwen {
             auto norm_out        = std::dynamic_pointer_cast<AdaLayerNormContinuous>(blocks["norm_out"]);
             auto proj_out        = std::dynamic_pointer_cast<Linear>(blocks["proj_out"]);
 
+            Rope::RopeParams rpar;
+            rpar.freq_base = params.theta;
+            rpar.n_rot     = params.axes_dim_sum;
+            rpar.rope_type = GGML_ROPE_TYPE_IMROPE_PERM;
+            memcpy(rpar.sections, params.axes_dim.data(), sizeof(int) * params.axes_dim.size());
+
             auto t_emb = time_text_embed->forward(ctx, timestep);
             auto img = img_in->forward(ctx, x);
             auto txt = txt_norm->forward(ctx, context);
@@ -428,7 +472,7 @@ namespace Qwen {
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<QwenImageTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
 
-                auto result = block->forward(ctx, img, txt, t_emb, pe);
+                auto result = block->forward(ctx, img, txt, t_emb, pe, rpar);
                 img         = result.first;
                 txt         = result.second;
             }
@@ -467,6 +511,16 @@ namespace Qwen {
                 }
             }
 
+            if (img->type != GGML_TYPE_BF16) {
+                img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_BF16);
+            }
+            if (timestep->type != GGML_TYPE_BF16) {
+                timestep = ggml_cast(ctx->ggml_ctx, timestep, GGML_TYPE_BF16);
+            }
+            if (context->type != GGML_TYPE_BF16) {
+                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+            }
+
             int64_t h_len = ((H + (params.patch_size / 2)) / params.patch_size);
             int64_t w_len = ((W + (params.patch_size / 2)) / params.patch_size);
 
@@ -490,7 +544,7 @@ namespace Qwen {
     public:
         QwenImageParams qwen_image_params;
         QwenImageModel qwen_image;
-        std::vector<float> pe_vec;
+        std::vector<int> pe_vec;
         SDVersion version;
 
         QwenImageRunner(ggml_backend_t backend,
@@ -547,23 +601,18 @@ namespace Qwen {
                 ref_latents[i] = to_backend(ref_latents[i]);
             }
 
-            pe_vec      = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
-                                                  static_cast<int>(x->ne[0]),
-                                                  qwen_image_params.patch_size,
-                                                  static_cast<int>(x->ne[3]),
-                                                  static_cast<int>(context->ne[1]),
-                                                  ref_latents,
-                                                  increase_ref_index,
-                                                  qwen_image_params.theta,
-                                                  circular_y_enabled,
-                                                  circular_x_enabled,
-                                                  qwen_image_params.axes_dim);
-            int pos_len = static_cast<int>(pe_vec.size() / qwen_image_params.axes_dim_sum / 2);
-            // LOG_DEBUG("pos_len %d", pos_len);
-            auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, qwen_image_params.axes_dim_sum / 2, pos_len);
-            // pe->data = pe_vec.data();
-            // print_ggml_tensor(pe, true, "pe");
-            // pe->data = nullptr;
+            pe_vec      = Rope::gen_qwen_image_pe_2(static_cast<int>(x->ne[1]),
+                                                    static_cast<int>(x->ne[0]),
+                                                    qwen_image_params.patch_size,
+                                                    static_cast<int>(x->ne[3]),
+                                                    static_cast<int>(context->ne[1]),
+                                                    ref_latents,
+                                                    increase_ref_index,
+                                                    qwen_image_params.theta,
+                                                    circular_y_enabled,
+                                                    circular_x_enabled,
+                                                    qwen_image_params.axes_dim);
+            auto pe = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, static_cast<int64_t>(pe_vec.size()));
             set_backend_tensor_data(pe, pe_vec.data());
 
             auto runner_ctx = get_context();
@@ -574,6 +623,10 @@ namespace Qwen {
                                                   context,
                                                   pe,
                                                   ref_latents);
+
+            if (out->type != GGML_TYPE_F32) {
+                out = ggml_cast(runner_ctx.ggml_ctx, out, GGML_TYPE_F32);
+            }
 
             ggml_build_forward_expand(gf, out);
 
