@@ -2465,16 +2465,23 @@ public:
 
         ggml_tensor* noised_input = ggml_dup_tensor(work_ctx, x);
 
-        bool has_unconditioned = img_cfg_scale != 1.0 && uncond.c_crossattn != nullptr;
-        bool has_img_cond      = cfg_scale != img_cfg_scale && img_cond.c_crossattn != nullptr;
-        bool has_skiplayer     = slg_scale != 0.0 && skip_layers.size() > 0;
-        bool can_freeze_graph  = !has_unconditioned &&
-                                !has_img_cond &&
+        bool has_unconditioned      = img_cfg_scale != 1.0 && uncond.c_crossattn != nullptr;
+        bool has_img_cond           = cfg_scale != img_cfg_scale && img_cond.c_crossattn != nullptr;
+        bool has_skiplayer          = slg_scale != 0.0 && skip_layers.size() > 0;
+        bool same_condition_shapes  = !has_unconditioned || ggml_are_same_shape(cond.c_crossattn, uncond.c_crossattn);
+        bool can_freeze_cfg_graph   = sd_version_is_qwen_image(version) || sd_version_is_flux2(version);
+        bool can_freeze_graph       = !has_img_cond &&
                                 !has_skiplayer &&
                                 control_hint == nullptr &&
-                                control_net == nullptr &&
-                                cfg_scale <= 1.0f &&
-                                img_cfg_scale <= 1.0f;
+                                control_net == nullptr;
+        if (can_freeze_cfg_graph) {
+            can_freeze_graph = can_freeze_graph && same_condition_shapes;
+        } else {
+            can_freeze_graph = can_freeze_graph &&
+                               !has_unconditioned &&
+                               cfg_scale <= 1.0f &&
+                               img_cfg_scale <= 1.0f;
+        }
 
         // denoise wrapper
         ggml_tensor* out_cond     = ggml_dup_tensor(work_ctx, x);

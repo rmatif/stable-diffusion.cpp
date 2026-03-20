@@ -2099,6 +2099,11 @@ public:
                  ggml_tensor** output                 = nullptr,
                  ggml_context* output_ctx             = nullptr,
                  bool freeze_graph                    = false) {
+#ifdef SD_USE_CUDA
+        if (!ggml_backend_is_cpu(runtime_backend) && compute_allocr == nullptr) {
+            ggml_backend_cuda_reset_graph(runtime_backend);
+        }
+#endif
         if (!offload_params_to_runtime_backend()) {
             LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
             return false;

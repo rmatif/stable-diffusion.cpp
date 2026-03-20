@@ -640,7 +640,8 @@ namespace Qwen {
                      std::vector<ggml_tensor*> ref_latents = {},
                      bool increase_ref_index               = false,
                      ggml_tensor** output                  = nullptr,
-                     ggml_context* output_ctx              = nullptr) {
+                     ggml_context* output_ctx              = nullptr,
+                     bool freeze_graph                     = false) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
@@ -648,7 +649,7 @@ namespace Qwen {
                 return build_graph(x, timesteps, context, ref_latents, increase_ref_index);
             };
 
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx, freeze_graph);
         }
 
         void test() {
