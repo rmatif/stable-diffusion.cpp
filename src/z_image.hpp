@@ -412,7 +412,7 @@ namespace ZImage {
             Rope::RopeParams rpar;
             rpar.freq_base = z_image_params.theta;
             rpar.n_rot     = z_image_params.head_dim;
-            rpar.rope_type = GGML_ROPE_TYPE_MROPE;
+            rpar.rope_type = GGML_ROPE_TYPE_IMROPE_PERM;
             memcpy(rpar.sections, z_image_params.axes_dim.data(), sizeof(int) * z_image_params.axes_dim.size());
 
             auto txt_pad_token = params["cap_pad_token"];
@@ -513,6 +513,9 @@ namespace ZImage {
 
             if (img->type != GGML_TYPE_BF16) {
                 img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_BF16);
+            }
+            if (timestep->type != GGML_TYPE_BF16) {
+                timestep = ggml_cast(ctx->ggml_ctx, timestep, GGML_TYPE_BF16);
             }
             if (context->type != GGML_TYPE_BF16) {
                 context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);

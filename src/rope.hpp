@@ -864,7 +864,6 @@ namespace Rope {
             param.n_rot, param.sections, param.rope_type, param.n_ctx_orig,
             param.freq_base, param.freq_scale,
             param.ext_factor, param.attn_factor, param.beta_fast, param.beta_slow);
-        q = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));
         q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);
 
         k = ggml_rope_multi(
@@ -872,7 +871,6 @@ namespace Rope {
             param.n_rot, param.sections, param.rope_type, param.n_ctx_orig,
             param.freq_base, param.freq_scale,
             param.ext_factor, param.attn_factor, param.beta_fast, param.beta_slow);
-        k = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));
         k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale, GGML_TYPE_BF16);
