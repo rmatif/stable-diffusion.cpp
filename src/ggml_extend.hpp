@@ -1385,7 +1385,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
 
         if (mask_in != nullptr) {
-            mask_in = ggml_transpose(ctx, mask_in);
+            mask_in = ggml_ext_cont(ctx, ggml_transpose(ctx, mask_in));
         } else {
             if (kv_pad > 0) {
                 mask_in         = ggml_ext_zeros(ctx, L_k, L_q, 1, 1, GGML_TYPE_F16);

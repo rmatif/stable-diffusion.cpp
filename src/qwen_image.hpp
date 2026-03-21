@@ -155,49 +155,54 @@ namespace Qwen {
             auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
             auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
 
-            q = ggml_rope_multi(ctx->ggml_ctx,
-                                q,
-                                pe,
-                                nullptr,
-                                par.n_rot,
-                                par.sections,
-                                par.rope_type,
-                                par.n_ctx_orig,
-                                par.freq_base,
-                                par.freq_scale,
-                                par.ext_factor,
-                                par.attn_factor,
-                                par.beta_fast,
-                                par.beta_slow);
-            q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);
+            ggml_tensor* attn = nullptr;
+            if (pe->type == GGML_TYPE_F32) {
+                attn = Rope::attention(ctx, q, k, v, pe, mask, (1.0f / 128.f));
+            } else {
+                q = ggml_rope_multi(ctx->ggml_ctx,
+                                    q,
+                                    pe,
+                                    nullptr,
+                                    par.n_rot,
+                                    par.sections,
+                                    par.rope_type,
+                                    par.n_ctx_orig,
+                                    par.freq_base,
+                                    par.freq_scale,
+                                    par.ext_factor,
+                                    par.attn_factor,
+                                    par.beta_fast,
+                                    par.beta_slow);
+                q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);
 
-            k = ggml_rope_multi(ctx->ggml_ctx,
-                                k,
-                                pe,
-                                nullptr,
-                                par.n_rot,
-                                par.sections,
-                                par.rope_type,
-                                par.n_ctx_orig,
-                                par.freq_base,
-                                par.freq_scale,
-                                par.ext_factor,
-                                par.attn_factor,
-                                par.beta_fast,
-                                par.beta_slow);
-            k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);
+                k = ggml_rope_multi(ctx->ggml_ctx,
+                                    k,
+                                    pe,
+                                    nullptr,
+                                    par.n_rot,
+                                    par.sections,
+                                    par.rope_type,
+                                    par.n_ctx_orig,
+                                    par.freq_base,
+                                    par.freq_scale,
+                                    par.ext_factor,
+                                    par.attn_factor,
+                                    par.beta_fast,
+                                    par.beta_slow);
+                k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);
 
-            auto attn         = ggml_ext_attention_ext(ctx->ggml_ctx,
-                                               ctx->backend,
-                                               q,
-                                               k,
-                                               v,
-                                               v->ne[1],
-                                               mask,
-                                               true,
-                                               ctx->flash_attn_enabled,
-                                               (1.0f / 128.f),
-                                               GGML_TYPE_BF16);
+                attn = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                              ctx->backend,
+                                              q,
+                                              k,
+                                              v,
+                                              v->ne[1],
+                                              mask,
+                                              true,
+                                              ctx->flash_attn_enabled,
+                                              (1.0f / 128.f),
+                                              GGML_TYPE_BF16);
+            }
             auto txt_attn_out = ggml_view_3d(ctx->ggml_ctx,
                                              attn,
                                              attn->ne[0],
@@ -214,6 +219,10 @@ namespace Qwen {
                                              attn->nb[1],
                                              attn->nb[2],
                                              txt->ne[1] * attn->nb[1]);
+            if (pe->type == GGML_TYPE_F32) {
+                img_attn_out = ggml_cont(ctx->ggml_ctx, img_attn_out);
+                txt_attn_out = ggml_cont(ctx->ggml_ctx, txt_attn_out);
+            }
 
             img_attn_out = to_out_0->forward(ctx, img_attn_out);
             txt_attn_out = to_add_out->forward(ctx, txt_attn_out);
@@ -511,14 +520,16 @@ namespace Qwen {
                 }
             }
 
-            if (img->type != GGML_TYPE_BF16) {
-                img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_BF16);
-            }
-            if (timestep->type != GGML_TYPE_BF16) {
-                timestep = ggml_cast(ctx->ggml_ctx, timestep, GGML_TYPE_BF16);
-            }
-            if (context->type != GGML_TYPE_BF16) {
-                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+            if (ref_latents.empty()) {
+                if (img->type != GGML_TYPE_BF16) {
+                    img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_BF16);
+                }
+                if (timestep->type != GGML_TYPE_BF16) {
+                    timestep = ggml_cast(ctx->ggml_ctx, timestep, GGML_TYPE_BF16);
+                }
+                if (context->type != GGML_TYPE_BF16) {
+                    context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+                }
             }
 
             int64_t h_len = ((H + (params.patch_size / 2)) / params.patch_size);
@@ -601,19 +612,38 @@ namespace Qwen {
                 ref_latents[i] = to_backend(ref_latents[i]);
             }
 
-            pe_vec      = Rope::gen_qwen_image_pe_2(static_cast<int>(x->ne[1]),
-                                                    static_cast<int>(x->ne[0]),
-                                                    qwen_image_params.patch_size,
-                                                    static_cast<int>(x->ne[3]),
-                                                    static_cast<int>(context->ne[1]),
-                                                    ref_latents,
-                                                    increase_ref_index,
-                                                    qwen_image_params.theta,
-                                                    circular_y_enabled,
-                                                    circular_x_enabled,
-                                                    qwen_image_params.axes_dim);
-            auto pe = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, static_cast<int64_t>(pe_vec.size()));
-            set_backend_tensor_data(pe, pe_vec.data());
+            ggml_tensor* pe = nullptr;
+            if (ref_latents.empty()) {
+                pe_vec = Rope::gen_qwen_image_pe_2(static_cast<int>(x->ne[1]),
+                                                   static_cast<int>(x->ne[0]),
+                                                   qwen_image_params.patch_size,
+                                                   static_cast<int>(x->ne[3]),
+                                                   static_cast<int>(context->ne[1]),
+                                                   ref_latents,
+                                                   increase_ref_index,
+                                                   qwen_image_params.theta,
+                                                   circular_y_enabled,
+                                                   circular_x_enabled,
+                                                   qwen_image_params.axes_dim);
+                pe = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, static_cast<int64_t>(pe_vec.size()));
+                set_backend_tensor_data(pe, pe_vec.data());
+            } else {
+                static const std::vector<int> legacy_axes_dim = {16, 56, 56};
+                auto pe_vec_f = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
+                                                        static_cast<int>(x->ne[0]),
+                                                        qwen_image_params.patch_size,
+                                                        static_cast<int>(x->ne[3]),
+                                                        static_cast<int>(context->ne[1]),
+                                                        ref_latents,
+                                                        increase_ref_index,
+                                                        qwen_image_params.theta,
+                                                        circular_y_enabled,
+                                                        circular_x_enabled,
+                                                        legacy_axes_dim);
+                int pos_len = static_cast<int>(pe_vec_f.size() / qwen_image_params.axes_dim_sum / 2);
+                pe          = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, qwen_image_params.axes_dim_sum / 2, pos_len);
+                set_backend_tensor_data(pe, pe_vec_f.data());
+            }
 
             auto runner_ctx = get_context();
 
