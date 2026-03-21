@@ -2060,6 +2060,14 @@ public:
         offload_params_to_params_backend();
     }
 
+    void reset_graph() {
+#ifdef SD_USE_CUDA
+        if (!ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_cuda_reset_graph(runtime_backend);
+        }
+#endif
+    }
+
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
         backend_tensor_data_map[tensor] = data;

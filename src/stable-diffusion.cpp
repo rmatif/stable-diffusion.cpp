@@ -2626,6 +2626,34 @@ public:
             diffusion_params.vace_context       = vace_context;
             diffusion_params.vace_strength      = vace_strength;
             diffusion_params.freeze_graph       = can_freeze_graph && step > 0 && step < static_cast<int>(steps);
+            bool reset_qwen_graph_on_shape_change = sd_version_is_qwen_image(version) &&
+                                                    has_unconditioned &&
+                                                    !same_condition_shapes;
+            int64_t last_qwen_context_shape[4]    = {-1, -1, -1, -1};
+
+            auto maybe_reset_qwen_graph = [&](const SDCondition& condition) {
+                if (!reset_qwen_graph_on_shape_change || condition.c_crossattn == nullptr) {
+                    return;
+                }
+
+                bool need_reset = last_qwen_context_shape[0] < 0;
+                if (!need_reset) {
+                    for (int i = 0; i < 4; ++i) {
+                        if (last_qwen_context_shape[i] != condition.c_crossattn->ne[i]) {
+                            need_reset = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (need_reset) {
+                    work_diffusion_model->reset_graph();
+                }
+
+                for (int i = 0; i < 4; ++i) {
+                    last_qwen_context_shape[i] = condition.c_crossattn->ne[i];
+                }
+            };
 
             auto run_diffusion_condition = [&](const SDCondition* condition, ggml_tensor** output_tensor) -> bool {
                 if (step_cache.before_condition(condition, diffusion_params.x, *output_tensor)) {
@@ -2662,6 +2690,7 @@ public:
                 diffusion_params.context  = condition.c_crossattn;
                 diffusion_params.c_concat = condition.c_concat;
                 diffusion_params.y        = condition.c_vector;
+                maybe_reset_qwen_graph(condition);
                 if (!run_diffusion_condition(&condition, output)) {
                     return false;
                 }

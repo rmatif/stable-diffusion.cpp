@@ -43,6 +43,7 @@ struct DiffusionModel {
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_circular_axes(bool circular_x, bool circular_y) = 0;
+    virtual void reset_graph() {}
 };
 
 struct UNetModel : public DiffusionModel {
@@ -440,6 +441,10 @@ struct QwenImageModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         qwen_image.set_circular_axes(circular_x, circular_y);
+    }
+
+    void reset_graph() override {
+        qwen_image.reset_graph();
     }
 
     bool compute(int n_threads,

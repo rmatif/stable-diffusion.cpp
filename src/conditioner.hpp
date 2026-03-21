@@ -1982,8 +1982,6 @@ struct LLMEmbedder : public Conditioner {
     SDVersion version;
     std::shared_ptr<LLM::BPETokenizer> tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
-    int cached_qwen_prompt_length = 0;
-
     LLMEmbedder(ggml_backend_t backend,
                 bool offload_params_to_cpu,
                 const String2TensorStorage& tensor_storage_map = {},
@@ -2263,15 +2261,6 @@ struct LLMEmbedder : public Conditioner {
 
                 prompt += "<|im_end|>\n<|im_start|>assistant\n";
 
-                auto qwen_tokens_and_weights = tokenize(prompt, prompt_attn_range, 0, false);
-                int qwen_prompt_length       = static_cast<int>(std::get<0>(qwen_tokens_and_weights).size());
-                if (!conditioner_params.text.empty()) {
-                    cached_qwen_prompt_length = qwen_prompt_length;
-                } else if (cached_qwen_prompt_length > qwen_prompt_length) {
-                    max_length = cached_qwen_prompt_length;
-                } else {
-                    cached_qwen_prompt_length = qwen_prompt_length;
-                }
             }
         } else if (version == VERSION_FLUX2) {
             prompt_template_encode_start_idx = 0;
