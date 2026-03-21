@@ -266,6 +266,9 @@ namespace Flux {
                                                   Rope::RopeParams& par,
                                                   ggml_tensor* mask,
                                                   float kv_scale) {
+        if (pe->type != GGML_TYPE_I32) {
+            return Rope::attention(ctx, q, k, v, pe, mask, kv_scale);
+        }
         q = ggml_rope_multi(ctx->ggml_ctx,
                             q,
                             pe,
@@ -936,6 +939,7 @@ namespace Flux {
 
             ggml_tensor* vec;
             ggml_tensor* txt_img_mask = nullptr;
+            const bool use_legacy_ref_path = pe != nullptr && pe->type != GGML_TYPE_I32;
             if (params.is_chroma) {
                 int64_t mod_index_length = 344;
                 auto approx              = std::dynamic_pointer_cast<ChromaApproximator>(blocks["distilled_guidance_layer"]);
@@ -963,12 +967,13 @@ namespace Flux {
                 }
             } else {
                 auto time_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["time_in"]);
-                vec          = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f, GGML_TYPE_BF16));
+                const ggml_type timestep_embedding_type = use_legacy_ref_path ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+                vec = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f, timestep_embedding_type));
                 if (params.guidance_embed) {
                     GGML_ASSERT(guidance != nullptr);
                     auto guidance_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["guidance_in"]);
                     // bf16 and fp16 result is different
-                    auto g_in = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 256, 10000, 1000.f, GGML_TYPE_BF16);
+                    auto g_in = ggml_ext_timestep_embedding(ctx->ggml_ctx, guidance, 256, 10000, 1000.f, timestep_embedding_type);
                     vec       = ggml_add(ctx->ggml_ctx, vec, guidance_in->forward(ctx, g_in));
                 }
 
@@ -1211,26 +1216,37 @@ namespace Flux {
             // pe: (L, d_head/2, 2, 2)
             // return: (N, C, H, W)
 
-            if (x->type == GGML_TYPE_F32) {
-                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_BF16);
-            }
-            if (y != nullptr && y->type == GGML_TYPE_F32) {
-                y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_BF16);
-            }
-            if (context->type == GGML_TYPE_F32) {
-                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
-            }
-            if (pe != nullptr && pe->type == GGML_TYPE_F32) {
-                pe = ggml_cast(ctx->ggml_ctx, pe, GGML_TYPE_BF16);
-            }
-            if (guidance != nullptr && guidance->type == GGML_TYPE_F32) {
-                guidance = ggml_cast(ctx->ggml_ctx, guidance, GGML_TYPE_BF16);
-            }
-            if (mod_index_arange != nullptr && mod_index_arange->type == GGML_TYPE_F32) {
-                mod_index_arange = ggml_cast(ctx->ggml_ctx, mod_index_arange, GGML_TYPE_BF16);
-            }
-            if (dct != nullptr && dct->type == GGML_TYPE_F32) {
-                dct = ggml_cast(ctx->ggml_ctx, dct, GGML_TYPE_BF16);
+            const bool use_legacy_ref_path = sd_version_is_flux2(params.version) && !ref_latents.empty();
+            if (!use_legacy_ref_path) {
+                if (x->type == GGML_TYPE_F32) {
+                    x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_BF16);
+                }
+                if (y != nullptr && y->type == GGML_TYPE_F32) {
+                    y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_BF16);
+                }
+                if (context->type == GGML_TYPE_F32) {
+                    context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+                }
+                if (pe != nullptr && pe->type == GGML_TYPE_F32) {
+                    pe = ggml_cast(ctx->ggml_ctx, pe, GGML_TYPE_BF16);
+                }
+                if (guidance != nullptr && guidance->type == GGML_TYPE_F32) {
+                    guidance = ggml_cast(ctx->ggml_ctx, guidance, GGML_TYPE_BF16);
+                }
+                if (mod_index_arange != nullptr && mod_index_arange->type == GGML_TYPE_F32) {
+                    mod_index_arange = ggml_cast(ctx->ggml_ctx, mod_index_arange, GGML_TYPE_BF16);
+                }
+                if (dct != nullptr && dct->type == GGML_TYPE_F32) {
+                    dct = ggml_cast(ctx->ggml_ctx, dct, GGML_TYPE_BF16);
+                }
+                if (c_concat != nullptr && c_concat->type != x->type) {
+                    c_concat = ggml_cast(ctx->ggml_ctx, c_concat, x->type);
+                }
+                for (ggml_tensor*& ref : ref_latents) {
+                    if (ref != nullptr && ref->type != x->type) {
+                        ref = ggml_cast(ctx->ggml_ctx, ref, x->type);
+                    }
+                }
             }
 
             if (params.version == VERSION_CHROMA_RADIANCE) {
@@ -1495,21 +1511,47 @@ namespace Flux {
                 txt_arange_dims = {1, 2};
             }
 
-            pe_vec      = Rope::gen_flux_pe_2(static_cast<int>(x->ne[1]),
-                                              static_cast<int>(x->ne[0]),
-                                              flux_params.patch_size,
-                                              static_cast<int>(x->ne[3]),
-                                              static_cast<int>(context->ne[1]),
-                                              txt_arange_dims,
-                                              ref_latents,
-                                              increase_ref_index,
-                                              flux_params.ref_index_scale,
-                                              flux_params.theta,
-                                              circular_y_enabled,
-                                              circular_x_enabled,
-                                              flux_params.axes_dim);
-            auto pe = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, static_cast<int64_t>(pe_vec.size()));
-            set_backend_tensor_data(pe, pe_vec.data());
+            const bool use_legacy_ref_path = sd_version_is_flux2(version) && !ref_latents.empty();
+            ggml_tensor* pe                = nullptr;
+            if (use_legacy_ref_path) {
+                const std::vector<int> legacy_edit_axes_dim = {32, 32, 32, 32};
+                std::vector<float> pe_vec_f32 = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
+                                                                  static_cast<int>(x->ne[0]),
+                                                                  flux_params.patch_size,
+                                                                  static_cast<int>(x->ne[3]),
+                                                                  static_cast<int>(context->ne[1]),
+                                                                  txt_arange_dims,
+                                                                  ref_latents,
+                                                                  increase_ref_index,
+                                                                  flux_params.ref_index_scale,
+                                                                  flux_params.theta,
+                                                                  circular_y_enabled,
+                                                                  circular_x_enabled,
+                                                                  legacy_edit_axes_dim);
+                int legacy_axes_dim_sum = 0;
+                for (int dim : legacy_edit_axes_dim) {
+                    legacy_axes_dim_sum += dim;
+                }
+                int pos_len = static_cast<int>(pe_vec_f32.size() / legacy_axes_dim_sum / 2);
+                pe          = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, legacy_axes_dim_sum / 2, pos_len);
+                set_backend_tensor_data(pe, pe_vec_f32.data());
+            } else {
+                pe_vec = Rope::gen_flux_pe_2(static_cast<int>(x->ne[1]),
+                                             static_cast<int>(x->ne[0]),
+                                             flux_params.patch_size,
+                                             static_cast<int>(x->ne[3]),
+                                             static_cast<int>(context->ne[1]),
+                                             txt_arange_dims,
+                                             ref_latents,
+                                             increase_ref_index,
+                                             flux_params.ref_index_scale,
+                                             flux_params.theta,
+                                             circular_y_enabled,
+                                             circular_x_enabled,
+                                             flux_params.axes_dim);
+                pe = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, static_cast<int64_t>(pe_vec.size()));
+                set_backend_tensor_data(pe, pe_vec.data());
+            }
 
             if (version == VERSION_CHROMA_RADIANCE) {
                 int patch_size     = flux_params.patch_size;
@@ -1537,7 +1579,7 @@ namespace Flux {
                                             ref_latents,
                                             skip_layers);
 
-            if (out->type != GGML_TYPE_F32) {
+            if (!use_legacy_ref_path && out->type != GGML_TYPE_F32) {
                 out = ggml_cast(runner_ctx.ggml_ctx, out, GGML_TYPE_F32);
             }
 

@@ -463,9 +463,42 @@ namespace Rope {
         auto img_ids = gen_flux_img_ids_2(h, w, patch_size, bs, axes_dim_num);
 
         auto ids = concat_ids_2(txt_ids, img_ids, bs);
-        (void) ref_latents;
-        (void) increase_ref_index;
-        (void) ref_index_scale;
+        if (!ref_latents.empty()) {
+            std::vector<std::vector<int>> ref_ids;
+            int curr_h_offset = 0;
+            int curr_w_offset = 0;
+            int index         = 1;
+            for (ggml_tensor* ref : ref_latents) {
+                int h_offset = 0;
+                int w_offset = 0;
+                if (!increase_ref_index) {
+                    if (ref->ne[1] + curr_h_offset > ref->ne[0] + curr_w_offset) {
+                        w_offset = curr_w_offset;
+                    } else {
+                        h_offset = curr_h_offset;
+                    }
+                }
+
+                auto ref_img_ids = gen_flux_img_ids_2(static_cast<int>(ref->ne[1]),
+                                                      static_cast<int>(ref->ne[0]),
+                                                      patch_size,
+                                                      bs,
+                                                      axes_dim_num,
+                                                      static_cast<int>(index * ref_index_scale),
+                                                      h_offset,
+                                                      w_offset,
+                                                      false);
+                ref_ids          = concat_ids_2(ref_ids, ref_img_ids, bs);
+
+                if (increase_ref_index) {
+                    index++;
+                }
+
+                curr_h_offset = std::max(curr_h_offset, static_cast<int>(ref->ne[1]) + h_offset);
+                curr_w_offset = std::max(curr_w_offset, static_cast<int>(ref->ne[0]) + w_offset);
+            }
+            ids = concat_ids_2(ids, ref_ids, bs);
+        }
         return ids;
     }
 
@@ -834,7 +867,6 @@ namespace Rope {
         // return: [N, L, n_head*d_head]
         q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
         k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
-
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx,
                                         ctx->backend,
                                         q,
@@ -844,8 +876,7 @@ namespace Rope {
                                         mask,
                                         true,
                                         ctx->flash_attn_enabled,
-                                        kv_scale,
-                                        GGML_TYPE_BF16);  // [N, L, n_head*d_head]
+                                        kv_scale);  // [N, L, n_head*d_head]
         return x;
     }
 
