@@ -358,6 +358,18 @@ public:
         auto k = to_k->forward(ctx, context);  // [N, n_context, inner_dim]
         auto v = to_v->forward(ctx, context);  // [N, n_context, inner_dim]
 
+        if (ctx->flash_attn_enabled && kv_type == GGML_TYPE_F32) {
+            if (q->type != GGML_TYPE_F32) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+            }
+            if (k->type != GGML_TYPE_F32) {
+                k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F32);
+            }
+            if (v->type != GGML_TYPE_F32) {
+                v = ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F32);
+            }
+        }
+
         x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, nullptr, false, ctx->flash_attn_enabled, 1.0f, kv_type);  // [N, n_token, inner_dim]
 
         x = to_out_0->forward(ctx, x);  // [N, n_token, query_dim]

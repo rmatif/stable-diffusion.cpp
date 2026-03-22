@@ -267,10 +267,11 @@ public:
                                        int64_t d_head,
                                        int64_t depth,
                                        int64_t context_dim) -> SpatialTransformer* {
+            const ggml_type attn_kv_type = version == VERSION_SD1 ? GGML_TYPE_F32 : GGML_TYPE_F16;
             if (version == VERSION_SVD) {
                 return new SpatialVideoTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
             } else {
-                return new SpatialTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
+                return new SpatialTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection, attn_kv_type);
             }
         };
 
