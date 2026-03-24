@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -963,6 +964,15 @@ std::vector<std::string> split_with_special_tokens(
             if (token_pos != std::string::npos && token_pos < next_pos) {
                 next_pos      = token_pos;
                 matched_token = token;
+            }
+        }
+
+        size_t embed_pos = text.find("<embed:", pos);
+        if (embed_pos != std::string::npos) {
+            size_t embed_end = text.find('>', embed_pos + strlen("<embed:"));
+            if (embed_end != std::string::npos && embed_pos < next_pos) {
+                next_pos      = embed_pos;
+                matched_token = text.substr(embed_pos, embed_end - embed_pos + 1);
             }
         }
 

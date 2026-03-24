@@ -97,6 +97,9 @@ private:
     }
 
     bool is_special_token(const std::string& token) {
+        if (starts_with(token, "<embed:") && ends_with(token, ">")) {
+            return true;
+        }
         for (auto& special_token : special_tokens) {
             if (special_token == token) {
                 return true;
@@ -1020,9 +1023,9 @@ struct CLIPTextModelRunner : public GGMLRunner {
         ggml_tensor* embeddings = nullptr;
 
         if (num_custom_embeddings > 0 && custom_embeddings_data != nullptr) {
-            auto token_embed_weight = model.get_token_embed_weight();
+            auto token_embed_weight = ggml_ext_cast_f32(compute_ctx, model.get_token_embed_weight());
             auto custom_embeddings  = ggml_new_tensor_2d(compute_ctx,
-                                                         token_embed_weight->type,
+                                                         GGML_TYPE_F32,
                                                          model.hidden_size,
                                                          num_custom_embeddings);
             set_backend_tensor_data(custom_embeddings, custom_embeddings_data);
