@@ -1555,6 +1555,8 @@ public:
             diffusion_model = std::make_shared<MMDiTModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map());
         } else if (sd_version_is_qwen_image(version)) {
             diffusion_model = std::make_shared<QwenImageModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.diffusion_model", version);
+        } else if (sd_version_is_z_image(version)) {
+            diffusion_model = std::make_shared<ZImageModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "model.diffusion_model", version);
         } else {
             diffusion_model = std::make_shared<UNetModel>(backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), version);
             if (diffusion_conv_direct) {
