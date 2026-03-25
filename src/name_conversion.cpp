@@ -567,15 +567,25 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
             flux_name_map[block_prefix + "ff.net.0.proj.bias"]   = dst_prefix + "img_mlp.0.bias";
             flux_name_map[block_prefix + "ff.net.2.weight"]      = dst_prefix + "img_mlp.2.weight";
             flux_name_map[block_prefix + "ff.net.2.bias"]        = dst_prefix + "img_mlp.2.bias";
+            flux_name_map[block_prefix + "ff.linear_in.weight"]  = dst_prefix + "img_mlp.0.weight";
+            flux_name_map[block_prefix + "ff.linear_in.bias"]    = dst_prefix + "img_mlp.0.bias";
+            flux_name_map[block_prefix + "ff.linear_out.weight"] = dst_prefix + "img_mlp.2.weight";
+            flux_name_map[block_prefix + "ff.linear_out.bias"]   = dst_prefix + "img_mlp.2.bias";
 
             flux_name_map[block_prefix + "ff_context.net.0.proj.weight"] = dst_prefix + "txt_mlp.0.weight";
             flux_name_map[block_prefix + "ff_context.net.0.proj.bias"]   = dst_prefix + "txt_mlp.0.bias";
             flux_name_map[block_prefix + "ff_context.net.2.weight"]      = dst_prefix + "txt_mlp.2.weight";
             flux_name_map[block_prefix + "ff_context.net.2.bias"]        = dst_prefix + "txt_mlp.2.bias";
+            flux_name_map[block_prefix + "ff_context.linear_in.weight"]  = dst_prefix + "txt_mlp.0.weight";
+            flux_name_map[block_prefix + "ff_context.linear_in.bias"]    = dst_prefix + "txt_mlp.0.bias";
+            flux_name_map[block_prefix + "ff_context.linear_out.weight"] = dst_prefix + "txt_mlp.2.weight";
+            flux_name_map[block_prefix + "ff_context.linear_out.bias"]   = dst_prefix + "txt_mlp.2.bias";
 
             // output projections
             flux_name_map[block_prefix + "attn.to_out.0.weight"]   = dst_prefix + "img_attn.proj.weight";
             flux_name_map[block_prefix + "attn.to_out.0.bias"]     = dst_prefix + "img_attn.proj.bias";
+            flux_name_map[block_prefix + "attn.to_out.weight"]     = dst_prefix + "img_attn.proj.weight";
+            flux_name_map[block_prefix + "attn.to_out.bias"]       = dst_prefix + "img_attn.proj.bias";
             flux_name_map[block_prefix + "attn.to_add_out.weight"] = dst_prefix + "txt_attn.proj.weight";
             flux_name_map[block_prefix + "attn.to_add_out.bias"]   = dst_prefix + "txt_attn.proj.bias";
         }
@@ -594,13 +604,17 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
             flux_name_map[block_prefix + "attn.to_k.bias"]   = dst_prefix + "linear1.bias.1";
             flux_name_map[block_prefix + "attn.to_v.weight"] = dst_prefix + "linear1.weight.2";
             flux_name_map[block_prefix + "attn.to_v.bias"]   = dst_prefix + "linear1.bias.2";
-            flux_name_map[block_prefix + "proj_mlp.weight"]  = dst_prefix + "linear1.weight.3";
-            flux_name_map[block_prefix + "proj_mlp.bias"]    = dst_prefix + "linear1.bias.3";
+            flux_name_map[block_prefix + "proj_mlp.weight"]            = dst_prefix + "linear1.weight.3";
+            flux_name_map[block_prefix + "proj_mlp.bias"]              = dst_prefix + "linear1.bias.3";
+            flux_name_map[block_prefix + "attn.to_qkv_mlp_proj.weight"] = dst_prefix + "linear1.weight";
+            flux_name_map[block_prefix + "attn.to_qkv_mlp_proj.bias"]   = dst_prefix + "linear1.bias";
 
             flux_name_map[block_prefix + "attn.norm_q.weight"] = dst_prefix + "norm.query_norm.scale";
             flux_name_map[block_prefix + "attn.norm_k.weight"] = dst_prefix + "norm.key_norm.scale";
             flux_name_map[block_prefix + "proj_out.weight"]    = dst_prefix + "linear2.weight";
             flux_name_map[block_prefix + "proj_out.bias"]      = dst_prefix + "linear2.bias";
+            flux_name_map[block_prefix + "attn.to_out.weight"] = dst_prefix + "linear2.weight";
+            flux_name_map[block_prefix + "attn.to_out.bias"]   = dst_prefix + "linear2.bias";
         }
 
         // --- final layers ---
@@ -894,6 +908,9 @@ std::string convert_sep_to_dot(std::string name) {
         "txt_mlp",
         "img_mlp",
         "proj_mlp",
+        "to_qkv_mlp_proj",
+        "linear_in",
+        "linear_out",
         "wi_0",
         "wi_1",
         "norm1_context",
