@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -578,6 +579,16 @@ __STATIC_INLINE__ float ggml_ext_tensor_mean(ggml_tensor* src) {
     return mean;
 }
 
+__STATIC_INLINE__ float ggml_ext_tensor_mean_abs(ggml_tensor* src) {
+    float mean_abs    = 0.0f;
+    int64_t nelements = ggml_nelements(src);
+    float* data       = (float*)src->data;
+    for (int i = 0; i < nelements; i++) {
+        mean_abs += std::fabs(data[i]) / nelements * 1.0f;
+    }
+    return mean_abs;
+}
+
 // a = a+b
 __STATIC_INLINE__ void ggml_ext_tensor_add_inplace(ggml_tensor* a, ggml_tensor* b) {
     GGML_ASSERT(ggml_nelements(a) == ggml_nelements(b));
@@ -595,6 +606,51 @@ __STATIC_INLINE__ void ggml_ext_tensor_scale_inplace(ggml_tensor* src, float sca
     for (int i = 0; i < nelements; i++) {
         data[i] = data[i] * scale;
     }
+}
+
+__STATIC_INLINE__ float ggml_ext_tensor_get_prompt_weight_scale(ggml_tensor* weighted,
+                                                                float original_mean,
+                                                                float original_mean_abs,
+                                                                float eps = 1e-6f) {
+    float new_mean = ggml_ext_tensor_mean(weighted);
+    if (std::isfinite(original_mean) && std::isfinite(new_mean) &&
+        std::fabs(new_mean) > eps && original_mean * new_mean > 0.f) {
+        return original_mean / new_mean;
+    }
+
+    float new_mean_abs = ggml_ext_tensor_mean_abs(weighted);
+    if (std::isfinite(original_mean_abs) && std::isfinite(new_mean_abs) &&
+        original_mean_abs > eps && new_mean_abs > eps) {
+        return original_mean_abs / new_mean_abs;
+    }
+
+    return 1.f;
+}
+
+__STATIC_INLINE__ void ggml_ext_tensor_apply_token_weights(ggml_tensor* dst,
+                                                           ggml_tensor* src,
+                                                           const std::vector<float>& token_weights) {
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(token_weights.size() >= static_cast<size_t>(src->ne[1]));
+
+    float original_mean     = ggml_ext_tensor_mean(src);
+    float original_mean_abs = ggml_ext_tensor_mean_abs(src);
+
+    for (int i3 = 0; i3 < src->ne[3]; i3++) {
+        for (int i2 = 0; i2 < src->ne[2]; i2++) {
+            for (int i1 = 0; i1 < src->ne[1]; i1++) {
+                for (int i0 = 0; i0 < src->ne[0]; i0++) {
+                    float value = ggml_ext_tensor_get_f32(src, i0, i1, i2, i3);
+                    value *= token_weights[i1];
+                    ggml_ext_tensor_set_f32(dst, value, i0, i1, i2, i3);
+                }
+            }
+        }
+    }
+
+    float scale = ggml_ext_tensor_get_prompt_weight_scale(dst, original_mean, original_mean_abs);
+    ggml_ext_tensor_scale_inplace(dst, scale);
 }
 
 __STATIC_INLINE__ void ggml_ext_tensor_clamp_inplace(ggml_tensor* src, float min, float max) {

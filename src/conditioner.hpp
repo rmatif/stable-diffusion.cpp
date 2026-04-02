@@ -716,20 +716,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             int64_t t1 = ggml_time_ms();
             LOG_DEBUG("computing condition graph completed, taking %" PRId64 " ms", t1 - t0);
             ggml_tensor* result = ggml_dup_tensor(work_ctx, chunk_hidden_states);
-            {
-                float original_mean = ggml_ext_tensor_mean(chunk_hidden_states);
-                for (int i2 = 0; i2 < chunk_hidden_states->ne[2]; i2++) {
-                    for (int i1 = 0; i1 < chunk_hidden_states->ne[1]; i1++) {
-                        for (int i0 = 0; i0 < chunk_hidden_states->ne[0]; i0++) {
-                            float value = ggml_ext_tensor_get_f32(chunk_hidden_states, i0, i1, i2);
-                            value *= chunk_weights[i1];
-                            ggml_ext_tensor_set_f32(result, value, i0, i1, i2);
-                        }
-                    }
-                }
-                float new_mean = ggml_ext_tensor_mean(result);
-                ggml_ext_tensor_scale_inplace(result, (original_mean / new_mean));
-            }
+            ggml_ext_tensor_apply_token_weights(result, chunk_hidden_states, chunk_weights);
             if (zero_out_masked) {
                 float* vec = (float*)result->data;
                 for (int i = 0; i < ggml_nelements(result); i++) {
@@ -1143,21 +1130,7 @@ struct SD3CLIPEmbedder : public Conditioner {
                                 clip_skip,
                                 &chunk_hidden_states_l,
                                 work_ctx);
-                {
-                    auto tensor         = chunk_hidden_states_l;
-                    float original_mean = ggml_ext_tensor_mean(tensor);
-                    for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                        for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                            for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                                float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                                value *= chunk_weights[i1];
-                                ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                            }
-                        }
-                    }
-                    float new_mean = ggml_ext_tensor_mean(tensor);
-                    ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-                }
+                ggml_ext_tensor_apply_token_weights(chunk_hidden_states_l, chunk_hidden_states_l, chunk_weights);
 
                 if (chunk_idx == 0) {
                     auto it       = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_l_tokenizer.EOS_TOKEN_ID);
@@ -1200,22 +1173,7 @@ struct SD3CLIPEmbedder : public Conditioner {
                                 clip_skip,
                                 &chunk_hidden_states_g,
                                 work_ctx);
-
-                {
-                    auto tensor         = chunk_hidden_states_g;
-                    float original_mean = ggml_ext_tensor_mean(tensor);
-                    for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                        for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                            for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                                float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                                value *= chunk_weights[i1];
-                                ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                            }
-                        }
-                    }
-                    float new_mean = ggml_ext_tensor_mean(tensor);
-                    ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-                }
+                ggml_ext_tensor_apply_token_weights(chunk_hidden_states_g, chunk_hidden_states_g, chunk_weights);
 
                 if (chunk_idx == 0) {
                     auto it       = std::find(chunk_tokens.begin(), chunk_tokens.end(), clip_g_tokenizer.EOS_TOKEN_ID);
@@ -1253,21 +1211,7 @@ struct SD3CLIPEmbedder : public Conditioner {
                             nullptr,
                             &chunk_hidden_states_t5,
                             work_ctx);
-                {
-                    auto tensor         = chunk_hidden_states_t5;
-                    float original_mean = ggml_ext_tensor_mean(tensor);
-                    for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                        for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                            for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                                float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                                value *= chunk_weights[i1];
-                                ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                            }
-                        }
-                    }
-                    float new_mean = ggml_ext_tensor_mean(tensor);
-                    ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-                }
+                ggml_ext_tensor_apply_token_weights(chunk_hidden_states_t5, chunk_hidden_states_t5, chunk_weights);
             } else {
                 chunk_hidden_states_t5 = ggml_new_tensor_2d(work_ctx, GGML_TYPE_F32, 4096, chunk_len);
                 ggml_set_f32(chunk_hidden_states_t5, 0.f);
@@ -1556,21 +1500,7 @@ struct FluxCLIPEmbedder : public Conditioner {
                             nullptr,
                             &chunk_hidden_states,
                             work_ctx);
-                {
-                    auto tensor         = chunk_hidden_states;
-                    float original_mean = ggml_ext_tensor_mean(tensor);
-                    for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                        for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                            for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                                float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                                value *= chunk_weights[i1];
-                                ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                            }
-                        }
-                    }
-                    float new_mean = ggml_ext_tensor_mean(tensor);
-                    ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-                }
+                ggml_ext_tensor_apply_token_weights(chunk_hidden_states, chunk_hidden_states, chunk_weights);
             } else {
                 chunk_hidden_states = ggml_new_tensor_2d(work_ctx, GGML_TYPE_F32, 4096, chunk_len);
                 ggml_set_f32(chunk_hidden_states, 0.f);
@@ -1782,21 +1712,7 @@ struct T5CLIPEmbedder : public Conditioner {
                         t5_attn_mask_chunk,
                         &chunk_hidden_states,
                         work_ctx);
-            {
-                auto tensor         = chunk_hidden_states;
-                float original_mean = ggml_ext_tensor_mean(tensor);
-                for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                    for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                        for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                            float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                            value *= chunk_weights[i1];
-                            ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                        }
-                    }
-                }
-                float new_mean = ggml_ext_tensor_mean(tensor);
-                ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-            }
+            ggml_ext_tensor_apply_token_weights(chunk_hidden_states, chunk_hidden_states, chunk_weights);
 
             int64_t t1 = ggml_time_ms();
             LOG_DEBUG("computing condition graph completed, taking %" PRId64 " ms", t1 - t0);
@@ -1947,21 +1863,7 @@ struct AnimaConditioner : public Conditioner {
                      work_ctx);
 
         {
-            auto tensor         = hidden_states;
-            float original_mean = ggml_ext_tensor_mean(tensor);
-            for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                    for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                        float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                        value *= qwen_weights[i1];
-                        ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                    }
-                }
-            }
-            float new_mean = ggml_ext_tensor_mean(tensor);
-            if (new_mean != 0.f) {
-                ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
-            }
+            ggml_ext_tensor_apply_token_weights(hidden_states, hidden_states, qwen_weights);
         }
 
         ggml_tensor* t5_ids_tensor    = nullptr;
@@ -2131,19 +2033,7 @@ struct LLMEmbedder : public Conditioner {
                      &hidden_states,
                      work_ctx);
         {
-            auto tensor         = hidden_states;
-            float original_mean = ggml_ext_tensor_mean(tensor);
-            for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
-                for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
-                    for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                        float value = ggml_ext_tensor_get_f32(tensor, i0, i1, i2);
-                        value *= weights[i1];
-                        ggml_ext_tensor_set_f32(tensor, value, i0, i1, i2);
-                    }
-                }
-            }
-            float new_mean = ggml_ext_tensor_mean(tensor);
-            ggml_ext_tensor_scale_inplace(tensor, (original_mean / new_mean));
+            ggml_ext_tensor_apply_token_weights(hidden_states, hidden_states, weights);
         }
 
         GGML_ASSERT(hidden_states->ne[1] > prompt_template_encode_start_idx);
