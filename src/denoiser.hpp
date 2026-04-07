@@ -2,6 +2,7 @@
 #define __DENOISER_HPP__
 
 #include <cmath>
+#include <tuple>
 
 #include "ggml_extend.hpp"
 #include "gits_noise.inl"
@@ -761,6 +762,51 @@ struct Flux2FlowDenoiser : public FluxFlowDenoiser {
 
 typedef std::function<ggml_tensor*(ggml_tensor*, float, int)> denoise_cb_t;
 
+static std::pair<float, float> get_ancestral_step(float sigma_from,
+                                                  float sigma_to,
+                                                  float eta = 1.0f) {
+    if (eta <= 0.0f) {
+        return {sigma_to, 0.0f};
+    }
+
+    float sigma_up = eta * std::sqrt(std::max(sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to) / (sigma_from * sigma_from), 0.0f));
+    sigma_up        = std::min(sigma_to, sigma_up);
+    float sigma_down = std::sqrt(std::max(sigma_to * sigma_to - sigma_up * sigma_up, 0.0f));
+
+    return {sigma_down, sigma_up};
+}
+
+static std::tuple<float, float, float> get_ancestral_step_flow(float sigma_from,
+                                                               float sigma_to,
+                                                               float eta = 1.0f) {
+    float sigma_down  = sigma_to;
+    float sigma_up    = 0.0f;
+    float alpha_scale = 1.0f;
+
+    if (eta <= 0.0f || sigma_from <= 0.0f || sigma_to <= 0.0f) {
+        return {sigma_down, sigma_up, alpha_scale};
+    }
+
+    eta = std::min(eta, 1.0f);
+
+    float sigma_ratio = sigma_to / sigma_from;
+    sigma_down        = sigma_to * (1.0f + (sigma_ratio - 1.0f) * eta);
+    sigma_down        = std::max(0.0f, std::min(sigma_to, sigma_down));
+
+    float denom = 1.0f - sigma_down;
+    if (denom <= 0.0f) {
+        return {sigma_to, sigma_up, alpha_scale};
+    }
+
+    alpha_scale = (1.0f - sigma_to) / denom;
+
+    float term = (sigma_down / sigma_to) * alpha_scale;
+    term       = std::max(-1.0f, std::min(1.0f, term));
+    sigma_up   = sigma_to * std::sqrt(std::max(1.0f - term * term, 0.0f));
+
+    return {sigma_down, sigma_up, alpha_scale};
+}
+
 // k diffusion reverse ODE: dx = (x - D(x;\sigma)) / \sigma dt; \sigma(t) = t
 static bool sample_k_diffusion(sample_method_t method,
                                denoise_cb_t model,
@@ -768,13 +814,14 @@ static bool sample_k_diffusion(sample_method_t method,
                                ggml_tensor* x,
                                std::vector<float> sigmas,
                                std::shared_ptr<RNG> rng,
-                               float eta) {
+                               float eta,
+                               bool is_flow_denoiser) {
     size_t steps = sigmas.size() - 1;
     // sample_euler_ancestral
     switch (method) {
         case EULER_A_SAMPLE_METHOD: {
             ggml_tensor* noise = ggml_dup_tensor(work_ctx, x);
-            ggml_tensor* d     = ggml_dup_tensor(work_ctx, x);
+            ggml_tensor* d     = is_flow_denoiser ? nullptr : ggml_dup_tensor(work_ctx, x);
 
             for (int i = 0; i < steps; i++) {
                 float sigma = sigmas[i];
@@ -785,44 +832,56 @@ static bool sample_k_diffusion(sample_method_t method,
                     return false;
                 }
 
-                // d = (x - denoised) / sigma
-                {
-                    float* vec_d        = (float*)d->data;
-                    float* vec_x        = (float*)x->data;
-                    float* vec_denoised = (float*)denoised->data;
+                if (is_flow_denoiser) {
+                    auto [sigma_down, sigma_up, alpha_scale] = get_ancestral_step_flow(sigma, sigmas[i + 1], eta);
+                    float* vec_x                             = (float*)x->data;
+                    float* vec_denoised                      = (float*)denoised->data;
+                    float sigma_ratio                        = sigma > 0.0f ? sigma_down / sigma : 0.0f;
 
-                    for (int i = 0; i < ggml_nelements(d); i++) {
-                        vec_d[i] = (vec_x[i] - vec_denoised[i]) / sigma;
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = sigma_ratio * vec_x[j] + (1.0f - sigma_ratio) * vec_denoised[j];
                     }
-                }
 
-                // get_ancestral_step
-                float sigma_up   = std::min(sigmas[i + 1],
-                                            std::sqrt(sigmas[i + 1] * sigmas[i + 1] * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1]) / (sigmas[i] * sigmas[i])));
-                float sigma_down = std::sqrt(sigmas[i + 1] * sigmas[i + 1] - sigma_up * sigma_up);
+                    if (sigma_up > 0.0f) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
+                        float* vec_noise = (float*)noise->data;
 
-                // Euler method
-                float dt = sigma_down - sigmas[i];
-                // x = x + d * dt
-                {
-                    float* vec_d = (float*)d->data;
-                    float* vec_x = (float*)x->data;
-
-                    for (int i = 0; i < ggml_nelements(x); i++) {
-                        vec_x[i] = vec_x[i] + vec_d[i] * dt;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = alpha_scale * vec_x[j] + vec_noise[j] * sigma_up;
+                        }
                     }
-                }
-
-                if (sigmas[i + 1] > 0) {
-                    // x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
-                    ggml_ext_im_set_randn_f32(noise, rng);
-                    // noise = load_tensor_from_file(work_ctx, "./rand" + std::to_string(i+1) + ".bin");
+                } else {
+                    // d = (x - denoised) / sigma
                     {
+                        float* vec_d        = (float*)d->data;
+                        float* vec_x        = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(d); j++) {
+                            vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigma;
+                        }
+                    }
+
+                    auto [sigma_down, sigma_up] = get_ancestral_step(sigma, sigmas[i + 1], eta);
+
+                    // Euler method
+                    float dt = sigma_down - sigma;
+                    {
+                        float* vec_d = (float*)d->data;
+                        float* vec_x = (float*)x->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                        }
+                    }
+
+                    if (sigmas[i + 1] > 0) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
                         float* vec_x     = (float*)x->data;
                         float* vec_noise = (float*)noise->data;
 
-                        for (int i = 0; i < ggml_nelements(x); i++) {
-                            vec_x[i] = vec_x[i] + vec_noise[i] * sigma_up;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_noise[j] * sigma_up;
                         }
                     }
                 }
@@ -989,10 +1048,7 @@ static bool sample_k_diffusion(sample_method_t method,
                     return false;
                 }
 
-                // get_ancestral_step
-                float sigma_up   = std::min(sigmas[i + 1],
-                                            std::sqrt(sigmas[i + 1] * sigmas[i + 1] * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1]) / (sigmas[i] * sigmas[i])));
-                float sigma_down = std::sqrt(sigmas[i + 1] * sigmas[i + 1] - sigma_up * sigma_up);
+                auto [sigma_down, sigma_up] = get_ancestral_step(sigmas[i], sigmas[i + 1], eta);
                 auto t_fn        = [](float sigma) -> float { return -log(sigma); };
                 auto sigma_fn    = [](float t) -> float { return exp(-t); };
 

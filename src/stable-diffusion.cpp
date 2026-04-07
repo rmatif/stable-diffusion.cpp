@@ -2434,6 +2434,24 @@ public:
             LOG_WARN("timestep shifting is only supported for SDXL models!");
             shifted_timestep = 0;
         }
+        if (eta == INFINITY) {
+            switch (method) {
+                case DDIM_TRAILING_SAMPLE_METHOD:
+                case TCD_SAMPLE_METHOD:
+                case RES_MULTISTEP_SAMPLE_METHOD:
+                case RES_2S_SAMPLE_METHOD:
+                    eta = 0.0f;
+                    break;
+                case EULER_A_SAMPLE_METHOD:
+                case DPMPP2S_A_SAMPLE_METHOD:
+                    eta = 1.0f;
+                    break;
+                default:
+                    eta = 0.0f;
+                    break;
+            }
+        }
+        bool is_flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser) != nullptr;
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
 
         float cfg_scale = guidance.txt_cfg;
@@ -2810,7 +2828,7 @@ public:
             return denoised;
         };
 
-        if (!sample_k_diffusion(method, denoise, work_ctx, x, sigmas, sampler_rng, eta)) {
+        if (!sample_k_diffusion(method, denoise, work_ctx, x, sigmas, sampler_rng, eta, is_flow_denoiser)) {
             LOG_ERROR("Diffusion model sampling failed");
             if (control_net) {
                 control_net->free_control_ctx();
@@ -3247,6 +3265,7 @@ void sd_sample_params_init(sd_sample_params_t* sample_params) {
     sample_params->scheduler                   = SCHEDULER_COUNT;
     sample_params->sample_method               = SAMPLE_METHOD_COUNT;
     sample_params->sample_steps                = 20;
+    sample_params->eta                         = INFINITY;
     sample_params->custom_sigmas               = nullptr;
     sample_params->custom_sigmas_count         = 0;
     sample_params->flow_shift                  = INFINITY;
