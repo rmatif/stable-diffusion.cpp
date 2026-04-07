@@ -1048,57 +1048,109 @@ static bool sample_k_diffusion(sample_method_t method,
                     return false;
                 }
 
-                auto [sigma_down, sigma_up] = get_ancestral_step(sigmas[i], sigmas[i + 1], eta);
-                auto t_fn        = [](float sigma) -> float { return -log(sigma); };
-                auto sigma_fn    = [](float t) -> float { return exp(-t); };
+                if (is_flow_denoiser) {
+                    float sigma = sigmas[i];
+                    auto [sigma_down, sigma_up, alpha_scale] = get_ancestral_step_flow(sigma, sigmas[i + 1], eta);
 
-                if (sigma_down == 0) {
-                    // d = (x - denoised) / sigmas[i];
-                    // dt = sigma_down - sigmas[i];
-                    // x += d * dt;
-                    // => x = denoised
-                    float* vec_x        = (float*)x->data;
-                    float* vec_denoised = (float*)denoised->data;
+                    if (sigmas[i + 1] == 0.0f || sigma_down == 0.0f) {
+                        float* vec_x        = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
 
-                    for (int j = 0; j < ggml_nelements(x); j++) {
-                        vec_x[j] = vec_denoised[j];
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_denoised[j];
+                        }
+                    } else {
+                        auto sigma_fn = [](float lambda) -> float { return 1.0f / (std::exp(lambda) + 1.0f); };
+                        auto lambda_fn = [](float sigma) -> float {
+                            sigma = std::min(std::max(sigma, 1e-6f), 1.0f - 1e-6f);
+                            return std::log((1.0f - sigma) / sigma);
+                        };
+
+                        float sigma_s = sigma >= (1.0f - 1e-6f) ? 0.9999f : sigma_fn(0.5f * (lambda_fn(sigma) + lambda_fn(sigma_down)));
+
+                        float* vec_x        = (float*)x->data;
+                        float* vec_x2       = (float*)x2->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        float sigma_s_ratio = sigma_s / sigma;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x2[j] = sigma_s_ratio * vec_x[j] + (1.0f - sigma_s_ratio) * vec_denoised[j];
+                        }
+
+                        ggml_tensor* denoised2 = model(x2, sigma_s, i + 1);
+                        if (denoised2 == nullptr) {
+                            return false;
+                        }
+
+                        float* vec_denoised2     = (float*)denoised2->data;
+                        float sigma_down_i_ratio = sigma_down / sigma;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = sigma_down_i_ratio * vec_x[j] + (1.0f - sigma_down_i_ratio) * vec_denoised2[j];
+                        }
                     }
-                } else {
-                    // DPM-Solver++(2S)
-                    float t      = t_fn(sigmas[i]);
-                    float t_next = t_fn(sigma_down);
-                    float h      = t_next - t;
-                    float s      = t + 0.5f * h;
 
-                    float* vec_x        = (float*)x->data;
-                    float* vec_x2       = (float*)x2->data;
-                    float* vec_denoised = (float*)denoised->data;
-
-                    // First half-step
-                    for (int j = 0; j < ggml_nelements(x); j++) {
-                        vec_x2[j] = (sigma_fn(s) / sigma_fn(t)) * vec_x[j] - (exp(-h * 0.5f) - 1) * vec_denoised[j];
-                    }
-
-                    ggml_tensor* denoised = model(x2, sigmas[i + 1], i + 1);
-                    if (denoised == nullptr) {
-                        return false;
-                    }
-
-                    // Second half-step
-                    for (int j = 0; j < ggml_nelements(x); j++) {
-                        vec_x[j] = (sigma_fn(t_next) / sigma_fn(t)) * vec_x[j] - (exp(-h) - 1) * vec_denoised[j];
-                    }
-                }
-
-                // Noise addition
-                if (sigmas[i + 1] > 0) {
-                    ggml_ext_im_set_randn_f32(noise, rng);
-                    {
+                    if (sigmas[i + 1] > 0.0f && eta > 0.0f) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
                         float* vec_x     = (float*)x->data;
                         float* vec_noise = (float*)noise->data;
 
-                        for (int i = 0; i < ggml_nelements(x); i++) {
-                            vec_x[i] = vec_x[i] + vec_noise[i] * sigma_up;
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = alpha_scale * vec_x[j] + vec_noise[j] * sigma_up;
+                        }
+                    }
+                } else {
+                    auto [sigma_down, sigma_up] = get_ancestral_step(sigmas[i], sigmas[i + 1], eta);
+                    auto t_fn                   = [](float sigma) -> float { return -log(sigma); };
+                    auto sigma_fn               = [](float t) -> float { return exp(-t); };
+
+                    if (sigma_down == 0) {
+                        // d = (x - denoised) / sigmas[i];
+                        // dt = sigma_down - sigmas[i];
+                        // x += d * dt;
+                        // => x = denoised
+                        float* vec_x        = (float*)x->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_denoised[j];
+                        }
+                    } else {
+                        // DPM-Solver++(2S)
+                        float t      = t_fn(sigmas[i]);
+                        float t_next = t_fn(sigma_down);
+                        float h      = t_next - t;
+                        float s      = t + 0.5f * h;
+
+                        float* vec_x        = (float*)x->data;
+                        float* vec_x2       = (float*)x2->data;
+                        float* vec_denoised = (float*)denoised->data;
+
+                        // First half-step
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x2[j] = (sigma_fn(s) / sigma_fn(t)) * vec_x[j] - (exp(-h * 0.5f) - 1) * vec_denoised[j];
+                        }
+
+                        ggml_tensor* denoised = model(x2, sigmas[i + 1], i + 1);
+                        if (denoised == nullptr) {
+                            return false;
+                        }
+
+                        // Second half-step
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = (sigma_fn(t_next) / sigma_fn(t)) * vec_x[j] - (exp(-h) - 1) * vec_denoised[j];
+                        }
+                    }
+
+                    // Noise addition
+                    if (sigmas[i + 1] > 0) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
+                        {
+                            float* vec_x     = (float*)x->data;
+                            float* vec_noise = (float*)noise->data;
+
+                            for (int i = 0; i < ggml_nelements(x); i++) {
+                                vec_x[i] = vec_x[i] + vec_noise[i] * sigma_up;
+                            }
                         }
                     }
                 }
