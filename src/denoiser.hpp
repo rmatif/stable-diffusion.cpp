@@ -807,6 +807,33 @@ static std::tuple<float, float, float> get_ancestral_step_flow(float sigma_from,
     return {sigma_down, sigma_up, alpha_scale};
 }
 
+static float er_sde_flow_sigma(float sigma) {
+    sigma = std::max(sigma, 1e-6f);
+    sigma = std::min(sigma, 1.0f - 1e-4f);
+    return sigma;
+}
+
+static float sigma_to_er_sde_lambda(float sigma, bool is_flow_denoiser) {
+    if (is_flow_denoiser) {
+        sigma = er_sde_flow_sigma(sigma);
+        return sigma / std::max(1.0f - sigma, 1e-6f);
+    }
+    return std::max(sigma, 1e-6f);
+}
+
+static float sigma_to_er_sde_alpha(float sigma, bool is_flow_denoiser) {
+    if (is_flow_denoiser) {
+        sigma = er_sde_flow_sigma(sigma);
+        return 1.0f - sigma;
+    }
+    return 1.0f;
+}
+
+static float er_sde_noise_scaler(float x) {
+    x = std::max(x, 0.0f);
+    return x * (std::exp(std::pow(x, 0.3f)) + 10.0f);
+}
+
 // k diffusion reverse ODE: dx = (x - D(x;\sigma)) / \sigma dt; \sigma(t) = t
 static bool sample_k_diffusion(sample_method_t method,
                                denoise_cb_t model,
@@ -1242,6 +1269,139 @@ static bool sample_k_diffusion(sample_method_t method,
                 for (int j = 0; j < ggml_nelements(x); j++) {
                     vec_old_denoised[j] = vec_denoised[j];
                 }
+            }
+        } break;
+        case ER_SDE_SAMPLE_METHOD:  // Extended Reverse-Time SDE solver (VP ER-SDE-Solver-3)
+        {
+            constexpr int max_stage                = 3;
+            constexpr int num_integration_points   = 200;
+            constexpr float num_integration_points_f = 200.0f;
+            constexpr float s_noise               = 1.0f;
+
+            ggml_tensor* noise          = ggml_dup_tensor(work_ctx, x);
+            ggml_tensor* old_denoised   = ggml_dup_tensor(work_ctx, x);
+            ggml_tensor* denoised_d     = ggml_dup_tensor(work_ctx, x);
+            ggml_tensor* old_denoised_d = ggml_dup_tensor(work_ctx, x);
+
+            if (is_flow_denoiser) {
+                for (size_t i = 0; i + 1 < sigmas.size(); ++i) {
+                    if (sigmas[i] > 1.0f) {
+                        sigmas[i] = er_sde_flow_sigma(sigmas[i]);
+                    }
+                }
+            }
+
+            std::vector<float> er_lambdas(sigmas.size(), 0.0f);
+            for (size_t i = 0; i < sigmas.size(); ++i) {
+                er_lambdas[i] = sigma_to_er_sde_lambda(sigmas[i], is_flow_denoiser);
+            }
+
+            bool have_old_denoised   = false;
+            bool have_old_denoised_d = false;
+
+            for (int i = 0; i < steps; i++) {
+                ggml_tensor* denoised = model(x, sigmas[i], i + 1);
+                if (denoised == nullptr) {
+                    return false;
+                }
+
+                int stage_used = std::min(max_stage, i + 1);
+
+                if (sigmas[i + 1] == 0.0f) {
+                    float* vec_x        = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_denoised[j];
+                    }
+                } else {
+                    float er_lambda_s = er_lambdas[i];
+                    float er_lambda_t = er_lambdas[i + 1];
+                    float alpha_s     = sigma_to_er_sde_alpha(sigmas[i], is_flow_denoiser);
+                    float alpha_t     = sigma_to_er_sde_alpha(sigmas[i + 1], is_flow_denoiser);
+                    float scaled_s    = er_sde_noise_scaler(er_lambda_s);
+                    float scaled_t    = er_sde_noise_scaler(er_lambda_t);
+                    float r_alpha     = alpha_s > 0.0f ? alpha_t / alpha_s : 0.0f;
+                    float r           = scaled_s > 0.0f ? scaled_t / scaled_s : 0.0f;
+
+                    float* vec_x        = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = r_alpha * r * vec_x[j] + alpha_t * (1.0f - r) * vec_denoised[j];
+                    }
+
+                    if (stage_used >= 2 && have_old_denoised) {
+                        float dt               = er_lambda_t - er_lambda_s;
+                        float lambda_step_size = -dt / num_integration_points_f;
+                        float s                = 0.0f;
+                        float s_u              = 0.0f;
+
+                        for (int p = 0; p < num_integration_points; ++p) {
+                            float lambda_pos = er_lambda_t + p * lambda_step_size;
+                            float scaled_pos = er_sde_noise_scaler(lambda_pos);
+                            if (scaled_pos <= 0.0f) {
+                                continue;
+                            }
+
+                            s += 1.0f / scaled_pos;
+                            if (stage_used >= 3 && have_old_denoised_d) {
+                                s_u += (lambda_pos - er_lambda_s) / scaled_pos;
+                            }
+                        }
+
+                        s *= lambda_step_size;
+
+                        float denom_d = er_lambda_s - er_lambdas[i - 1];
+                        if (std::fabs(denom_d) > 1e-12f) {
+                            float coeff_d            = alpha_t * (dt + s * scaled_t);
+                            float* vec_old_denoised  = (float*)old_denoised->data;
+                            float* vec_denoised_d    = (float*)denoised_d->data;
+
+                            for (int j = 0; j < ggml_nelements(x); j++) {
+                                vec_denoised_d[j] = (vec_denoised[j] - vec_old_denoised[j]) / denom_d;
+                                vec_x[j] += coeff_d * vec_denoised_d[j];
+                            }
+
+                            if (stage_used >= 3 && have_old_denoised_d) {
+                                float denom_u = (er_lambda_s - er_lambdas[i - 2]) * 0.5f;
+                                if (std::fabs(denom_u) > 1e-12f) {
+                                    s_u *= lambda_step_size;
+                                    float coeff_u              = alpha_t * (0.5f * dt * dt + s_u * scaled_t);
+                                    float* vec_old_denoised_d  = (float*)old_denoised_d->data;
+
+                                    for (int j = 0; j < ggml_nelements(x); j++) {
+                                        float denoised_u = (vec_denoised_d[j] - vec_old_denoised_d[j]) / denom_u;
+                                        vec_x[j] += coeff_u * denoised_u;
+                                    }
+                                }
+                            }
+
+                            float* vec_old_denoised_d = (float*)old_denoised_d->data;
+                            for (int j = 0; j < ggml_nelements(x); j++) {
+                                vec_old_denoised_d[j] = vec_denoised_d[j];
+                            }
+                            have_old_denoised_d = true;
+                        }
+                    }
+
+                    float noise_scale_sq = er_lambda_t * er_lambda_t - er_lambda_s * er_lambda_s * r * r;
+                    if (s_noise > 0.0f && noise_scale_sq > 0.0f) {
+                        ggml_ext_im_set_randn_f32(noise, rng);
+                        float noise_scale = alpha_t * std::sqrt(std::max(noise_scale_sq, 0.0f));
+                        float* vec_noise  = (float*)noise->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] += vec_noise[j] * noise_scale;
+                        }
+                    }
+                }
+
+                float* vec_old_denoised = (float*)old_denoised->data;
+                float* vec_denoised     = (float*)denoised->data;
+                for (int j = 0; j < ggml_nelements(x); j++) {
+                    vec_old_denoised[j] = vec_denoised[j];
+                }
+                have_old_denoised = true;
             }
         } break;
         case IPNDM_SAMPLE_METHOD:  // iPNDM sampler from https://github.com/zju-pi/diff-sampler/tree/main/diff-solvers-main
