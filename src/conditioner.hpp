@@ -1802,6 +1802,20 @@ struct AnimaConditioner : public Conditioner {
     std::tuple<std::vector<int>, std::vector<float>, std::vector<int>, std::vector<float>> tokenize(std::string text) {
         auto parsed_attention = parse_prompt_attention(text);
 
+        std::vector<std::pair<std::string, float>> normalized_attention;
+        normalized_attention.reserve(parsed_attention.size());
+        for (const auto& item : parsed_attention) {
+            if (item.first == "BREAK" && item.second == -1.0f) {
+                continue;
+            }
+            if (!normalized_attention.empty() && normalized_attention.back().second == item.second) {
+                normalized_attention.back().first += item.first;
+            } else {
+                normalized_attention.push_back(item);
+            }
+        }
+        parsed_attention = std::move(normalized_attention);
+
         {
             std::stringstream ss;
             ss << "[";
