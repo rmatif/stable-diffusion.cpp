@@ -173,6 +173,7 @@ public:
 class UnetModelBlock : public GGMLBlock {
 protected:
     SDVersion version = VERSION_SD1;
+    bool bf16_diffusion = false;
     // network hparams
     int in_channels                        = 4;
     int out_channels                       = 4;
@@ -193,6 +194,16 @@ public:
 
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
+        for (const auto& [name, tensor_storage] : tensor_storage_map) {
+            if (!starts_with(name, "model.diffusion_model.")) {
+                continue;
+            }
+            ggml_type type = tensor_storage.expected_type != GGML_TYPE_COUNT ? tensor_storage.expected_type : tensor_storage.type;
+            if (type == GGML_TYPE_BF16) {
+                bf16_diffusion = true;
+                break;
+            }
+        }
         if (sd_version_is_sd2(version)) {
             context_dim           = 1024;
             num_head_channels     = 64;
@@ -267,7 +278,7 @@ public:
                                        int64_t d_head,
                                        int64_t depth,
                                        int64_t context_dim) -> SpatialTransformer* {
-            const ggml_type attn_kv_type = version == VERSION_SD1 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            const ggml_type attn_kv_type = version == VERSION_SD1 ? GGML_TYPE_F32 : (bf16_diffusion ? GGML_TYPE_BF16 : GGML_TYPE_F16);
             if (version == VERSION_SVD) {
                 return new SpatialVideoTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
             } else {
@@ -442,16 +453,17 @@ public:
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         // return: [N, out_channels, h, w]
+        const ggml_type diffusion_type = bf16_diffusion ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (x->type == GGML_TYPE_F32) {
-            x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            x = ggml_cast(ctx->ggml_ctx, x, diffusion_type);
         }
 
         if (context != nullptr) {
             if (context->type == GGML_TYPE_F32) {
-                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_F16);
+                context = ggml_cast(ctx->ggml_ctx, context, diffusion_type);
             }
             if (context->ne[2] != x->ne[3]) {
-                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, context->type, context->ne[0], context->ne[1], x->ne[3]));
+                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, diffusion_type, context->ne[0], context->ne[1], x->ne[3]));
             }
         }
 
@@ -467,10 +479,10 @@ public:
 
         if (y != nullptr) {
             if (y->type == GGML_TYPE_F32) {
-                y = ggml_cast(ctx->ggml_ctx, y, GGML_TYPE_F16);
+                y = ggml_cast(ctx->ggml_ctx, y, diffusion_type);
             }
             if (y->ne[1] != x->ne[3]) {
-                y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, y->type, y->ne[0], x->ne[3]));
+                y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, diffusion_type, y->ne[0], x->ne[3]));
             }
         }
 
@@ -486,7 +498,7 @@ public:
                                                  model_channels,
                                                  10000,
                                                  1.0f,
-                                                 GGML_TYPE_F16);  // [N, model_channels]
+                                                 diffusion_type);  // [N, model_channels]
 
         auto emb = time_embed_0->forward(ctx, t_emb);
         emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
@@ -623,6 +635,10 @@ public:
         ggml_set_name(h, "bench-end");
         return h;  // [N, out_channels, h, w]
     }
+
+    bool uses_bf16_diffusion() const {
+        return bf16_diffusion;
+    }
 };
 
 struct UNetModelRunner : public GGMLRunner {
@@ -673,7 +689,7 @@ struct UNetModelRunner : public GGMLRunner {
         auto runner_ctx = get_context();
 
         if (x->type == GGML_TYPE_F32) {
-            x = ggml_cast(runner_ctx.ggml_ctx, x, GGML_TYPE_F16);
+            x = ggml_cast(runner_ctx.ggml_ctx, x, unet.uses_bf16_diffusion() ? GGML_TYPE_BF16 : GGML_TYPE_F16);
         }
 
         ggml_tensor* out = unet.forward(&runner_ctx,
