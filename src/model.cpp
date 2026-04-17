@@ -954,6 +954,49 @@ void convert_tensor(void* src,
     }
 }
 
+static int64_t sanitize_nonfinite_tensor_data(void* data, ggml_type type, int64_t n) {
+    int64_t replaced = 0;
+
+    switch (type) {
+        case GGML_TYPE_F32: {
+            float* values = static_cast<float*>(data);
+            for (int64_t i = 0; i < n; ++i) {
+                if (!std::isfinite(values[i])) {
+                    values[i] = 0.0f;
+                    ++replaced;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_F16: {
+            ggml_fp16_t* values = static_cast<ggml_fp16_t*>(data);
+            for (int64_t i = 0; i < n; ++i) {
+                const float value = ggml_fp16_to_fp32(values[i]);
+                if (!std::isfinite(value)) {
+                    values[i] = ggml_fp32_to_fp16(0.0f);
+                    ++replaced;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_BF16: {
+            ggml_bf16_t* values = static_cast<ggml_bf16_t*>(data);
+            for (int64_t i = 0; i < n; ++i) {
+                const float value = ggml_bf16_to_fp32(values[i]);
+                if (!std::isfinite(value)) {
+                    values[i] = ggml_fp32_to_bf16(0.0f);
+                    ++replaced;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return replaced;
+}
+
 /*================================================= ModelLoader ==================================================*/
 
 void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
@@ -2386,6 +2429,16 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                                        (int)tensor_storage.ne[0]);
                     } else {
                         convert_buf = read_buf;
+                    }
+
+                    const int64_t replaced_nonfinite = sanitize_nonfinite_tensor_data(
+                        convert_buf,
+                        dst_tensor->type,
+                        tensor_storage.nelements());
+                    if (replaced_nonfinite > 0) {
+                        LOG_WARN("sanitized %lld non-finite values in tensor '%s'",
+                                 (long long) replaced_nonfinite,
+                                 tensor_storage.name.c_str());
                     }
                     t1 = ggml_time_ms();
                     convert_time_ms.fetch_add(t1 - t0);
