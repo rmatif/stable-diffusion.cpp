@@ -1284,6 +1284,7 @@ namespace Flux {
         FluxParams flux_params;
         Flux flux;
         std::vector<int> pe_vec;
+        std::vector<float> pe_vec_f32;
         std::vector<float> mod_index_arange_vec;
         std::vector<float> dct_vec;
         SDVersion version;
@@ -1515,19 +1516,19 @@ namespace Flux {
             ggml_tensor* pe                = nullptr;
             if (use_legacy_ref_path) {
                 const std::vector<int> legacy_edit_axes_dim = {32, 32, 32, 32};
-                std::vector<float> pe_vec_f32 = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
-                                                                  static_cast<int>(x->ne[0]),
-                                                                  flux_params.patch_size,
-                                                                  static_cast<int>(x->ne[3]),
-                                                                  static_cast<int>(context->ne[1]),
-                                                                  txt_arange_dims,
-                                                                  ref_latents,
-                                                                  increase_ref_index,
-                                                                  flux_params.ref_index_scale,
-                                                                  flux_params.theta,
-                                                                  circular_y_enabled,
-                                                                  circular_x_enabled,
-                                                                  legacy_edit_axes_dim);
+                pe_vec_f32 = Rope::gen_flux_pe(static_cast<int>(x->ne[1]),
+                                               static_cast<int>(x->ne[0]),
+                                               flux_params.patch_size,
+                                               static_cast<int>(x->ne[3]),
+                                               static_cast<int>(context->ne[1]),
+                                               txt_arange_dims,
+                                               ref_latents,
+                                               increase_ref_index,
+                                               flux_params.ref_index_scale,
+                                               flux_params.theta,
+                                               circular_y_enabled,
+                                               circular_x_enabled,
+                                               legacy_edit_axes_dim);
                 int legacy_axes_dim_sum = 0;
                 for (int dim : legacy_edit_axes_dim) {
                     legacy_axes_dim_sum += dim;
