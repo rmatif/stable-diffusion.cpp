@@ -454,16 +454,19 @@ public:
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         // return: [N, out_channels, h, w]
         const ggml_type diffusion_type = bf16_diffusion ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+        const ggml_type context_type   = bf16_diffusion ? GGML_TYPE_F32 : diffusion_type;
+        const ggml_type timestep_type  = bf16_diffusion ? GGML_TYPE_F32 : diffusion_type;
+
         if (x->type == GGML_TYPE_F32) {
             x = ggml_cast(ctx->ggml_ctx, x, diffusion_type);
         }
 
         if (context != nullptr) {
-            if (context->type == GGML_TYPE_F32) {
-                context = ggml_cast(ctx->ggml_ctx, context, diffusion_type);
+            if (context->type != context_type) {
+                context = ggml_cast(ctx->ggml_ctx, context, context_type);
             }
             if (context->ne[2] != x->ne[3]) {
-                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, diffusion_type, context->ne[0], context->ne[1], x->ne[3]));
+                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, context_type, context->ne[0], context->ne[1], x->ne[3]));
             }
         }
 
@@ -498,7 +501,7 @@ public:
                                                  model_channels,
                                                  10000,
                                                  1.0f,
-                                                 diffusion_type);  // [N, model_channels]
+                                                 timestep_type);  // [N, model_channels]
 
         auto emb = time_embed_0->forward(ctx, t_emb);
         emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
