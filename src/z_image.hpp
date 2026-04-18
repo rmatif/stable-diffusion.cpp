@@ -415,14 +415,16 @@ namespace ZImage {
             rpar.rope_type = GGML_ROPE_TYPE_IMROPE_PERM;
             memcpy(rpar.sections, z_image_params.axes_dim.data(), sizeof(int) * z_image_params.axes_dim.size());
 
-            auto txt_pad_token = params["cap_pad_token"];
-            auto img_pad_token = params["x_pad_token"];
+            auto txt_pad_token       = params["cap_pad_token"];
+            auto img_pad_token       = params["x_pad_token"];
+            const bool use_bf16_path = ctx->weight_adapter == nullptr;
+            const ggml_type act_type = use_bf16_path ? GGML_TYPE_BF16 : GGML_TYPE_F32;
 
-            if (txt_pad_token->type != GGML_TYPE_BF16) {
-                txt_pad_token = ggml_cast(ctx->ggml_ctx, txt_pad_token, GGML_TYPE_BF16);
+            if (txt_pad_token->type != act_type) {
+                txt_pad_token = ggml_cast(ctx->ggml_ctx, txt_pad_token, act_type);
             }
-            if (img_pad_token->type != GGML_TYPE_BF16) {
-                img_pad_token = ggml_cast(ctx->ggml_ctx, img_pad_token, GGML_TYPE_BF16);
+            if (img_pad_token->type != act_type) {
+                img_pad_token = ggml_cast(ctx->ggml_ctx, img_pad_token, act_type);
             }
 
             int64_t N           = x->ne[2];
@@ -511,14 +513,17 @@ namespace ZImage {
                 }
             }
 
-            if (img->type != GGML_TYPE_BF16) {
-                img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_BF16);
+            const bool use_bf16_path = ctx->weight_adapter == nullptr;
+            const ggml_type act_type = use_bf16_path ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+
+            if (img->type != act_type) {
+                img = ggml_cast(ctx->ggml_ctx, img, act_type);
             }
-            if (timestep->type != GGML_TYPE_BF16) {
-                timestep = ggml_cast(ctx->ggml_ctx, timestep, GGML_TYPE_BF16);
+            if (timestep->type != act_type) {
+                timestep = ggml_cast(ctx->ggml_ctx, timestep, act_type);
             }
-            if (context->type != GGML_TYPE_BF16) {
-                context = ggml_cast(ctx->ggml_ctx, context, GGML_TYPE_BF16);
+            if (context->type != act_type) {
+                context = ggml_cast(ctx->ggml_ctx, context, act_type);
             }
 
             auto out = forward_core(ctx, img, timestep, context, pe);
