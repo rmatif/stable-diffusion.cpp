@@ -867,6 +867,7 @@ namespace Rope {
         // return: [N, L, n_head*d_head]
         q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
         k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        const bool use_flash_attn = ctx->flash_attn_enabled && !(mask != nullptr && !rope_interleaved);
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx,
                                         ctx->backend,
                                         q,
@@ -875,7 +876,7 @@ namespace Rope {
                                         v->ne[1],
                                         mask,
                                         true,
-                                        ctx->flash_attn_enabled,
+                                        use_flash_attn,
                                         kv_scale);  // [N, L, n_head*d_head]
         return x;
     }

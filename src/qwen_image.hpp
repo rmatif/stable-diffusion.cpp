@@ -556,6 +556,7 @@ namespace Qwen {
         QwenImageParams qwen_image_params;
         QwenImageModel qwen_image;
         std::vector<int> pe_vec;
+        std::vector<float> pe_vec_f32;
         SDVersion version;
 
         QwenImageRunner(ggml_backend_t backend,
@@ -629,20 +630,20 @@ namespace Qwen {
                 set_backend_tensor_data(pe, pe_vec.data());
             } else {
                 static const std::vector<int> legacy_axes_dim = {16, 56, 56};
-                auto pe_vec_f = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
-                                                        static_cast<int>(x->ne[0]),
-                                                        qwen_image_params.patch_size,
-                                                        static_cast<int>(x->ne[3]),
-                                                        static_cast<int>(context->ne[1]),
-                                                        ref_latents,
-                                                        increase_ref_index,
-                                                        qwen_image_params.theta,
-                                                        circular_y_enabled,
-                                                        circular_x_enabled,
-                                                        legacy_axes_dim);
-                int pos_len = static_cast<int>(pe_vec_f.size() / qwen_image_params.axes_dim_sum / 2);
+                pe_vec_f32 = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
+                                                     static_cast<int>(x->ne[0]),
+                                                     qwen_image_params.patch_size,
+                                                     static_cast<int>(x->ne[3]),
+                                                     static_cast<int>(context->ne[1]),
+                                                     ref_latents,
+                                                     increase_ref_index,
+                                                     qwen_image_params.theta,
+                                                     circular_y_enabled,
+                                                     circular_x_enabled,
+                                                     legacy_axes_dim);
+                int pos_len = static_cast<int>(pe_vec_f32.size() / qwen_image_params.axes_dim_sum / 2);
                 pe          = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, qwen_image_params.axes_dim_sum / 2, pos_len);
-                set_backend_tensor_data(pe, pe_vec_f.data());
+                set_backend_tensor_data(pe, pe_vec_f32.data());
             }
 
             auto runner_ctx = get_context();
