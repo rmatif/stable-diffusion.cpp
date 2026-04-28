@@ -66,8 +66,15 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::string embd_dir;
     int32_t num_custom_embeddings   = 0;
     int32_t num_custom_embeddings_2 = 0;
-    std::vector<uint8_t> token_embed_custom;
-    std::map<std::string, std::pair<int, int>> embedding_pos_map;
+    std::vector<float> token_embed_custom;
+    std::vector<float> token_embed_custom_2;
+    std::vector<int32_t> custom_token_map;
+    std::vector<int32_t> custom_token_map_2;
+    struct EmbeddingTokenRange {
+        int32_t token_start = 0;
+        int32_t token_count = 0;
+    };
+    std::map<std::string, EmbeddingTokenRange> embedding_pos_map;
 
     FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
                                       bool offload_params_to_cpu,
@@ -95,6 +102,74 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
 
     void set_embedding_dir(const std::string& dir) {
         embd_dir = dir;
+    }
+
+    int32_t append_custom_embedding(ggml_tensor* embd,
+                                    int32_t& custom_count,
+                                    std::vector<float>& custom_data) {
+        int32_t pos_start = custom_count;
+        size_t old_size   = custom_data.size();
+        int64_t n_elem    = ggml_nelements(embd);
+        custom_data.resize(old_size + n_elem);
+
+        float* dst = custom_data.data() + old_size;
+        if (embd->type == GGML_TYPE_F32) {
+            memcpy(dst, embd->data, n_elem * sizeof(float));
+        } else if (embd->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(embd->data), dst, n_elem);
+        } else if (embd->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(embd->data), dst, n_elem);
+        } else {
+            const ggml_type_traits* type_traits = ggml_get_type_traits(embd->type);
+            if (type_traits->to_float == nullptr) {
+                LOG_ERROR("embedding type %s cannot be converted to f32", ggml_type_name(embd->type));
+                custom_data.resize(old_size);
+                return -1;
+            }
+            type_traits->to_float(embd->data, dst, n_elem);
+        }
+        custom_count += static_cast<int32_t>(embd->ne[1]);
+        return pos_start;
+    }
+
+    bool can_convert_embedding_to_f32(ggml_tensor* embd) {
+        if (embd->type == GGML_TYPE_F32 || embd->type == GGML_TYPE_F16 || embd->type == GGML_TYPE_BF16) {
+            return true;
+        }
+        const ggml_type_traits* type_traits = ggml_get_type_traits(embd->type);
+        if (type_traits->to_float != nullptr) {
+            return true;
+        }
+        LOG_ERROR("embedding type %s cannot be converted to f32", ggml_type_name(embd->type));
+        return false;
+    }
+
+    void remap_custom_embedding_tokens(std::vector<int>& tokens,
+                                       const std::vector<int32_t>& token_map,
+                                       int32_t token_vocab_size,
+                                       int32_t model_vocab_size,
+                                       int32_t pad_token) {
+        std::vector<int> remapped_tokens;
+        remapped_tokens.reserve(tokens.size());
+        for (int token : tokens) {
+            int32_t custom_index = token - token_vocab_size;
+            if (custom_index >= 0 && custom_index < static_cast<int32_t>(token_map.size())) {
+                int32_t mapped_index = token_map[custom_index];
+                if (mapped_index >= 0) {
+                    remapped_tokens.push_back(model_vocab_size + mapped_index);
+                }
+            } else {
+                remapped_tokens.push_back(token);
+            }
+        }
+
+        while (remapped_tokens.size() < tokens.size()) {
+            remapped_tokens.push_back(pad_token);
+        }
+        if (remapped_tokens.size() > tokens.size()) {
+            remapped_tokens.resize(tokens.size());
+        }
+        tokens = std::move(remapped_tokens);
     }
 
     std::string resolve_embedding_path(const std::string& embd_name) {
@@ -179,8 +254,9 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         auto iter = embedding_pos_map.find(embd_name);
         if (iter != embedding_pos_map.end()) {
             LOG_DEBUG("embedding already read in: %s", embd_name.c_str());
-            for (int i = iter->second.first; i < iter->second.second; i++) {
-                bpe_tokens.push_back(text_model->model.vocab_size + i);
+            for (int i = 0; i < iter->second.token_count; i++) {
+                int32_t token_index = iter->second.token_start + i;
+                bpe_tokens.push_back(text_model->model.vocab_size + token_index);
             }
             return true;
         }
@@ -212,36 +288,54 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             return true;
         };
         model_loader.load_tensors(on_load, 1);
-        int pos_start = num_custom_embeddings;
+        int32_t token_count = 0;
         if (embd) {
-            int64_t hidden_size = text_model->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings * hidden_size * ggml_type_size(embd->type)),
-                   embd->data,
-                   ggml_nbytes(embd));
+            token_count = std::max(token_count, static_cast<int32_t>(embd->ne[1]));
+        }
+        if (embd2) {
+            token_count = std::max(token_count, static_cast<int32_t>(embd2->ne[1]));
+        }
+        if (token_count == 0) {
+            ggml_free(embd_ctx);
+            return false;
+        }
+        if ((embd && !can_convert_embedding_to_f32(embd)) || (embd2 && !can_convert_embedding_to_f32(embd2))) {
+            ggml_free(embd_ctx);
+            return false;
+        }
+
+        int32_t token_start = static_cast<int32_t>(custom_token_map.size());
+        custom_token_map.resize(token_start + token_count, -1);
+        custom_token_map_2.resize(token_start + token_count, -1);
+
+        if (embd) {
+            int32_t pos_start = append_custom_embedding(embd, num_custom_embeddings, token_embed_custom);
+            if (pos_start < 0) {
+                ggml_free(embd_ctx);
+                return false;
+            }
             for (int i = 0; i < embd->ne[1]; i++) {
-                bpe_tokens.push_back(text_model->model.vocab_size + num_custom_embeddings);
-                num_custom_embeddings++;
+                custom_token_map[token_start + i] = pos_start + i;
             }
             LOG_DEBUG("embedding '%s' applied, custom embeddings: %i", embd_name.c_str(), num_custom_embeddings);
         }
         if (embd2) {
-            int64_t hidden_size = text_model2->model.hidden_size;
-            token_embed_custom.resize(token_embed_custom.size() + ggml_nbytes(embd2));
-            memcpy((void*)(token_embed_custom.data() + num_custom_embeddings_2 * hidden_size * ggml_type_size(embd2->type)),
-                   embd2->data,
-                   ggml_nbytes(embd2));
+            int32_t pos_start = append_custom_embedding(embd2, num_custom_embeddings_2, token_embed_custom_2);
+            if (pos_start < 0) {
+                ggml_free(embd_ctx);
+                return false;
+            }
             for (int i = 0; i < embd2->ne[1]; i++) {
-                bpe_tokens.push_back(text_model2->model.vocab_size + num_custom_embeddings_2);
-                num_custom_embeddings_2++;
+                custom_token_map_2[token_start + i] = pos_start + i;
             }
             LOG_DEBUG("embedding '%s' applied, custom embeddings: %i (text model 2)", embd_name.c_str(), num_custom_embeddings_2);
         }
-        int pos_end = num_custom_embeddings;
-        if (pos_end == pos_start) {
-            return false;
+
+        for (int i = 0; i < token_count; i++) {
+            bpe_tokens.push_back(text_model->model.vocab_size + token_start + i);
         }
-        embedding_pos_map[embd_name] = std::pair{pos_start, pos_end};
+        embedding_pos_map[embd_name] = EmbeddingTokenRange{token_start, token_count};
+        ggml_free(embd_ctx);
         return true;
     }
 
@@ -657,18 +751,30 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             std::vector<float> chunk_weights(weights.begin() + chunk_idx * chunk_len,
                                              weights.begin() + (chunk_idx + 1) * chunk_len);
 
-            auto input_ids          = vector_to_ggml_tensor_i32(work_ctx, chunk_tokens);
+            std::vector<int> chunk_tokens1 = chunk_tokens;
+            remap_custom_embedding_tokens(chunk_tokens1,
+                                          custom_token_map,
+                                          text_model->model.vocab_size,
+                                          text_model->model.vocab_size,
+                                          tokenizer.EOS_TOKEN_ID);
+            auto input_ids          = vector_to_ggml_tensor_i32(work_ctx, chunk_tokens1);
             ggml_tensor* input_ids2 = nullptr;
             size_t max_token_idx    = 0;
             if (sd_version_is_sdxl(version)) {
-                auto it = std::find(chunk_tokens.begin(), chunk_tokens.end(), tokenizer.EOS_TOKEN_ID);
-                if (it != chunk_tokens.end()) {
-                    std::fill(std::next(it), chunk_tokens.end(), 0);
+                std::vector<int> chunk_tokens2 = chunk_tokens;
+                remap_custom_embedding_tokens(chunk_tokens2,
+                                              custom_token_map_2,
+                                              text_model->model.vocab_size,
+                                              text_model2->model.vocab_size,
+                                              0);
+                auto it = std::find(chunk_tokens2.begin(), chunk_tokens2.end(), tokenizer.EOS_TOKEN_ID);
+                if (it != chunk_tokens2.end()) {
+                    std::fill(std::next(it), chunk_tokens2.end(), 0);
                 }
 
-                max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
+                max_token_idx = std::min<size_t>(std::distance(chunk_tokens2.begin(), it), chunk_tokens2.size() - 1);
 
-                input_ids2 = vector_to_ggml_tensor_i32(work_ctx, chunk_tokens);
+                input_ids2 = vector_to_ggml_tensor_i32(work_ctx, chunk_tokens2);
 
                 // for (int i = 0; i < chunk_tokens.size(); i++) {
                 //     printf("%d ", chunk_tokens[i]);
@@ -689,8 +795,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                 if (sd_version_is_sdxl(version)) {
                     text_model2->compute(n_threads,
                                          input_ids2,
-                                         num_custom_embeddings,
-                                         token_embed_custom.data(),
+                                         num_custom_embeddings_2,
+                                         token_embed_custom_2.data(),
                                          max_token_idx,
                                          false,
                                          clip_skip,
@@ -700,8 +806,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                     if (chunk_idx == 0) {
                         text_model2->compute(n_threads,
                                              input_ids2,
-                                             num_custom_embeddings,
-                                             token_embed_custom.data(),
+                                             num_custom_embeddings_2,
+                                             token_embed_custom_2.data(),
                                              max_token_idx,
                                              true,
                                              clip_skip,
