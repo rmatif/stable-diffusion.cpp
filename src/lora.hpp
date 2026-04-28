@@ -15,6 +15,7 @@ struct LoraModel : public GGMLRunner {
     std::vector<int> zero_index_vec = {0};
     ggml_tensor* zero_index         = nullptr;
     std::string file_path;
+    SDVersion sd_version = VERSION_COUNT;
     ModelLoader model_loader;
     bool load_failed         = false;
     bool applied             = false;
@@ -27,7 +28,7 @@ struct LoraModel : public GGMLRunner {
               const std::string& file_path = "",
               std::string prefix           = "",
               SDVersion version            = VERSION_COUNT)
-        : lora_id(lora_id), file_path(file_path), GGMLRunner(backend, false) {
+        : lora_id(lora_id), file_path(file_path), sd_version(version), GGMLRunner(backend, false) {
         prefix = "lora." + prefix;
         if (!model_loader.init_from_file_and_convert_name(file_path, prefix, version)) {
             load_failed = true;
@@ -501,6 +502,19 @@ struct LoraModel : public GGMLRunner {
                     LOG_WARN("pad for %s", model_tensor_name.c_str());
                     auto pad_tensor = ggml_ext_zeros(ctx, diff->ne[0], model_tensor->ne[1] - diff->ne[1], 1, 1);
                     diff            = ggml_concat(ctx, diff, pad_tensor, 1);
+                }
+            } else if (ggml_nelements(diff) > ggml_nelements(model_tensor)) {
+                if (sd_version_is_anima(sd_version) &&
+                    model_tensor_name == "model.diffusion_model.net.x_embedder.proj.1.weight" &&
+                    ggml_n_dims(diff) == 2 &&
+                    ggml_n_dims(model_tensor) == 2 &&
+                    diff->ne[0] > model_tensor->ne[0] &&
+                    diff->ne[1] == model_tensor->ne[1]) {
+                    LOG_WARN("slice Anima x_embedder LoRA diff for %s from %lld to %lld input features",
+                             model_tensor_name.c_str(),
+                             (long long)diff->ne[0],
+                             (long long)model_tensor->ne[0]);
+                    diff = ggml_ext_slice(ctx, diff, 0, 0, model_tensor->ne[0]);
                 }
             }
 
