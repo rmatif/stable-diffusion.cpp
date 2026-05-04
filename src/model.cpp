@@ -1029,6 +1029,20 @@ void ModelLoader::rebuild_tensor_storage_map() {
     }
 }
 
+static bool is_original_unet_lora_block_name(const std::string& name) {
+    return name.find("unet_input_blocks_") != std::string::npos ||
+           name.find("unet_middle_block_") != std::string::npos ||
+           name.find("unet_output_blocks_") != std::string::npos ||
+           name.find("model.diffusion_model.input_blocks.") != std::string::npos ||
+           name.find("model.diffusion_model.middle_block.") != std::string::npos ||
+           name.find("model.diffusion_model.output_blocks.") != std::string::npos;
+}
+
+static bool should_prefer_lora_source(const std::string& candidate_source, const std::string& existing_source) {
+    return is_original_unet_lora_block_name(candidate_source) &&
+           !is_original_unet_lora_block_name(existing_source);
+}
+
 bool is_zip_file(const std::string& file_path) {
     zip_t* zip = zip_open(file_path.c_str(), 0, 'r');
     if (zip == nullptr) {
@@ -1131,12 +1145,20 @@ bool ModelLoader::init_from_file(const std::string& file_path, const std::string
 void ModelLoader::convert_tensors_name() {
     SDVersion version = (version_ == VERSION_COUNT) ? get_sd_version() : version_;
     String2TensorStorage new_map;
+    std::unordered_map<std::string, std::string> source_names;
 
     for (auto& [_, tensor_storage] : tensor_storage_map) {
-        auto new_name = convert_tensor_name(tensor_storage.name, version);
+        const std::string source_name = tensor_storage.name;
+        auto new_name                 = convert_tensor_name(source_name, version);
         // LOG_DEBUG("%s -> %s", tensor_storage.name.c_str(), new_name.c_str());
         tensor_storage.name = new_name;
-        new_map[new_name]   = std::move(tensor_storage);
+        auto inserted       = new_map.insert({new_name, tensor_storage});
+        if (inserted.second) {
+            source_names[new_name] = source_name;
+        } else if (!should_prefer_lora_source(source_names[new_name], source_name)) {
+            inserted.first->second = tensor_storage;
+            source_names[new_name] = source_name;
+        }
     }
 
     tensor_storage_map.swap(new_map);
