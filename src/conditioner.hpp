@@ -1960,6 +1960,14 @@ struct AnimaConditioner : public Conditioner {
             t5_tokens.push_back(1);  // t5 eos token
             t5_weights.push_back(1.f);
         }
+        if (t5_tokens.size() > 512) {
+            // Anima consumes a 512-token adapted context. Truncate before the
+            // full-attention adapter so overflow tokens cannot affect kept tokens.
+            t5_tokens.resize(512);
+            t5_weights.resize(512);
+            t5_tokens.back()  = 1;  // t5 eos token
+            t5_weights.back() = 1.f;
+        }
 
         return {qwen_tokens, qwen_weights, t5_tokens, t5_weights};
     }
