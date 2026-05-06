@@ -493,8 +493,6 @@ namespace Anima {
                                                      adapted_context->ne[2],
                                                      1);
                     adapted_context = ggml_concat(ctx->ggml_ctx, adapted_context, pad_ctx, 1);
-                } else if (adapted_context->ne[1] > 512) {
-                    adapted_context = ggml_ext_slice(ctx->ggml_ctx, adapted_context, 1, 0, 512);
                 }
                 encoder_hidden_states = adapted_context;
             }
