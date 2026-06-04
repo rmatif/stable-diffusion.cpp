@@ -679,6 +679,58 @@ public:
         }
     }
 
+    bool get_backend_memory(size_t* free_bytes, size_t* total_bytes) const {
+        if (backend == nullptr || ggml_backend_is_cpu(backend)) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+        size_t free_vram  = 0;
+        size_t total_vram = 0;
+        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+        if (free_bytes != nullptr) {
+            *free_bytes = free_vram;
+        }
+        if (total_bytes != nullptr) {
+            *total_bytes = total_vram;
+        }
+        return true;
+    }
+
+    size_t get_total_params_buffer_size() const {
+        size_t total = 0;
+
+        auto add_runner = [&](const auto& runner) {
+            if (runner) {
+                total += runner->get_params_buffer_size();
+            }
+        };
+
+        add_runner(cond_stage_model);
+        add_runner(clip_vision);
+        add_runner(diffusion_model);
+        add_runner(high_noise_diffusion_model);
+        add_runner(first_stage_model);
+        add_runner(preview_vae);
+        add_runner(control_net);
+        add_runner(pmid_model);
+        add_runner(pmid_lora);
+
+        for (const auto& lora : cond_stage_lora_models) {
+            add_runner(lora);
+        }
+        for (const auto& lora : diffusion_lora_models) {
+            add_runner(lora);
+        }
+        for (const auto& lora : first_stage_lora_models) {
+            add_runner(lora);
+        }
+
+        return total;
+    }
+
     void init_backend() {
 #ifdef SD_USE_CUDA
         LOG_DEBUG("Using CUDA backend");
@@ -3651,6 +3703,34 @@ SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx) {
         return SD_MODEL_VERSION_UNKNOWN;
     }
     return static_cast<sd_model_version_t>(sd_ctx->sd->version);
+}
+
+SD_API bool sd_ctx_get_backend_memory(const sd_ctx_t* sd_ctx, size_t* free_bytes, size_t* total_bytes) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->get_backend_memory(free_bytes, total_bytes);
+}
+
+SD_API size_t sd_ctx_get_total_params_size(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return 0;
+    }
+    return sd_ctx->sd->get_total_params_buffer_size();
+}
+
+SD_API bool sd_ctx_uses_cpu_params(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->offload_params_to_cpu;
+}
+
+SD_API bool sd_ctx_uses_stream_layers(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->stream_layers;
 }
 
 SD_API int sd_get_vae_scale_factor(const sd_ctx_t* sd_ctx) {

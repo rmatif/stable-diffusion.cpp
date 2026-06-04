@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <unordered_map>
 #include <numeric>
@@ -5367,13 +5368,67 @@ json logs_to_json(const LogCollector& collector) {
     return entries;
 }
 
-bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& error_message) {
+constexpr size_t adaptive_streaming_headroom_bytes = 1024ull * 1024 * 1024;
+
+bool is_adaptive_streaming_config(const CtxConfig& config) {
+    return config.stream_layers && config.max_vram < 0.f;
+}
+
+std::string format_gib(size_t bytes) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << (bytes / (1024.0 * 1024.0 * 1024.0));
+    return oss.str();
+}
+
+bool should_rebuild_for_adaptive_streaming(ServerState& state, const CtxConfig& desired, LogCollector& collector) {
+    if (state.ctx == nullptr || !is_adaptive_streaming_config(desired) || desired != state.ctx_config) {
+        return false;
+    }
+
+    size_t free_vram  = 0;
+    size_t total_vram = 0;
+    if (!sd_ctx_get_backend_memory(state.ctx, &free_vram, &total_vram)) {
+        return false;
+    }
+
+    const size_t params_size = sd_ctx_get_total_params_size(state.ctx);
+    if (params_size == 0) {
+        return false;
+    }
+
+    const bool active_gpu_resident = !sd_ctx_uses_cpu_params(state.ctx) &&
+                                     !sd_ctx_uses_stream_layers(state.ctx);
+    const bool should_use_gpu_resident =
+        active_gpu_resident
+            ? free_vram >= adaptive_streaming_headroom_bytes
+            : free_vram >= params_size + adaptive_streaming_headroom_bytes;
+
+    if (should_use_gpu_resident == active_gpu_resident) {
+        return false;
+    }
+
+    std::ostringstream message;
+    if (should_use_gpu_resident) {
+        message << "adaptive stream-layers: free VRAM " << format_gib(free_vram)
+                << " GiB can fit params " << format_gib(params_size)
+                << " GiB plus " << format_gib(adaptive_streaming_headroom_bytes)
+                << " GiB headroom; rebuilding with GPU-resident params";
+    } else {
+        message << "adaptive stream-layers: free VRAM " << format_gib(free_vram)
+                << " GiB is below " << format_gib(adaptive_streaming_headroom_bytes)
+                << " GiB headroom for current GPU-resident context; rebuilding with CPU layer streaming";
+    }
+    collector.add(SD_LOG_INFO, message.str());
+    return true;
+}
+
+bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& error_message, bool force_reload = false) {
     if (desired.model_path.empty() && desired.diffusion_model_path.empty()) {
         error_message = "model_path or diffusion_model_path must be provided";
         return false;
     }
 
-    bool needs_reload = (state.ctx == nullptr) || (desired != state.ctx_config);
+    bool needs_reload = force_reload || (state.ctx == nullptr) || (desired != state.ctx_config);
     if (!needs_reload) {
         return true;
     }
@@ -5754,7 +5809,8 @@ int main(int argc, char** argv) {
         bool needs_vae_encode = request_params.has_init_image || !request_params.ref_images.empty();
         desired_config.vae_decode_only = !needs_vae_encode;
 
-        if (!ensure_context(state, desired_config, context_error)) {
+        const bool force_adaptive_reload = should_rebuild_for_adaptive_streaming(state, desired_config, collector);
+        if (!ensure_context(state, desired_config, context_error, force_adaptive_reload)) {
             auto response = make_error_response(context_error, collector);
             res.status = 500;
             res.set_content(response.dump(), "application/json");

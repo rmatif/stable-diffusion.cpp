@@ -421,6 +421,10 @@ SD_API bool sd_reload_text_encoders(sd_ctx_t* sd_ctx,
                                     const char* qwen2vl_path,
                                     const char* qwen2vl_vision_path);
 SD_API enum sd_model_version_t sd_get_model_version(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_get_backend_memory(const sd_ctx_t* sd_ctx, size_t* free_bytes, size_t* total_bytes);
+SD_API size_t sd_ctx_get_total_params_size(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_uses_cpu_params(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_uses_stream_layers(const sd_ctx_t* sd_ctx);
 SD_API int sd_get_vae_scale_factor(const sd_ctx_t* sd_ctx);
 SD_API int sd_get_image_size_multiple(const sd_ctx_t* sd_ctx);
 
