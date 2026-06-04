@@ -2025,6 +2025,11 @@ namespace WAN {
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
             }
 
+            sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            if (c != nullptr) {
+                sd::ggml_graph_cut::mark_graph_cut(c, "wan.prelude", "c");
+            }
+
             auto x_orig = x;
 
             for (int i = 0; i < params.num_layers; i++) {
@@ -2043,6 +2048,10 @@ namespace WAN {
                     c           = result.second;
                     c_skip      = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
                     x           = ggml_add(ctx->ggml_ctx, x, c_skip);
+                }
+                sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");
+                if (c != nullptr) {
+                    sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
                 }
             }
 

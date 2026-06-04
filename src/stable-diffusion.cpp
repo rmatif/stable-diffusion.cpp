@@ -15,6 +15,7 @@
 #include "diffusion_model.hpp"
 #include "easycache.hpp"
 #include "esrgan.hpp"
+#include "ggml_graph_cut.h"
 #include "lora.hpp"
 #include "pmid.hpp"
 #include "spectrum.hpp"
@@ -564,6 +565,8 @@ public:
     std::string taesd_path;
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
     bool offload_params_to_cpu           = false;
+    float max_vram                       = 0.f;
+    bool stream_layers                   = false;
     bool use_pmid                        = false;
 
     bool is_using_v_parameterization     = false;
@@ -598,7 +601,14 @@ public:
 
         auto offload_runner = [](auto& module) {
             if (module) {
+                module->release_streaming_residency();
                 module->free_compute_buffer();
+            }
+        };
+        auto offload_ggml_runner = [](auto& runner) {
+            if (runner) {
+                runner->release_streaming_residency();
+                runner->free_compute_buffer();
             }
         };
         auto offload_conditioner = [](const std::shared_ptr<Conditioner>& conditioner) {
@@ -607,56 +617,65 @@ public:
             }
             if (auto clip = std::dynamic_pointer_cast<FrozenCLIPEmbedderWithCustomWords>(conditioner)) {
                 if (clip->text_model) {
+                    clip->text_model->release_streaming_residency();
                     clip->text_model->free_compute_buffer();
                 }
                 if (clip->text_model2) {
+                    clip->text_model2->release_streaming_residency();
                     clip->text_model2->free_compute_buffer();
                 }
             } else if (auto sd3 = std::dynamic_pointer_cast<SD3CLIPEmbedder>(conditioner)) {
                 if (sd3->clip_l) {
+                    sd3->clip_l->release_streaming_residency();
                     sd3->clip_l->free_compute_buffer();
                 }
                 if (sd3->clip_g) {
+                    sd3->clip_g->release_streaming_residency();
                     sd3->clip_g->free_compute_buffer();
                 }
                 if (sd3->t5) {
+                    sd3->t5->release_streaming_residency();
                     sd3->t5->free_compute_buffer();
                 }
             } else if (auto t5 = std::dynamic_pointer_cast<T5CLIPEmbedder>(conditioner)) {
                 if (t5->t5) {
+                    t5->t5->release_streaming_residency();
                     t5->t5->free_compute_buffer();
                 }
             } else if (auto flux = std::dynamic_pointer_cast<FluxCLIPEmbedder>(conditioner)) {
                 if (flux->clip_l) {
+                    flux->clip_l->release_streaming_residency();
                     flux->clip_l->free_compute_buffer();
                 }
                 if (flux->t5) {
+                    flux->t5->release_streaming_residency();
                     flux->t5->free_compute_buffer();
                 }
             } else if (auto llm = std::dynamic_pointer_cast<LLMEmbedder>(conditioner)) {
                 if (llm->llm) {
+                    llm->llm->release_streaming_residency();
                     llm->llm->free_compute_buffer();
                 }
             }
         };
 
         offload_conditioner(cond_stage_model);
-        offload_runner(clip_vision);
+        offload_ggml_runner(clip_vision);
         offload_runner(diffusion_model);
         offload_runner(high_noise_diffusion_model);
-        offload_runner(first_stage_model);
-        offload_runner(control_net);
-        offload_runner(pmid_model);
-        offload_runner(pmid_lora);
+        offload_ggml_runner(first_stage_model);
+        offload_ggml_runner(control_net);
+        offload_ggml_runner(pmid_model);
+        offload_ggml_runner(pmid_lora);
 
         for (auto& lora : cond_stage_lora_models) {
-            offload_runner(lora);
+            offload_ggml_runner(lora);
         }
         for (auto& lora : diffusion_lora_models) {
-            offload_runner(lora);
+            offload_ggml_runner(lora);
         }
         for (auto& lora : first_stage_lora_models) {
-            offload_runner(lora);
+            offload_ggml_runner(lora);
         }
     }
 
@@ -732,6 +751,8 @@ public:
         vae_decode_only         = sd_ctx_params->vae_decode_only;
         free_params_immediately = sd_ctx_params->free_params_immediately;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
+        max_vram                = sd_ctx_params->max_vram;
+        stream_layers           = sd_ctx_params->stream_layers;
 
         bool use_tae = false;
 
@@ -745,6 +766,29 @@ public:
         ggml_log_set(ggml_log_callback_default, nullptr);
 
         init_backend();
+
+        max_vram = sd::ggml_graph_cut::resolve_max_vram_gib(max_vram, backend);
+        if (stream_layers && max_vram <= 0.f) {
+            LOG_WARN("--stream-layers requires --max-vram; disabling layer streaming");
+            stream_layers = false;
+        }
+        if (stream_layers && ggml_backend_is_cpu(backend)) {
+            LOG_WARN("--stream-layers requested with CPU backend; disabling layer streaming");
+            stream_layers = false;
+        }
+        if (stream_layers && !offload_params_to_cpu) {
+            LOG_INFO("--stream-layers requires CPU-resident params; enabling --offload-to-cpu");
+            offload_params_to_cpu = true;
+        }
+        const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram);
+        const bool graph_cut_can_run = max_graph_vram_bytes > 0 && offload_params_to_cpu && !ggml_backend_is_cpu(backend);
+        if (max_graph_vram_bytes > 0 && !graph_cut_can_run) {
+            LOG_WARN("--max-vram requires --offload-to-cpu or --stream-layers with a GPU backend; graph splitting disabled");
+        } else if (graph_cut_can_run) {
+            LOG_INFO("graph cut max VRAM budget: %.2f GiB%s",
+                     max_vram,
+                     stream_layers ? " with layer streaming" : "");
+        }
 
         ModelLoader model_loader;
 
@@ -889,7 +933,7 @@ public:
                     }
                 }
             }
-            if (have_quantized_weight) {
+            if (have_quantized_weight || stream_layers || offload_params_to_cpu) {
                 apply_lora_immediately = false;
             } else {
                 apply_lora_immediately = true;
@@ -916,6 +960,17 @@ public:
         }
 
         bool clip_on_cpu = sd_ctx_params->keep_clip_on_cpu;
+        auto configure_ggml_runner = [&](const auto& runner) {
+            if (runner) {
+                runner->set_max_graph_vram_bytes(max_graph_vram_bytes);
+            }
+        };
+        auto configure_diffusion_runner = [&](const std::shared_ptr<DiffusionModel>& model) {
+            if (model) {
+                model->set_max_graph_vram_bytes(max_graph_vram_bytes);
+                model->set_stream_layers_enabled(stream_layers);
+            }
+        };
 
         {
             clip_backend = backend;
@@ -1006,6 +1061,7 @@ public:
                     clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend,
                                                                              offload_params_to_cpu,
                                                                              tensor_storage_map);
+                    configure_ggml_runner(clip_vision);
                     clip_vision->alloc_params_buffer();
                     clip_vision->get_param_tensors(tensors);
                 }
@@ -1072,6 +1128,10 @@ public:
                     std::dynamic_pointer_cast<UNetModel>(diffusion_model)->unet.set_conv2d_direct_enabled(true);
                 }
             }
+
+            cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
+            configure_diffusion_runner(diffusion_model);
+            configure_diffusion_runner(high_noise_diffusion_model);
 
             cond_stage_model->alloc_params_buffer();
             cond_stage_model->get_param_tensors(tensors);
@@ -1153,19 +1213,23 @@ public:
                 first_stage_model = std::make_shared<FakeVAE>(version,
                                                               vae_backend,
                                                               offload_params_to_cpu);
+                configure_ggml_runner(first_stage_model);
             } else if (use_tae && !tae_preview_only) {
                 LOG_INFO("using TAE for encoding / decoding");
                 first_stage_model = create_tae();
+                configure_ggml_runner(first_stage_model);
                 first_stage_model->alloc_params_buffer();
                 first_stage_model->get_param_tensors(tensors, "tae");
             } else {
                 LOG_INFO("using VAE for encoding / decoding");
                 first_stage_model = create_vae();
+                configure_ggml_runner(first_stage_model);
                 first_stage_model->alloc_params_buffer();
                 first_stage_model->get_param_tensors(tensors, "first_stage_model");
                 if (use_tae && tae_preview_only) {
                     LOG_INFO("using TAE for preview");
                     preview_vae = create_tae();
+                    configure_ggml_runner(preview_vae);
                     preview_vae->alloc_params_buffer();
                     preview_vae->get_param_tensors(tensors, "tae");
                 }
@@ -1180,17 +1244,17 @@ public:
             }
 
             if (strlen(SAFE_STR(sd_ctx_params->control_net_path)) > 0) {
-                ggml_backend_t controlnet_backend = nullptr;
                 if (sd_ctx_params->keep_control_net_on_cpu && !ggml_backend_is_cpu(backend)) {
                     LOG_DEBUG("ControlNet: Using CPU backend");
-                    controlnet_backend = ggml_backend_cpu_init();
+                    control_net_backend = ggml_backend_cpu_init();
                 } else {
-                    controlnet_backend = backend;
+                    control_net_backend = backend;
                 }
-                control_net = std::make_shared<ControlNet>(controlnet_backend,
+                control_net = std::make_shared<ControlNet>(control_net_backend,
                                                            offload_params_to_cpu,
                                                            tensor_storage_map,
                                                            version);
+                configure_ggml_runner(control_net);
                 if (sd_ctx_params->diffusion_conv_direct) {
                     LOG_INFO("Using Conv2d direct in the control net");
                     control_net->set_conv2d_direct_enabled(true);
@@ -1204,6 +1268,7 @@ public:
                                                                    "pmid",
                                                                    version,
                                                                    PM_VERSION_2);
+                configure_ggml_runner(pmid_model);
                 LOG_INFO("using PhotoMaker Version 2");
             } else {
                 pmid_model = std::make_shared<PhotoMakerIDEncoder>(backend,
@@ -1211,9 +1276,11 @@ public:
                                                                    tensor_storage_map,
                                                                    "pmid",
                                                                    version);
+                configure_ggml_runner(pmid_model);
             }
             if (strlen(SAFE_STR(sd_ctx_params->photo_maker_path)) > 0) {
                 pmid_lora               = std::make_shared<LoraModel>("pmid", backend, sd_ctx_params->photo_maker_path, "", version);
+                configure_ggml_runner(pmid_lora);
                 auto lora_tensor_filter = [&](const std::string& tensor_name) {
                     if (starts_with(tensor_name, "lora.model")) {
                         return true;
@@ -1349,25 +1416,29 @@ public:
 
             size_t total_params_ram_size  = 0;
             size_t total_params_vram_size = 0;
-            if (ggml_backend_is_cpu(clip_backend)) {
+            const bool clip_params_on_cpu        = offload_params_to_cpu || ggml_backend_is_cpu(clip_backend);
+            const bool diffusion_params_on_cpu   = offload_params_to_cpu || ggml_backend_is_cpu(backend);
+            const bool vae_params_on_cpu         = offload_params_to_cpu || ggml_backend_is_cpu(vae_backend);
+            const bool control_net_params_on_cpu = offload_params_to_cpu || ggml_backend_is_cpu(control_net_backend);
+            if (clip_params_on_cpu) {
                 total_params_ram_size += clip_params_mem_size + pmid_params_mem_size;
             } else {
                 total_params_vram_size += clip_params_mem_size + pmid_params_mem_size;
             }
 
-            if (ggml_backend_is_cpu(backend)) {
+            if (diffusion_params_on_cpu) {
                 total_params_ram_size += unet_params_mem_size;
             } else {
                 total_params_vram_size += unet_params_mem_size;
             }
 
-            if (ggml_backend_is_cpu(vae_backend)) {
+            if (vae_params_on_cpu) {
                 total_params_ram_size += vae_params_mem_size;
             } else {
                 total_params_vram_size += vae_params_mem_size;
             }
 
-            if (ggml_backend_is_cpu(control_net_backend)) {
+            if (control_net_params_on_cpu) {
                 total_params_ram_size += control_net_params_mem_size;
             } else {
                 total_params_vram_size += control_net_params_mem_size;
@@ -1381,15 +1452,15 @@ public:
                 total_params_vram_size / 1024.0 / 1024.0,
                 total_params_ram_size / 1024.0 / 1024.0,
                 clip_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM",
+                clip_params_on_cpu ? "RAM" : "VRAM",
                 unet_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(backend) ? "RAM" : "VRAM",
+                diffusion_params_on_cpu ? "RAM" : "VRAM",
                 vae_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(vae_backend) ? "RAM" : "VRAM",
+                vae_params_on_cpu ? "RAM" : "VRAM",
                 control_net_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(control_net_backend) ? "RAM" : "VRAM",
+                control_net_params_on_cpu ? "RAM" : "VRAM",
                 pmid_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM");
+                clip_params_on_cpu ? "RAM" : "VRAM");
         }
 
         // init denoiser
@@ -1566,6 +1637,14 @@ public:
             }
         }
 
+        const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram);
+        diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
+        diffusion_model->set_stream_layers_enabled(stream_layers);
+        if (high_noise_diffusion_model) {
+            high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
+            high_noise_diffusion_model->set_stream_layers_enabled(stream_layers);
+        }
+
         if (diffusion_flash_attn) {
             LOG_INFO("Using flash attention in the diffusion model");
             diffusion_model->set_flash_attention_enabled(true);
@@ -1641,6 +1720,7 @@ public:
             }
         }
 
+        first_stage_model->set_max_graph_vram_bytes(sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram));
         first_stage_model->alloc_params_buffer();
 
         std::map<std::string, struct ggml_tensor*> vae_tensors;
@@ -1742,6 +1822,7 @@ public:
             cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), std::map<std::string, std::string>{}, version);
         }
 
+        cond_stage_model->set_max_graph_vram_bytes(sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram));
         cond_stage_model->alloc_params_buffer();
 
         std::map<std::string, struct ggml_tensor*> text_encoder_tensors;
@@ -3212,6 +3293,8 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->prediction              = PREDICTION_COUNT;
     sd_ctx_params->lora_apply_mode         = LORA_APPLY_AUTO;
     sd_ctx_params->offload_params_to_cpu   = false;
+    sd_ctx_params->max_vram                = 0.f;
+    sd_ctx_params->stream_layers           = false;
     sd_ctx_params->enable_mmap             = false;
     sd_ctx_params->keep_clip_on_cpu        = false;
     sd_ctx_params->keep_control_net_on_cpu = false;
@@ -3253,6 +3336,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "sampler_rng_type: %s\n"
              "prediction: %s\n"
              "offload_params_to_cpu: %s\n"
+             "max_vram: %.2f\n"
+             "stream_layers: %s\n"
              "keep_clip_on_cpu: %s\n"
              "keep_control_net_on_cpu: %s\n"
              "keep_vae_on_cpu: %s\n"
@@ -3285,6 +3370,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              sd_rng_type_name(sd_ctx_params->sampler_rng_type),
              sd_prediction_name(sd_ctx_params->prediction),
              BOOL_STR(sd_ctx_params->offload_params_to_cpu),
+             sd_ctx_params->max_vram,
+             BOOL_STR(sd_ctx_params->stream_layers),
              BOOL_STR(sd_ctx_params->keep_clip_on_cpu),
              BOOL_STR(sd_ctx_params->keep_control_net_on_cpu),
              BOOL_STR(sd_ctx_params->keep_vae_on_cpu),
@@ -3842,6 +3929,7 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         }
     }
 
+    sd_ctx->sd->diffusion_model->release_streaming_residency();
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
@@ -4607,6 +4695,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
 
         int64_t sampling_end = ggml_time_ms();
         LOG_INFO("sampling(high noise) completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+        sd_ctx->sd->high_noise_diffusion_model->release_streaming_residency();
         if (sd_ctx->sd->free_params_immediately) {
             sd_ctx->sd->high_noise_diffusion_model->free_params_buffer();
         }
@@ -4646,6 +4735,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
 
         int64_t sampling_end = ggml_time_ms();
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+        sd_ctx->sd->diffusion_model->release_streaming_residency();
         if (sd_ctx->sd->free_params_immediately) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }

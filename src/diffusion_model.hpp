@@ -43,6 +43,9 @@ struct DiffusionModel {
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_circular_axes(bool circular_x, bool circular_y) = 0;
+    virtual void set_max_graph_vram_bytes(size_t bytes)              = 0;
+    virtual void set_stream_layers_enabled(bool enabled)             = 0;
+    virtual void release_streaming_residency()                       = 0;
     virtual void reset_graph() {}
 };
 
@@ -98,6 +101,18 @@ struct UNetModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         unet.set_circular_axes(circular_x, circular_y);
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        unet.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        unet.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        unet.release_streaming_residency();
     }
 
     bool compute(int n_threads,
@@ -168,6 +183,18 @@ struct MMDiTModel : public DiffusionModel {
         mmdit.set_circular_axes(circular_x, circular_y);
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        mmdit.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        mmdit.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        mmdit.release_streaming_residency();
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  ggml_tensor** output     = nullptr,
@@ -232,6 +259,18 @@ struct FluxModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         flux.set_circular_axes(circular_x, circular_y);
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        flux.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        flux.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        flux.release_streaming_residency();
     }
 
     bool compute(int n_threads,
@@ -305,6 +344,18 @@ struct AnimaModel : public DiffusionModel {
         anima.set_circular_axes(circular_x, circular_y);
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        anima.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        anima.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        anima.release_streaming_residency();
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  ggml_tensor** output     = nullptr,
@@ -370,6 +421,18 @@ struct WanModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         wan.set_circular_axes(circular_x, circular_y);
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        wan.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        wan.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        wan.release_streaming_residency();
     }
 
     bool compute(int n_threads,
@@ -447,6 +510,18 @@ struct QwenImageModel : public DiffusionModel {
         qwen_image.reset_graph();
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        qwen_image.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        qwen_image.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        qwen_image.release_streaming_residency();
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  ggml_tensor** output     = nullptr,
@@ -513,6 +588,18 @@ struct ZImageModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         z_image.set_circular_axes(circular_x, circular_y);
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        z_image.set_max_graph_vram_bytes(bytes);
+    }
+
+    void set_stream_layers_enabled(bool enabled) override {
+        z_image.set_stream_layers_enabled(enabled);
+    }
+
+    void release_streaming_residency() override {
+        z_image.release_streaming_residency();
     }
 
     bool compute(int n_threads,

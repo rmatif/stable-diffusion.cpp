@@ -852,6 +852,8 @@ struct CLIOptions {
     bool diffusion_conv_direct = false;
     bool vae_conv_direct = false;
     bool offload_params_to_cpu = false;
+    float max_vram = 0.f;
+    bool stream_layers = false;
     bool enable_mmap = false;
     bool control_net_cpu = false;
     bool clip_on_cpu = false;
@@ -898,6 +900,7 @@ void print_usage() {
         << "      --prediction <type>                 Prediction override [eps, v, edm_v, sd3_flow, flux_flow, flux2_flow] (default: auto)\n"
         << "      --lora-apply-mode <mode>            LoRA apply mode [auto, immediately, at_runtime] (default: immediately)\n"
         << "      --flow-shift <value>                Flow model shift override\n"
+        << "      --max-vram <GiB>                    VRAM budget for segmented execution with CPU-resident params (0 disabled, -1 auto)\n"
         << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
         << "      --ucache <thr,start,end>            Enable UCache with threshold/start/end percents\n"
         << "      --spectrum <w,m,lam,window,flex,warmup,stop>\n"
@@ -907,6 +910,7 @@ void print_usage() {
         << "\n"
         << "Device placement:\n"
         << "      --offload-to-cpu                    Offload model weights to CPU RAM\n"
+        << "      --stream-layers                     Stream diffusion layer weights from CPU during generation\n"
         << "      --mmap                              Memory-map model weights\n"
         << "      --control-net-cpu                   Keep ControlNet on CPU\n"
         << "      --clip-on-cpu                       Keep CLIP on CPU\n"
@@ -1345,6 +1349,19 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
             options.vae_conv_direct = true;
         } else if (arg == "--offload-to-cpu") {
             options.offload_params_to_cpu = true;
+        } else if (arg == "--max-vram") {
+            if (i + 1 >= argc) {
+                error = "missing value for --max-vram";
+                return false;
+            }
+            try {
+                options.max_vram = std::stof(argv[++i]);
+            } catch (const std::exception&) {
+                error = "invalid value for --max-vram";
+                return false;
+            }
+        } else if (arg == "--stream-layers") {
+            options.stream_layers = true;
         } else if (arg == "--mmap") {
             options.enable_mmap = true;
         } else if (arg == "--control-net-cpu") {
@@ -1416,6 +1433,8 @@ struct CtxConfig {
     sd_type_t wtype = SD_TYPE_COUNT;
     rng_type_t rng_type = CUDA_RNG;
     bool offload_params_to_cpu = false;
+    float max_vram = 0.f;
+    bool stream_layers = false;
     bool enable_mmap = false;
     bool keep_clip_on_cpu = false;
     bool keep_control_net_on_cpu = false;
@@ -1452,6 +1471,8 @@ struct CtxConfig {
                wtype == other.wtype &&
                rng_type == other.rng_type &&
                offload_params_to_cpu == other.offload_params_to_cpu &&
+               max_vram == other.max_vram &&
+               stream_layers == other.stream_layers &&
                enable_mmap == other.enable_mmap &&
                keep_clip_on_cpu == other.keep_clip_on_cpu &&
                keep_control_net_on_cpu == other.keep_control_net_on_cpu &&
@@ -1495,6 +1516,8 @@ struct CtxConfig {
         params.wtype                   = wtype;
         params.rng_type                = rng_type;
         params.offload_params_to_cpu   = offload_params_to_cpu;
+        params.max_vram                = max_vram;
+        params.stream_layers           = stream_layers;
         params.enable_mmap             = enable_mmap;
         params.keep_clip_on_cpu        = keep_clip_on_cpu;
         params.keep_control_net_on_cpu = keep_control_net_on_cpu;
@@ -2185,6 +2208,7 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
     if (!assign_bool("vae_decode_only", config.vae_decode_only) ||
         !assign_bool("free_params_immediately", config.free_params_immediately) ||
         !assign_bool("offload_params_to_cpu", config.offload_params_to_cpu) ||
+        !assign_bool("stream_layers", config.stream_layers) ||
         !assign_bool("enable_mmap", config.enable_mmap) ||
         !assign_bool("clip_on_cpu", config.keep_clip_on_cpu) ||
         !assign_bool("control_net_cpu", config.keep_control_net_on_cpu) ||
@@ -2204,7 +2228,8 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
         return false;
     }
 
-    if (!assign_float("flow_shift", config.flow_shift)) {
+    if (!assign_float("flow_shift", config.flow_shift) ||
+        !assign_float("max_vram", config.max_vram)) {
         return false;
     }
 
@@ -5024,6 +5049,8 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.context.vae_conv_direct"] = config.vae_conv_direct;
     span_attributes["sdcpp.context.force_sdxl_vae_conv_scale"] = config.force_sdxl_vae_conv_scale;
     span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
+    span_attributes["sdcpp.context.max_vram"] = config.max_vram;
+    span_attributes["sdcpp.context.stream_layers"] = config.stream_layers;
     span_attributes["sdcpp.context.enable_mmap"] = config.enable_mmap;
     span_attributes["sdcpp.context.keep_clip_on_cpu"] = config.keep_clip_on_cpu;
     span_attributes["sdcpp.context.keep_control_net_on_cpu"] = config.keep_control_net_on_cpu;
@@ -5274,6 +5301,8 @@ json make_upscale_telemetry(const UpscaleRequest& request,
     }
     span_attributes["sdcpp.context.n_threads"] = config.n_threads;
     span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
+    span_attributes["sdcpp.context.max_vram"] = config.max_vram;
+    span_attributes["sdcpp.context.stream_layers"] = config.stream_layers;
 
     json spans = json::array();
     json root_span = json::object();
@@ -5395,6 +5424,8 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.wtype != desired.wtype ||
                current.rng_type != desired.rng_type ||
                current.offload_params_to_cpu != desired.offload_params_to_cpu ||
+               current.max_vram != desired.max_vram ||
+               current.stream_layers != desired.stream_layers ||
                current.enable_mmap != desired.enable_mmap ||
                current.keep_clip_on_cpu != desired.keep_clip_on_cpu ||
                current.keep_control_net_on_cpu != desired.keep_control_net_on_cpu ||
@@ -5603,6 +5634,8 @@ int main(int argc, char** argv) {
     state.ctx_config.wtype = options.wtype;
     state.ctx_config.rng_type = options.rng_type;
     state.ctx_config.offload_params_to_cpu = options.offload_params_to_cpu;
+    state.ctx_config.max_vram = options.max_vram;
+    state.ctx_config.stream_layers = options.stream_layers;
     state.ctx_config.enable_mmap = options.enable_mmap;
     state.ctx_config.keep_control_net_on_cpu = options.control_net_cpu;
     state.ctx_config.keep_clip_on_cpu = options.clip_on_cpu;

@@ -41,6 +41,7 @@ struct Conditioner {
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_flash_attention_enabled(bool enabled)                                 = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
+    virtual void set_max_graph_vram_bytes(size_t bytes) { SD_UNUSED(bytes); }
     virtual std::tuple<SDCondition, std::vector<bool>> get_learned_condition_with_trigger(ggml_context* work_ctx,
                                                                                           int n_threads,
                                                                                           const ConditionerParams& conditioner_params) {
@@ -242,6 +243,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         text_model->set_weight_adapter(adapter);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_weight_adapter(adapter);
+        }
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        text_model->set_max_graph_vram_bytes(bytes);
+        if (sd_version_is_sdxl(version)) {
+            text_model2->set_max_graph_vram_bytes(bytes);
         }
     }
 
@@ -1114,6 +1122,18 @@ struct SD3CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        if (clip_l) {
+            clip_l->set_max_graph_vram_bytes(bytes);
+        }
+        if (clip_g) {
+            clip_g->set_max_graph_vram_bytes(bytes);
+        }
+        if (t5) {
+            t5->set_max_graph_vram_bytes(bytes);
+        }
+    }
+
     std::vector<std::pair<std::vector<int>, std::vector<float>>> tokenize(std::string text,
                                                                           size_t max_length = 0,
                                                                           bool padding      = false) {
@@ -1485,6 +1505,15 @@ struct FluxCLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        if (clip_l) {
+            clip_l->set_max_graph_vram_bytes(bytes);
+        }
+        if (t5) {
+            t5->set_max_graph_vram_bytes(bytes);
+        }
+    }
+
     std::vector<std::pair<std::vector<int>, std::vector<float>>> tokenize(std::string text,
                                                                           size_t max_length = 0,
                                                                           bool padding      = false) {
@@ -1723,6 +1752,12 @@ struct T5CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        if (t5) {
+            t5->set_max_graph_vram_bytes(bytes);
+        }
+    }
+
     std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> tokenize(std::string text,
                                                                                   size_t max_length = 0,
                                                                                   bool padding      = false) {
@@ -1905,6 +1940,10 @@ struct AnimaConditioner : public Conditioner {
         llm->set_weight_adapter(adapter);
     }
 
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        llm->set_max_graph_vram_bytes(bytes);
+    }
+
     std::tuple<std::vector<int>, std::vector<float>, std::vector<int>, std::vector<float>> tokenize(std::string text) {
         auto parsed_attention = parse_prompt_attention(text);
 
@@ -2059,6 +2098,12 @@ struct LLMEmbedder : public Conditioner {
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         if (llm) {
             llm->set_weight_adapter(adapter);
+        }
+    }
+
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        if (llm) {
+            llm->set_max_graph_vram_bytes(bytes);
         }
     }
 

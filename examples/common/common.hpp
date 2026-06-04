@@ -453,6 +453,8 @@ struct SDContextParams {
     rng_type_t rng_type         = CUDA_RNG;
     rng_type_t sampler_rng_type = RNG_TYPE_COUNT;
     bool offload_params_to_cpu  = false;
+    float max_vram              = 0.f;
+    bool stream_layers          = false;
     bool enable_mmap            = false;
     bool control_net_cpu        = false;
     bool clip_on_cpu            = false;
@@ -578,6 +580,10 @@ struct SDContextParams {
 
         options.float_options = {
             {"",
+             "--max-vram",
+             "maximum VRAM budget in GiB for graph-cut segmented execution with CPU-resident params. 0 disables graph splitting; -1 uses free VRAM minus 1 GiB",
+             &max_vram},
+            {"",
              "--vae-tile-overlap",
              "tile overlap for vae tiling, in fraction of tile size (default: 0.5)",
              &vae_tiling_params.target_overlap},
@@ -596,6 +602,10 @@ struct SDContextParams {
              "--offload-to-cpu",
              "place the weights in RAM to save VRAM, and automatically load them into VRAM when needed",
              true, &offload_params_to_cpu},
+            {"",
+             "--stream-layers",
+             "stream diffusion layer weights from CPU during generation on top of --max-vram",
+             true, &stream_layers},
             {"",
              "--mmap",
              "whether to memory-map model",
@@ -900,6 +910,8 @@ struct SDContextParams {
             << "  rng_type: " << sd_rng_type_name(rng_type) << ",\n"
             << "  sampler_rng_type: " << sd_rng_type_name(sampler_rng_type) << ",\n"
             << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
+            << "  max_vram: " << max_vram << ",\n"
+            << "  stream_layers: " << (stream_layers ? "true" : "false") << ",\n"
             << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
             << "  control_net_cpu: " << (control_net_cpu ? "true" : "false") << ",\n"
             << "  clip_on_cpu: " << (clip_on_cpu ? "true" : "false") << ",\n"
@@ -965,6 +977,8 @@ struct SDContextParams {
             prediction,
             lora_apply_mode,
             offload_params_to_cpu,
+            max_vram,
+            stream_layers,
             enable_mmap,
             clip_on_cpu,
             control_net_cpu,
