@@ -2708,8 +2708,12 @@ int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend, ggml_type type)
         if (is_unused_tensor(tensor_storage.name)) {
             continue;
         }
-        if (tensor_should_be_converted(tensor_storage, type)) {
-            tensor_storage.type = type;
+        ggml_type dst_type = type;
+        if (dst_type == GGML_TYPE_COUNT) {
+            dst_type = tensor_storage.expected_type;
+        }
+        if (tensor_should_be_converted(tensor_storage, dst_type)) {
+            tensor_storage.type = dst_type;
         }
         mem_size += tensor_storage.nbytes() + alignment;
     }

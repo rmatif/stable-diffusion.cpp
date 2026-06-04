@@ -753,6 +753,8 @@ public:
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
         max_vram                = sd_ctx_params->max_vram;
         stream_layers           = sd_ctx_params->stream_layers;
+        const float requested_max_vram = max_vram;
+        bool auto_gpu_resident_params  = false;
 
         bool use_tae = false;
 
@@ -781,14 +783,6 @@ public:
             offload_params_to_cpu = true;
         }
         const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram);
-        const bool graph_cut_can_run = max_graph_vram_bytes > 0 && offload_params_to_cpu && !ggml_backend_is_cpu(backend);
-        if (max_graph_vram_bytes > 0 && !graph_cut_can_run) {
-            LOG_WARN("--max-vram requires --offload-to-cpu or --stream-layers with a GPU backend; graph splitting disabled");
-        } else if (graph_cut_can_run) {
-            LOG_INFO("graph cut max VRAM budget: %.2f GiB%s",
-                     max_vram,
-                     stream_layers ? " with layer streaming" : "");
-        }
 
         ModelLoader model_loader;
 
@@ -920,6 +914,38 @@ public:
         LOG_INFO("VAE weight type stat:             %s", wtype_stat_to_str(vae_wtype_stat).c_str());
 
         LOG_DEBUG("ggml tensor size = %d bytes", (int)sizeof(ggml_tensor));
+
+        if (stream_layers && requested_max_vram < 0.f && offload_params_to_cpu && !ggml_backend_is_cpu(backend) && max_graph_vram_bytes > 0) {
+            constexpr size_t auto_full_residency_margin = 1024ull * 1024 * 1024;
+            const int64_t estimated_params_mem_size     = model_loader.get_params_mem_size(backend);
+            const size_t estimated_params_vram_size     = estimated_params_mem_size > 0 ? static_cast<size_t>(estimated_params_mem_size) : 0;
+            const double estimated_params_gib           = estimated_params_vram_size / (1024.0 * 1024.0 * 1024.0);
+            const double max_graph_vram_gib             = max_graph_vram_bytes / (1024.0 * 1024.0 * 1024.0);
+            const double margin_gib                     = auto_full_residency_margin / (1024.0 * 1024.0 * 1024.0);
+            if (estimated_params_vram_size + auto_full_residency_margin <= max_graph_vram_bytes) {
+                LOG_INFO("--stream-layers auto: estimated params %.2f GiB fit within %.2f GiB budget plus %.2f GiB margin; using GPU-resident params",
+                         estimated_params_gib,
+                         max_graph_vram_gib,
+                         margin_gib);
+                offload_params_to_cpu   = false;
+                stream_layers           = false;
+                auto_gpu_resident_params = true;
+            } else {
+                LOG_INFO("--stream-layers auto: estimated params %.2f GiB exceed %.2f GiB budget after %.2f GiB margin; using CPU-resident layer streaming",
+                         estimated_params_gib,
+                         max_graph_vram_gib,
+                         margin_gib);
+            }
+        }
+
+        const bool graph_cut_can_run = max_graph_vram_bytes > 0 && offload_params_to_cpu && !ggml_backend_is_cpu(backend);
+        if (max_graph_vram_bytes > 0 && !graph_cut_can_run && !auto_gpu_resident_params) {
+            LOG_WARN("--max-vram requires --offload-to-cpu or --stream-layers with a GPU backend; graph splitting disabled");
+        } else if (graph_cut_can_run) {
+            LOG_INFO("graph cut max VRAM budget: %.2f GiB%s",
+                     max_vram,
+                     stream_layers ? " with layer streaming" : "");
+        }
 
         if (sd_ctx_params->lora_apply_mode == LORA_APPLY_AUTO) {
             bool have_quantized_weight = false;
