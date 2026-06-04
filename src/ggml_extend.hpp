@@ -2426,6 +2426,9 @@ protected:
                 size_t free_vram  = 0;
                 size_t total_vram = 0;
                 ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+                if (resident_runtime_params_buffer != nullptr) {
+                    free_vram += ggml_backend_buffer_get_size(resident_runtime_params_buffer);
+                }
                 constexpr size_t safety_margin = 512ull * 1024 * 1024;
                 size_t free_clamp              = free_vram > safety_margin ? free_vram - safety_margin : 0;
                 if (free_clamp < effective_budget) {
@@ -2782,38 +2785,53 @@ protected:
                                     ggml_context* output_ctx) {
         GGML_ASSERT(gf != nullptr);
 
-        if (weight_adapter != nullptr) {
-            restore_resident_params();
-        } else {
-            sd::ggml_graph_cut::Plan& base_plan = graph_cut_plan_cache_.graph_cut_plan;
-            if (base_plan.available) {
-                sd::ggml_graph_cut::annotate_residency(base_plan, residency_budget_bytes);
+        // Runtime LoRA composes weight + diff in the compute graph; the
+        // resident weight tensor data is not mutated, so chunk-K residency can
+        // remain valid across sampling steps.
+        size_t worst_merged_segment_footprint = 0;
+        for (const auto& segment : plan.segments) {
+            const size_t footprint = segment.input_param_bytes +
+                                     segment.compute_buffer_size +
+                                     segment.output_bytes +
+                                     segment.input_previous_cut_bytes +
+                                     segment.input_external_bytes;
+            if (footprint > worst_merged_segment_footprint) {
+                worst_merged_segment_footprint = footprint;
+            }
+        }
+        const size_t residency_budget_for_annotate =
+            residency_budget_bytes > worst_merged_segment_footprint
+                ? residency_budget_bytes - worst_merged_segment_footprint
+                : 0;
 
-                std::vector<ggml_tensor*> resident_params;
-                uint64_t token = 0;
-                for (const auto& segment : base_plan.segments) {
-                    if (segment.residency != sd::ggml_graph_cut::SegmentResidency::RESIDENT) {
+        sd::ggml_graph_cut::Plan& base_plan = graph_cut_plan_cache_.graph_cut_plan;
+        if (base_plan.available) {
+            sd::ggml_graph_cut::annotate_residency(base_plan, residency_budget_for_annotate);
+
+            std::vector<ggml_tensor*> resident_params;
+            uint64_t token = 0;
+            for (const auto& segment : base_plan.segments) {
+                if (segment.residency != sd::ggml_graph_cut::SegmentResidency::RESIDENT) {
+                    continue;
+                }
+                auto segment_params = sd::ggml_graph_cut::param_tensors(gf, segment);
+                for (ggml_tensor* tensor : segment_params) {
+                    if (tensor == nullptr) {
                         continue;
                     }
-                    auto segment_params = sd::ggml_graph_cut::param_tensors(gf, segment);
-                    for (ggml_tensor* tensor : segment_params) {
-                        if (tensor == nullptr) {
-                            continue;
-                        }
-                        resident_params.push_back(tensor);
-                        token ^= reinterpret_cast<uintptr_t>(tensor) * 0x9E3779B97F4A7C15ull;
-                    }
+                    resident_params.push_back(tensor);
+                    token ^= reinterpret_cast<uintptr_t>(tensor) * 0x9E3779B97F4A7C15ull;
                 }
-                if (token != resident_state_token) {
-                    restore_resident_params();
-                    if (!resident_params.empty()) {
-                        if (offload_resident_params(resident_params)) {
-                            resident_state_token = token;
-                        } else {
-                            LOG_ERROR("%s chunk-K: resident offload failed; continuing with per-segment streaming",
-                                      get_desc().c_str());
-                            restore_resident_params();
-                        }
+            }
+            if (token != resident_state_token) {
+                restore_resident_params();
+                if (!resident_params.empty()) {
+                    if (offload_resident_params(resident_params)) {
+                        resident_state_token = token;
+                    } else {
+                        LOG_ERROR("%s chunk-K: resident offload failed; continuing with per-segment streaming",
+                                  get_desc().c_str());
+                        restore_resident_params();
                     }
                 }
             }
@@ -2943,7 +2961,17 @@ public:
 
     bool alloc_params_buffer() {
         size_t num_tensors = ggml_tensor_num(params_ctx);
-        params_buffer      = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
+        ggml_backend_buffer_type_t params_buffer_type = nullptr;
+        if (params_backend != runtime_backend) {
+            ggml_backend_dev_t runtime_dev = ggml_backend_get_device(runtime_backend);
+            if (runtime_dev != nullptr) {
+                params_buffer_type = ggml_backend_dev_host_buffer_type(runtime_dev);
+            }
+        }
+        if (params_buffer_type == nullptr) {
+            params_buffer_type = ggml_backend_get_default_buffer_type(params_backend);
+        }
+        params_buffer = ggml_backend_alloc_ctx_tensors_from_buft(params_ctx, params_buffer_type);
         if (params_buffer == nullptr) {
             LOG_ERROR("%s alloc params backend buffer failed, num_tensors = %i",
                       get_desc().c_str(),
