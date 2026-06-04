@@ -3065,6 +3065,9 @@ public:
                  ggml_tensor** output                 = nullptr,
                  ggml_context* output_ctx             = nullptr,
                  bool freeze_graph                    = false) {
+        if (stream_layers_enabled) {
+            free_compute_buffer();
+        }
 #ifdef SD_USE_CUDA
         if (!ggml_backend_is_cpu(runtime_backend) && compute_allocr == nullptr) {
             ggml_backend_cuda_reset_graph(runtime_backend);
