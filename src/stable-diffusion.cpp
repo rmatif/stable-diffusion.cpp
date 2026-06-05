@@ -30,6 +30,7 @@
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -566,6 +567,7 @@ public:
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
     bool offload_params_to_cpu           = false;
     float max_vram                       = 0.f;
+    float max_vram_headroom              = 1.f;
     bool stream_layers                   = false;
     bool use_pmid                        = false;
 
@@ -804,6 +806,7 @@ public:
         free_params_immediately = sd_ctx_params->free_params_immediately;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
         max_vram                = sd_ctx_params->max_vram;
+        max_vram_headroom       = sd_ctx_params->max_vram_headroom;
         stream_layers           = sd_ctx_params->stream_layers;
         const float requested_max_vram = max_vram;
         bool auto_gpu_resident_params  = false;
@@ -821,7 +824,12 @@ public:
 
         init_backend();
 
-        max_vram = sd::ggml_graph_cut::resolve_max_vram_gib(max_vram, backend);
+        if (!std::isfinite(max_vram_headroom) || max_vram_headroom < 0.f) {
+            LOG_WARN("invalid max_vram_headroom %.2f GiB; using 1.00 GiB", max_vram_headroom);
+            max_vram_headroom = 1.f;
+        }
+
+        max_vram = sd::ggml_graph_cut::resolve_max_vram_gib(max_vram, max_vram_headroom, backend);
         if (stream_layers && max_vram <= 0.f) {
             LOG_WARN("--stream-layers requires --max-vram; disabling layer streaming");
             stream_layers = false;
@@ -968,7 +976,7 @@ public:
         LOG_DEBUG("ggml tensor size = %d bytes", (int)sizeof(ggml_tensor));
 
         if (stream_layers && requested_max_vram < 0.f && offload_params_to_cpu && !ggml_backend_is_cpu(backend) && max_graph_vram_bytes > 0) {
-            constexpr size_t auto_full_residency_margin = 1024ull * 1024 * 1024;
+            const size_t auto_full_residency_margin     = sd::ggml_graph_cut::max_vram_gib_to_bytes(max_vram_headroom);
             const int64_t estimated_params_mem_size     = model_loader.get_params_mem_size(backend);
             const size_t estimated_params_vram_size     = estimated_params_mem_size > 0 ? static_cast<size_t>(estimated_params_mem_size) : 0;
             const double estimated_params_gib           = estimated_params_vram_size / (1024.0 * 1024.0 * 1024.0);
@@ -3372,6 +3380,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->lora_apply_mode         = LORA_APPLY_AUTO;
     sd_ctx_params->offload_params_to_cpu   = false;
     sd_ctx_params->max_vram                = 0.f;
+    sd_ctx_params->max_vram_headroom       = 1.f;
     sd_ctx_params->stream_layers           = false;
     sd_ctx_params->enable_mmap             = false;
     sd_ctx_params->keep_clip_on_cpu        = false;
@@ -3415,6 +3424,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "prediction: %s\n"
              "offload_params_to_cpu: %s\n"
              "max_vram: %.2f\n"
+             "max_vram_headroom: %.2f\n"
              "stream_layers: %s\n"
              "keep_clip_on_cpu: %s\n"
              "keep_control_net_on_cpu: %s\n"
@@ -3449,6 +3459,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              sd_prediction_name(sd_ctx_params->prediction),
              BOOL_STR(sd_ctx_params->offload_params_to_cpu),
              sd_ctx_params->max_vram,
+             sd_ctx_params->max_vram_headroom,
              BOOL_STR(sd_ctx_params->stream_layers),
              BOOL_STR(sd_ctx_params->keep_clip_on_cpu),
              BOOL_STR(sd_ctx_params->keep_control_net_on_cpu),

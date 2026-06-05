@@ -854,6 +854,7 @@ struct CLIOptions {
     bool vae_conv_direct = false;
     bool offload_params_to_cpu = false;
     float max_vram = 0.f;
+    float max_vram_headroom = 1.f;
     bool stream_layers = false;
     bool enable_mmap = false;
     bool control_net_cpu = false;
@@ -902,6 +903,7 @@ void print_usage() {
         << "      --lora-apply-mode <mode>            LoRA apply mode [auto, immediately, at_runtime] (default: immediately)\n"
         << "      --flow-shift <value>                Flow model shift override\n"
         << "      --max-vram <GiB>                    VRAM budget for segmented execution with CPU-resident params (0 disabled, -1 auto)\n"
+        << "      --max-vram-headroom <GiB>           VRAM headroom for --max-vram -1 and adaptive streaming (default 1)\n"
         << "      --easycache <thr,start,end>         Enable EasyCache with threshold/start/end percents\n"
         << "      --ucache <thr,start,end>            Enable UCache with threshold/start/end percents\n"
         << "      --spectrum <w,m,lam,window,flex,warmup,stop>\n"
@@ -1361,6 +1363,21 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 error = "invalid value for --max-vram";
                 return false;
             }
+        } else if (arg == "--max-vram-headroom") {
+            if (i + 1 >= argc) {
+                error = "missing value for --max-vram-headroom";
+                return false;
+            }
+            try {
+                options.max_vram_headroom = std::stof(argv[++i]);
+            } catch (const std::exception&) {
+                error = "invalid value for --max-vram-headroom";
+                return false;
+            }
+            if (!std::isfinite(options.max_vram_headroom) || options.max_vram_headroom < 0.f) {
+                error = "--max-vram-headroom must be a non-negative finite value";
+                return false;
+            }
         } else if (arg == "--stream-layers") {
             options.stream_layers = true;
         } else if (arg == "--mmap") {
@@ -1435,6 +1452,7 @@ struct CtxConfig {
     rng_type_t rng_type = CUDA_RNG;
     bool offload_params_to_cpu = false;
     float max_vram = 0.f;
+    float max_vram_headroom = 1.f;
     bool stream_layers = false;
     bool enable_mmap = false;
     bool keep_clip_on_cpu = false;
@@ -1473,6 +1491,7 @@ struct CtxConfig {
                rng_type == other.rng_type &&
                offload_params_to_cpu == other.offload_params_to_cpu &&
                max_vram == other.max_vram &&
+               max_vram_headroom == other.max_vram_headroom &&
                stream_layers == other.stream_layers &&
                enable_mmap == other.enable_mmap &&
                keep_clip_on_cpu == other.keep_clip_on_cpu &&
@@ -1518,6 +1537,7 @@ struct CtxConfig {
         params.rng_type                = rng_type;
         params.offload_params_to_cpu   = offload_params_to_cpu;
         params.max_vram                = max_vram;
+        params.max_vram_headroom       = max_vram_headroom;
         params.stream_layers           = stream_layers;
         params.enable_mmap             = enable_mmap;
         params.keep_clip_on_cpu        = keep_clip_on_cpu;
@@ -2230,7 +2250,12 @@ bool apply_context_overrides(const json& body, CtxConfig& config, std::string& e
     }
 
     if (!assign_float("flow_shift", config.flow_shift) ||
-        !assign_float("max_vram", config.max_vram)) {
+        !assign_float("max_vram", config.max_vram) ||
+        !assign_float("max_vram_headroom", config.max_vram_headroom)) {
+        return false;
+    }
+    if (!std::isfinite(config.max_vram_headroom) || config.max_vram_headroom < 0.f) {
+        error = "field 'max_vram_headroom' must be a non-negative finite number";
         return false;
     }
 
@@ -5051,6 +5076,7 @@ json make_telemetry(const LogCollector& collector,
     span_attributes["sdcpp.context.force_sdxl_vae_conv_scale"] = config.force_sdxl_vae_conv_scale;
     span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
     span_attributes["sdcpp.context.max_vram"] = config.max_vram;
+    span_attributes["sdcpp.context.max_vram_headroom"] = config.max_vram_headroom;
     span_attributes["sdcpp.context.stream_layers"] = config.stream_layers;
     span_attributes["sdcpp.context.enable_mmap"] = config.enable_mmap;
     span_attributes["sdcpp.context.keep_clip_on_cpu"] = config.keep_clip_on_cpu;
@@ -5303,6 +5329,7 @@ json make_upscale_telemetry(const UpscaleRequest& request,
     span_attributes["sdcpp.context.n_threads"] = config.n_threads;
     span_attributes["sdcpp.context.offload_params_to_cpu"] = config.offload_params_to_cpu;
     span_attributes["sdcpp.context.max_vram"] = config.max_vram;
+    span_attributes["sdcpp.context.max_vram_headroom"] = config.max_vram_headroom;
     span_attributes["sdcpp.context.stream_layers"] = config.stream_layers;
 
     json spans = json::array();
@@ -5368,10 +5395,15 @@ json logs_to_json(const LogCollector& collector) {
     return entries;
 }
 
-constexpr size_t adaptive_streaming_headroom_bytes = 1024ull * 1024 * 1024;
-
 bool is_adaptive_streaming_config(const CtxConfig& config) {
     return config.stream_layers && config.max_vram < 0.f;
+}
+
+size_t max_vram_headroom_bytes(const CtxConfig& config) {
+    if (!std::isfinite(config.max_vram_headroom) || config.max_vram_headroom <= 0.f) {
+        return 0;
+    }
+    return static_cast<size_t>(static_cast<double>(config.max_vram_headroom) * 1024.0 * 1024.0 * 1024.0);
 }
 
 std::string format_gib(size_t bytes) {
@@ -5398,10 +5430,11 @@ bool should_rebuild_for_adaptive_streaming(ServerState& state, const CtxConfig& 
 
     const bool active_gpu_resident = !sd_ctx_uses_cpu_params(state.ctx) &&
                                      !sd_ctx_uses_stream_layers(state.ctx);
+    const size_t headroom_bytes = max_vram_headroom_bytes(desired);
     const bool should_use_gpu_resident =
         active_gpu_resident
-            ? free_vram >= adaptive_streaming_headroom_bytes
-            : free_vram >= params_size + adaptive_streaming_headroom_bytes;
+            ? free_vram >= headroom_bytes
+            : free_vram >= params_size + headroom_bytes;
 
     if (should_use_gpu_resident == active_gpu_resident) {
         return false;
@@ -5411,11 +5444,11 @@ bool should_rebuild_for_adaptive_streaming(ServerState& state, const CtxConfig& 
     if (should_use_gpu_resident) {
         message << "adaptive stream-layers: free VRAM " << format_gib(free_vram)
                 << " GiB can fit params " << format_gib(params_size)
-                << " GiB plus " << format_gib(adaptive_streaming_headroom_bytes)
+                << " GiB plus " << format_gib(headroom_bytes)
                 << " GiB headroom; rebuilding with GPU-resident params";
     } else {
         message << "adaptive stream-layers: free VRAM " << format_gib(free_vram)
-                << " GiB is below " << format_gib(adaptive_streaming_headroom_bytes)
+                << " GiB is below " << format_gib(headroom_bytes)
                 << " GiB headroom for current GPU-resident context; rebuilding with CPU layer streaming";
     }
     collector.add(SD_LOG_INFO, message.str());
@@ -5480,6 +5513,7 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
                current.rng_type != desired.rng_type ||
                current.offload_params_to_cpu != desired.offload_params_to_cpu ||
                current.max_vram != desired.max_vram ||
+               current.max_vram_headroom != desired.max_vram_headroom ||
                current.stream_layers != desired.stream_layers ||
                current.enable_mmap != desired.enable_mmap ||
                current.keep_clip_on_cpu != desired.keep_clip_on_cpu ||
@@ -5690,6 +5724,7 @@ int main(int argc, char** argv) {
     state.ctx_config.rng_type = options.rng_type;
     state.ctx_config.offload_params_to_cpu = options.offload_params_to_cpu;
     state.ctx_config.max_vram = options.max_vram;
+    state.ctx_config.max_vram_headroom = options.max_vram_headroom;
     state.ctx_config.stream_layers = options.stream_layers;
     state.ctx_config.enable_mmap = options.enable_mmap;
     state.ctx_config.keep_control_net_on_cpu = options.control_net_cpu;

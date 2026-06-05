@@ -454,6 +454,7 @@ struct SDContextParams {
     rng_type_t sampler_rng_type = RNG_TYPE_COUNT;
     bool offload_params_to_cpu  = false;
     float max_vram              = 0.f;
+    float max_vram_headroom     = 1.f;
     bool stream_layers          = false;
     bool enable_mmap            = false;
     bool control_net_cpu        = false;
@@ -581,8 +582,12 @@ struct SDContextParams {
         options.float_options = {
             {"",
              "--max-vram",
-             "maximum VRAM budget in GiB for graph-cut segmented execution with CPU-resident params. 0 disables graph splitting; -1 uses free VRAM minus 1 GiB",
+             "maximum VRAM budget in GiB for graph-cut segmented execution with CPU-resident params. 0 disables graph splitting; -1 uses free VRAM minus --max-vram-headroom",
              &max_vram},
+            {"",
+             "--max-vram-headroom",
+             "VRAM headroom in GiB reserved when --max-vram is auto (default: 1)",
+             &max_vram_headroom},
             {"",
              "--vae-tile-overlap",
              "tile overlap for vae tiling, in fraction of tile size (default: 0.5)",
@@ -911,6 +916,7 @@ struct SDContextParams {
             << "  sampler_rng_type: " << sd_rng_type_name(sampler_rng_type) << ",\n"
             << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
             << "  max_vram: " << max_vram << ",\n"
+            << "  max_vram_headroom: " << max_vram_headroom << ",\n"
             << "  stream_layers: " << (stream_layers ? "true" : "false") << ",\n"
             << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
             << "  control_net_cpu: " << (control_net_cpu ? "true" : "false") << ",\n"
@@ -978,6 +984,7 @@ struct SDContextParams {
             lora_apply_mode,
             offload_params_to_cpu,
             max_vram,
+            max_vram_headroom,
             stream_layers,
             enable_mmap,
             clip_on_cpu,

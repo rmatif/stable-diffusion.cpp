@@ -220,8 +220,9 @@ typedef struct {
     enum prediction_t prediction;
     enum lora_apply_mode_t lora_apply_mode;
     bool offload_params_to_cpu;
-    float max_vram;      // GiB budget for graph-cut segmented param offload; requires CPU-resident params (0 disabled, <0 auto)
-    bool stream_layers;  // Enable diffusion layer streaming on top of max_vram
+    float max_vram;           // GiB budget for graph-cut segmented param offload; requires CPU-resident params (0 disabled, <0 auto)
+    float max_vram_headroom;  // GiB to reserve when max_vram is auto, and for adaptive stream_layers fit checks
+    bool stream_layers;       // Enable diffusion layer streaming on top of max_vram
     bool enable_mmap;
     bool keep_clip_on_cpu;
     bool keep_control_net_on_cpu;

@@ -92,7 +92,7 @@ namespace sd::ggml_graph_cut {
         return static_cast<float>(static_cast<double>(max_vram_bytes) / MAX_VRAM_BYTES_PER_GIB);
     }
 
-    static size_t resolve_auto_max_vram_bytes(float spare_vram, ggml_backend_t backend) {
+    static size_t resolve_auto_max_vram_bytes(float headroom_gib, ggml_backend_t backend) {
         if (backend == nullptr) {
             LOG_WARN("--max-vram < 0 requested, but no backend is available; disabling graph splitting");
             return 0;
@@ -111,11 +111,12 @@ namespace sd::ggml_graph_cut {
         size_t free_vram  = 0;
         size_t total_vram = 0;
         ggml_backend_dev_memory(dev, &free_vram, &total_vram);
-        size_t spare_bytes = static_cast<size_t>(MAX_VRAM_BYTES_PER_GIB * spare_vram);
+        const float safe_headroom_gib = std::max(0.f, headroom_gib);
+        size_t spare_bytes            = static_cast<size_t>(MAX_VRAM_BYTES_PER_GIB * safe_headroom_gib);
 
         if (free_vram <= spare_bytes) {
             LOG_WARN("--max-vram < 0 requested, but free VRAM is %.2f GiB; reserving %.2f GiB leaves no graph budget",
-                     free_vram / MAX_VRAM_BYTES_PER_GIB, spare_vram);
+                     free_vram / MAX_VRAM_BYTES_PER_GIB, safe_headroom_gib);
             return 0;
         }
 
@@ -123,16 +124,16 @@ namespace sd::ggml_graph_cut {
         LOG_INFO("--max-vram < 0 auto-detected %.2f GiB free VRAM (%.2f GiB total), reserving %.2f GiB; using %.2f GiB",
                  free_vram / MAX_VRAM_BYTES_PER_GIB,
                  total_vram / MAX_VRAM_BYTES_PER_GIB,
-                 spare_vram,
+                 safe_headroom_gib,
                  max_vram_bytes / MAX_VRAM_BYTES_PER_GIB);
         return max_vram_bytes;
     }
 
-    float resolve_max_vram_gib(float max_vram, ggml_backend_t backend) {
+    float resolve_max_vram_gib(float max_vram, float auto_headroom_gib, ggml_backend_t backend) {
         if (max_vram >= 0.f) {
             return max_vram;
         }
-        return max_vram_bytes_to_gib(resolve_auto_max_vram_bytes(-max_vram, backend));
+        return max_vram_bytes_to_gib(resolve_auto_max_vram_bytes(auto_headroom_gib, backend));
     }
 
     static Segment make_segment_seed(const Plan& plan,
@@ -751,12 +752,12 @@ namespace sd::ggml_graph_cut {
         return resolved_plan;
     }
 
-    void annotate_residency(Plan& plan, size_t max_graph_vram_bytes) {
+    void annotate_residency(Plan& plan, size_t max_resident_param_bytes) {
         // Cached plans may be reused with a smaller live budget.
         for (auto& seg : plan.segments) {
             seg.residency = SegmentResidency::STREAMED;
         }
-        if (max_graph_vram_bytes == 0 || plan.segments.size() < 2) {
+        if (max_resident_param_bytes == 0 || plan.segments.size() < 2) {
             return;
         }
 
@@ -771,33 +772,33 @@ namespace sd::ggml_graph_cut {
             return;
         }
 
-        // Leave room for the largest active streamed segment.
-        size_t worst_streamed_footprint = 0;
-        for (const auto& seg : plan.segments) {
-            const size_t seg_footprint = seg.input_param_bytes +
-                                         seg.compute_buffer_size +
-                                         seg.output_bytes +
-                                         seg.input_previous_cut_bytes +
-                                         seg.input_external_bytes;
-            if (seg_footprint > worst_streamed_footprint) {
-                worst_streamed_footprint = seg_footprint;
+        std::vector<size_t> candidate_indices;
+        candidate_indices.reserve(plan.segments.size());
+        for (size_t i = 0; i < plan.segments.size(); ++i) {
+            if (plan.segments[i].input_param_bytes > 0) {
+                candidate_indices.push_back(i);
             }
         }
-        constexpr size_t safety = 512ull * 1024 * 1024;
-        const size_t reserved   = safety + worst_streamed_footprint;
 
-        if (max_graph_vram_bytes <= reserved) {
-            return;
-        }
-        const size_t available = max_graph_vram_bytes - reserved;
+        std::sort(candidate_indices.begin(),
+                  candidate_indices.end(),
+                  [&](size_t a, size_t b) {
+                      const size_t a_bytes = plan.segments[a].input_param_bytes;
+                      const size_t b_bytes = plan.segments[b].input_param_bytes;
+                      if (a_bytes != b_bytes) {
+                          return a_bytes > b_bytes;
+                      }
+                      return a < b;
+                  });
 
-        size_t cumulative = 0;
-        for (auto& seg : plan.segments) {
-            if (cumulative + seg.input_param_bytes > available) {
-                break;
+        size_t resident_bytes = 0;
+        for (size_t idx : candidate_indices) {
+            auto& seg = plan.segments[idx];
+            if (resident_bytes + seg.input_param_bytes > max_resident_param_bytes) {
+                continue;
             }
             seg.residency = SegmentResidency::RESIDENT;
-            cumulative += seg.input_param_bytes;
+            resident_bytes += seg.input_param_bytes;
         }
     }
 

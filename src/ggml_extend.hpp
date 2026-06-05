@@ -2168,6 +2168,11 @@ protected:
             if (resident_param_set.find(tensor) != resident_param_set.end()) {
                 continue;
             }
+            if (!ggml_backend_is_cpu(runtime_backend) &&
+                tensor->buffer != nullptr &&
+                !ggml_backend_buffer_is_host(tensor->buffer)) {
+                continue;
+            }
             if (seen_tensors.insert(tensor).second) {
                 unique_tensors.push_back(tensor);
             }
@@ -2441,6 +2446,20 @@ protected:
             }
         }
 
+        size_t plan_budget = effective_budget;
+        if (stream_layers_enabled && effective_budget > 0) {
+            constexpr size_t max_resident_target = 2ull * 1024 * 1024 * 1024;
+            constexpr size_t min_active_budget   = 512ull * 1024 * 1024;
+            const size_t resident_target         = std::min(effective_budget / 4, max_resident_target);
+            if (resident_target > 0 && effective_budget > resident_target + min_active_budget) {
+                plan_budget = effective_budget - resident_target;
+                LOG_DEBUG("%s streaming active segment budget = %.2f MB (%.2f MB reserved for resident layers)",
+                          get_desc().c_str(),
+                          plan_budget / (1024.0 * 1024.0),
+                          (effective_budget - plan_budget) / (1024.0 * 1024.0));
+            }
+        }
+
         if (effective_budget_out != nullptr) {
             *effective_budget_out = effective_budget;
         }
@@ -2448,7 +2467,7 @@ protected:
         *plan_out = sd::ggml_graph_cut::resolve_plan(runtime_backend,
                                                      gf,
                                                      &graph_cut_plan_cache_,
-                                                     effective_budget,
+                                                     plan_budget,
                                                      params_tensor_set_,
                                                      get_desc().c_str());
         if (stream_layers_enabled) {
@@ -2803,6 +2822,12 @@ protected:
             residency_budget_bytes > worst_merged_segment_footprint
                 ? residency_budget_bytes - worst_merged_segment_footprint
                 : 0;
+        if (stream_layers_enabled) {
+            LOG_DEBUG("%s streaming resident budget = %.2f MB after active segment reserve %.2f MB",
+                      get_desc().c_str(),
+                      residency_budget_for_annotate / (1024.0 * 1024.0),
+                      worst_merged_segment_footprint / (1024.0 * 1024.0));
+        }
 
         sd::ggml_graph_cut::Plan& base_plan = graph_cut_plan_cache_.graph_cut_plan;
         if (base_plan.available) {
@@ -2810,10 +2835,14 @@ protected:
 
             std::vector<ggml_tensor*> resident_params;
             uint64_t token = 0;
+            size_t resident_segment_count = 0;
+            size_t resident_param_bytes = 0;
             for (const auto& segment : base_plan.segments) {
                 if (segment.residency != sd::ggml_graph_cut::SegmentResidency::RESIDENT) {
                     continue;
                 }
+                resident_segment_count++;
+                resident_param_bytes += segment.input_param_bytes;
                 auto segment_params = sd::ggml_graph_cut::param_tensors(gf, segment);
                 for (ggml_tensor* tensor : segment_params) {
                     if (tensor == nullptr) {
@@ -2826,6 +2855,11 @@ protected:
             if (token != resident_state_token) {
                 restore_resident_params();
                 if (!resident_params.empty()) {
+                    LOG_INFO("%s streaming residency: keeping %zu/%zu layer segments resident (estimated %.2f MB params)",
+                             get_desc().c_str(),
+                             resident_segment_count,
+                             base_plan.segments.size(),
+                             resident_param_bytes / (1024.0 * 1024.0));
                     if (offload_resident_params(resident_params)) {
                         resident_state_token = token;
                     } else {
