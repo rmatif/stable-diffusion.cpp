@@ -843,7 +843,9 @@ std::string convert_pmid_v2_name(const std::string& name) {
 std::string convert_sep_to_dot(std::string name) {
     const std::vector<std::string> protected_tokens = {
         "self_attn",
+        "cross_attn",
         "out_proj",
+        "output_proj",
         "q_proj",
         "k_proj",
         "v_proj",
