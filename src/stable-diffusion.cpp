@@ -31,9 +31,14 @@
 #include "stb_image.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <list>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 // #define STB_IMAGE_WRITE_IMPLEMENTATION
 // #define STB_IMAGE_WRITE_STATIC
@@ -578,6 +583,25 @@ public:
 
     // lora_name => multiplier
     std::unordered_map<std::string, float> curr_lora_state;
+    struct ImmediateLoraTensorBackup {
+        ggml_tensor* tensor = nullptr;
+        size_t offset       = 0;
+        size_t size         = 0;
+    };
+    std::vector<ImmediateLoraTensorBackup> immediate_lora_tensor_backups;
+    std::unordered_set<ggml_tensor*> immediate_lora_backed_up_tensors;
+    std::vector<uint8_t> immediate_lora_backup_data;
+
+    static constexpr size_t IMMEDIATE_LORA_MODEL_CACHE_MAX_COUNT = 64;
+    static constexpr size_t IMMEDIATE_LORA_MODEL_CACHE_MAX_BYTES = 8ull * 1024 * 1024 * 1024;
+    struct ImmediateLoraModelCacheEntry {
+        std::shared_ptr<LoraModel> model;
+        size_t bytes = 0;
+        std::list<std::string>::iterator lru_it;
+    };
+    std::list<std::string> immediate_lora_model_cache_lru;
+    std::unordered_map<std::string, ImmediateLoraModelCacheEntry> immediate_lora_model_cache;
+    size_t immediate_lora_model_cache_bytes = 0;
 
     std::shared_ptr<Denoiser> denoiser = std::make_shared<CompVisDenoiser>();
 
@@ -1670,6 +1694,7 @@ public:
         }
 
         LOG_INFO("reloading diffusion model from '%s'", diffusion_model_path);
+        reset_immediate_lora_state(true, "diffusion reload");
 
         ModelLoader model_loader;
         if (!model_loader.init_from_file(diffusion_model_path, "model.diffusion_model.", n_threads)) {
@@ -1757,11 +1782,6 @@ public:
             tensors[pair.first] = pair.second;
         }
 
-        if (!curr_lora_state.empty()) {
-            curr_lora_state.clear();
-            LOG_INFO("cleared cached LoRA state after diffusion reload");
-        }
-
         LOG_INFO("diffusion model reloaded successfully, VRAM usage: %.2fMB", diffusion_model->get_params_buffer_size() / 1024.0 / 1024.0);
         return true;
     }
@@ -1773,6 +1793,7 @@ public:
         }
 
         LOG_INFO("reloading VAE from '%s'", vae_path);
+        reset_immediate_lora_state(true, "VAE reload");
 
         ModelLoader model_loader;
         if (!model_loader.init_from_file(vae_path, "vae.", n_threads)) {
@@ -1834,6 +1855,7 @@ public:
 
     bool reload_text_encoders(const char* clip_l_path, const char* clip_g_path, const char* t5xxl_path, const char* qwen2vl_path, const char* qwen2vl_vision_path) {
         LOG_INFO("reloading text encoders");
+        reset_immediate_lora_state(true, "text encoder reload");
         const char* llm_path        = qwen2vl_path;
         const char* llm_vision_path = qwen2vl_vision_path;
 
@@ -1972,7 +1994,8 @@ public:
     std::shared_ptr<LoraModel> load_lora_model_from_file(const std::string& lora_id,
                                                          float multiplier,
                                                          ggml_backend_t backend,
-                                                         LoraModel::filter_t lora_tensor_filter = nullptr) {
+                                                         LoraModel::filter_t lora_tensor_filter = nullptr,
+                                                         bool cache_model = false) {
         std::string lora_path             = lora_id;
         static std::string high_noise_tag = "|high_noise|";
         bool is_high_noise                = false;
@@ -1997,6 +2020,17 @@ public:
             return nullptr;
         }
 
+        std::string cache_key;
+        if (cache_model && lora_tensor_filter == nullptr) {
+            cache_key = (is_high_noise ? high_noise_tag : "") + file_path;
+            auto cached_lora = immediate_lora_model_cache.find(cache_key);
+            if (cached_lora != immediate_lora_model_cache.end()) {
+                touch_immediate_lora_model_cache_entry(cached_lora);
+                cached_lora->second.model->multiplier = multiplier;
+                return cached_lora->second.model;
+            }
+        }
+
         auto lora = std::make_shared<LoraModel>(lora_id, backend, file_path, is_high_noise ? "model.high_noise_" : "", version);
         if (!lora->load_from_file(n_threads, lora_tensor_filter)) {
             LOG_WARN("load lora tensors from %s failed", file_path.c_str());
@@ -2004,44 +2038,155 @@ public:
         }
 
         lora->multiplier = multiplier;
+        if (!cache_key.empty()) {
+            const size_t lora_bytes = lora->get_params_buffer_size();
+            auto lru_it            = immediate_lora_model_cache_lru.insert(immediate_lora_model_cache_lru.begin(), cache_key);
+
+            ImmediateLoraModelCacheEntry entry;
+            entry.model  = lora;
+            entry.bytes  = lora_bytes;
+            entry.lru_it = lru_it;
+
+            immediate_lora_model_cache_bytes += lora_bytes;
+            immediate_lora_model_cache.emplace(cache_key, std::move(entry));
+            evict_immediate_lora_model_cache_if_needed();
+        }
         return lora;
     }
 
-    void apply_loras_immediately(const std::unordered_map<std::string, float>& lora_state) {
-        std::unordered_map<std::string, float> lora_state_diff;
-        for (auto& kv : lora_state) {
-            const std::string& lora_name = kv.first;
-            float multiplier             = kv.second;
-            lora_state_diff[lora_name] += multiplier;
+    void touch_immediate_lora_model_cache_entry(std::unordered_map<std::string, ImmediateLoraModelCacheEntry>::iterator entry) {
+        immediate_lora_model_cache_lru.splice(immediate_lora_model_cache_lru.begin(),
+                                              immediate_lora_model_cache_lru,
+                                              entry->second.lru_it);
+    }
+
+    void evict_immediate_lora_model_cache_if_needed() {
+        while (!immediate_lora_model_cache_lru.empty() &&
+               (immediate_lora_model_cache.size() > IMMEDIATE_LORA_MODEL_CACHE_MAX_COUNT ||
+                (immediate_lora_model_cache_bytes > IMMEDIATE_LORA_MODEL_CACHE_MAX_BYTES && immediate_lora_model_cache.size() > 1))) {
+            const std::string cache_key = immediate_lora_model_cache_lru.back();
+            immediate_lora_model_cache_lru.pop_back();
+
+            auto cached_lora = immediate_lora_model_cache.find(cache_key);
+            if (cached_lora == immediate_lora_model_cache.end()) {
+                continue;
+            }
+
+            if (immediate_lora_model_cache_bytes >= cached_lora->second.bytes) {
+                immediate_lora_model_cache_bytes -= cached_lora->second.bytes;
+            } else {
+                immediate_lora_model_cache_bytes = 0;
+            }
+
+            LOG_INFO("evicted cached immediate LoRA '%s' (%.2fMB cache remaining)",
+                     cache_key.c_str(),
+                     immediate_lora_model_cache_bytes / 1024.0 / 1024.0);
+            immediate_lora_model_cache.erase(cached_lora);
         }
-        for (auto& kv : curr_lora_state) {
-            const std::string& lora_name = kv.first;
-            float curr_multiplier        = kv.second;
-            lora_state_diff[lora_name] -= curr_multiplier;
+    }
+
+    void backup_immediate_lora_tensor(ggml_tensor* tensor) {
+        if (tensor == nullptr || !immediate_lora_backed_up_tensors.insert(tensor).second) {
+            return;
         }
 
-        if (lora_state_diff.empty()) {
+        const size_t tensor_bytes = ggml_nbytes(tensor);
+        const size_t offset       = immediate_lora_backup_data.size();
+        immediate_lora_backup_data.resize(offset + tensor_bytes);
+        ggml_backend_tensor_get(tensor, immediate_lora_backup_data.data() + offset, 0, tensor_bytes);
+
+        ImmediateLoraTensorBackup backup;
+        backup.tensor = tensor;
+        backup.offset = offset;
+        backup.size   = tensor_bytes;
+        immediate_lora_tensor_backups.push_back(backup);
+    }
+
+    void restore_immediate_lora_base() {
+        if (immediate_lora_tensor_backups.empty()) {
+            return;
+        }
+
+        for (const ImmediateLoraTensorBackup& backup : immediate_lora_tensor_backups) {
+            if (backup.tensor == nullptr || backup.size == 0) {
+                continue;
+            }
+            ggml_backend_tensor_set(backup.tensor, immediate_lora_backup_data.data() + backup.offset, 0, backup.size);
+        }
+        LOG_INFO("restored %zu tensors touched by immediate LoRA (%.2fMB)",
+                 immediate_lora_tensor_backups.size(),
+                 immediate_lora_backup_data.size() / 1024.0 / 1024.0);
+    }
+
+    void clear_immediate_lora_backups() {
+        immediate_lora_tensor_backups.clear();
+        immediate_lora_backed_up_tensors.clear();
+        std::vector<uint8_t>().swap(immediate_lora_backup_data);
+    }
+
+    void clear_immediate_lora_model_cache(const char* reason) {
+        if (!immediate_lora_model_cache.empty()) {
+            LOG_INFO("cleared %zu cached immediate LoRAs (%.2fMB) after %s",
+                     immediate_lora_model_cache.size(),
+                     immediate_lora_model_cache_bytes / 1024.0 / 1024.0,
+                     reason);
+        }
+        immediate_lora_model_cache.clear();
+        immediate_lora_model_cache_lru.clear();
+        immediate_lora_model_cache_bytes = 0;
+    }
+
+    void reset_immediate_lora_state(bool restore_weights, const char* reason) {
+        if (restore_weights) {
+            restore_immediate_lora_base();
+        }
+        if (!curr_lora_state.empty()) {
+            curr_lora_state.clear();
+            LOG_INFO("cleared cached LoRA state after %s", reason);
+        }
+        clear_immediate_lora_backups();
+        clear_immediate_lora_model_cache(reason);
+    }
+
+    void apply_loras_immediately(const std::unordered_map<std::string, float>& lora_state) {
+        if (lora_state == curr_lora_state) {
             return;
         }
 
         LOG_INFO("apply lora immediately");
 
-        size_t rm = lora_state_diff.size() - lora_state.size();
-        if (rm != 0) {
-            LOG_INFO("attempting to apply %lu LoRAs (removing %lu applied LoRAs)", lora_state.size(), rm);
-        } else {
+        bool replacing_loras = !curr_lora_state.empty();
+        if (!curr_lora_state.empty()) {
+            LOG_INFO("attempting to apply %lu LoRAs (replacing %lu applied LoRAs)", lora_state.size(), curr_lora_state.size());
+            restore_immediate_lora_base();
+            curr_lora_state.clear();
+        } else if (lora_state.empty()) {
+            restore_immediate_lora_base();
+            clear_immediate_lora_backups();
+            return;
+        }
+
+        if (lora_state.empty()) {
+            clear_immediate_lora_backups();
+            return;
+        }
+
+        if (!replacing_loras) {
             LOG_INFO("attempting to apply %lu LoRAs", lora_state.size());
         }
 
-        for (auto& kv : lora_state_diff) {
+        auto backup_tensor_cb = [&](const std::string&, ggml_tensor* tensor) {
+            backup_immediate_lora_tensor(tensor);
+        };
+
+        for (auto& kv : lora_state) {
             int64_t t0 = ggml_time_ms();
 
-            auto lora = load_lora_model_from_file(kv.first, kv.second, backend);
+            auto lora = load_lora_model_from_file(kv.first, kv.second, backend, nullptr, true);
             if (!lora || lora->lora_tensors.empty()) {
                 continue;
             }
-            lora->apply(tensors, version, n_threads);
-            lora->free_params_buffer();
+            lora->apply(tensors, version, n_threads, backup_tensor_cb);
 
             int64_t t1 = ggml_time_ms();
 

@@ -22,6 +22,7 @@ struct LoraModel : public GGMLRunner {
     bool tensor_preprocessed = false;
 
     typedef std::function<bool(const std::string&)> filter_t;
+    typedef std::function<void(const std::string&, ggml_tensor*)> tensor_backup_t;
 
     LoraModel(const std::string& lora_id,
               ggml_backend_t backend,
@@ -770,7 +771,7 @@ struct LoraModel : public GGMLRunner {
         return out_diff;
     }
 
-    ggml_cgraph* build_lora_graph(const std::map<std::string, ggml_tensor*>& model_tensors, SDVersion version) {
+    ggml_cgraph* build_lora_graph(const std::map<std::string, ggml_tensor*>& model_tensors, SDVersion version, tensor_backup_t backup_tensor_cb = nullptr) {
         size_t lora_graph_size = LORA_GRAPH_BASE_SIZE + lora_tensors.size() * 10;
         ggml_cgraph* gf        = ggml_new_graph_custom(compute_ctx, lora_graph_size, false);
 
@@ -794,6 +795,9 @@ struct LoraModel : public GGMLRunner {
             }
 
             ggml_tensor* original_tensor = model_tensor;
+            if (backup_tensor_cb) {
+                backup_tensor_cb(model_tensor_name, original_tensor);
+            }
             if (!ggml_backend_is_cpu(runtime_backend) &&
                 original_tensor->buffer != nullptr &&
                 ggml_backend_buffer_is_host(original_tensor->buffer)) {
@@ -819,9 +823,9 @@ struct LoraModel : public GGMLRunner {
         return gf;
     }
 
-    void apply(std::map<std::string, ggml_tensor*> model_tensors, SDVersion version, int n_threads) {
+    void apply(std::map<std::string, ggml_tensor*> model_tensors, SDVersion version, int n_threads, tensor_backup_t backup_tensor_cb = nullptr) {
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_lora_graph(model_tensors, version);
+            return build_lora_graph(model_tensors, version, backup_tensor_cb);
         };
         GGMLRunner::compute(get_graph, n_threads, false);
         stat();
