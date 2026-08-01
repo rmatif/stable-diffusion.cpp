@@ -544,6 +544,7 @@ public:
     bool vae_decode_only         = false;
     bool external_vae_is_invalid = false;
     bool free_params_immediately = false;
+    bool force_sdxl_vae_conv_scale = false;
 
     bool circular_x = false;
     bool circular_y = false;
@@ -828,6 +829,7 @@ public:
         n_threads               = sd_ctx_params->n_threads;
         vae_decode_only         = sd_ctx_params->vae_decode_only;
         free_params_immediately = sd_ctx_params->free_params_immediately;
+        force_sdxl_vae_conv_scale = sd_ctx_params->force_sdxl_vae_conv_scale;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
         max_vram                = sd_ctx_params->max_vram;
         max_vram_headroom       = sd_ctx_params->max_vram_headroom;
@@ -1821,6 +1823,11 @@ public:
             first_stage_model = std::make_shared<FakeVAE>(version, vae_backend, offload_params_to_cpu);
         } else {
             first_stage_model = std::make_shared<AutoEncoderKL>(vae_backend, offload_params_to_cpu, model_loader.get_tensor_storage_map(), "first_stage_model", vae_decode_only, false, version);
+            if (sd_version_is_sdxl(version) && force_sdxl_vae_conv_scale) {
+                constexpr float vae_conv_2d_scale = 1.f / 32.f;
+                LOG_WARN("--force-sdxl-vae-conv-scale set, using Conv2D scale %.3f", vae_conv_2d_scale);
+                first_stage_model->set_conv2d_scale(vae_conv_2d_scale);
+            }
             if (vae_conv_direct) {
                 LOG_INFO("Using Conv2d direct in the VAE");
                 first_stage_model->set_conv2d_direct_enabled(true);
