@@ -5570,7 +5570,7 @@ bool ensure_context(ServerState& state, const CtxConfig& desired, std::string& e
         if (!sd_reload_diffusion_model(state.ctx,
                                        desired.diffusion_model_path.c_str(),
                                        desired.high_noise_diffusion_model_path.c_str(),
-                                       desired.diffusion_flash_attn,
+                                       desired.flash_attn || desired.diffusion_flash_attn,
                                        desired.diffusion_conv_direct)) {
             error_message = "failed to reload diffusion model";
             return false;
