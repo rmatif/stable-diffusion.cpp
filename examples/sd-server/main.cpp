@@ -31,6 +31,9 @@
 
 #include "stable-diffusion.h"
 #include "src/model.h"
+#ifdef SD_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include "httplib.h"
 #include "json.hpp"
@@ -6194,8 +6197,13 @@ int main(int argc, char** argv) {
             free_sd_ctx(state.ctx);
             state.ctx = nullptr;
             state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
-            release_allocator_pages();
         }
+#ifdef SD_USE_CUDA
+        for (int device = 0; device < ggml_backend_cuda_get_device_count(); ++device) {
+            ggml_backend_cuda_device_reset(device);
+        }
+#endif
+        release_allocator_pages();
         json response = {{"success", true}, {"message", "context released"}, {"model_path", state.ctx_config.model_path}};
         res.status = 200;
         res.set_content(response.dump(), "application/json");
