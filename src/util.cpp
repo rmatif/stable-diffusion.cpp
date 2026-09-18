@@ -751,6 +751,9 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
 
 std::vector<std::pair<std::string, float>> split_prompt_by_AND(const std::string& prompt) {
     static const std::regex re_and(R"(\bAND\b)");
+    if (!std::regex_search(prompt, re_and)) {
+        return {{prompt, 1.0f}};
+    }
     static const std::regex re_weight(R"(^((?:\s|.)*?)(?:\s*:\s*([-+]?(?:\d+\.?|\d*\.\d+)))?\s*$)");
 
     std::vector<std::pair<std::string, float>> result;
