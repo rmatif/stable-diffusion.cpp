@@ -146,6 +146,7 @@ If you want to improve performance or reduce VRAM/RAM usage, please refer to [pe
 - [LCM/LCM-LoRA](./docs/lcm.md)
 - [Using PhotoMaker to personalize image generation](./docs/photo_maker.md)
 - [Using ESRGAN to upscale results](./docs/esrgan.md)
+- [Marking results with an invisible watermark](./docs/watermark.md)
 - [Using TAESD to faster decoding](./docs/taesd.md)
 - [Docker](./docs/docker.md)
 - [Quantization and GGUF](./docs/quantization_and_gguf.md)

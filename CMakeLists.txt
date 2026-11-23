@@ -119,6 +119,11 @@ set_property(
   SDCPP_BUILD_COMMIT=${SDCPP_BUILD_COMMIT} SDCPP_BUILD_VERSION=${SDCPP_BUILD_VERSION}
 )
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Without these, sqrt may set errno and float ops may trap, which keeps the watermark's per-pixel loops from being vectorized.
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/watermark.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-math-errno -fno-trapping-math)
+endif()
+
 if(SD_BUILD_SHARED_LIBS)
     message("-- Build shared library")
     message(${SD_LIB_SOURCES})

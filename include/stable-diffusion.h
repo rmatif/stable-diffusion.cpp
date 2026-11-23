@@ -457,6 +457,20 @@ SD_API sd_image_t upscale(upscaler_ctx_t* upscaler_ctx,
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
+typedef struct sd_watermark_ctx_t sd_watermark_ctx_t;
+
+// Invisible watermark (PixelSeal). `model_path` is the file written by script/convert_pixelseal.py and
+// `message_hex` the 256-bit message as 64 hex characters, most significant bit first.
+SD_API sd_watermark_ctx_t* new_watermark_ctx(const char* model_path,
+                                             const char* message_hex,
+                                             int n_threads);
+SD_API void free_watermark_ctx(sd_watermark_ctx_t* watermark_ctx);
+
+// Embeds the message into `image` in place, unless the image already carries it (`already_marked`, optional).
+SD_API bool watermark_image(sd_watermark_ctx_t* watermark_ctx,
+                            sd_image_t image,
+                            bool* already_marked);
+
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
                     const char* output_path,

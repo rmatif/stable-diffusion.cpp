@@ -848,6 +848,8 @@ struct CLIOptions {
     std::string control_net_path;
     std::string embedding_dir;
     std::string photo_maker_path;
+    std::string watermark_model_path;
+    std::string watermark_message;
     int port = 8000;
     int n_threads = -1;
     bool verbose = false;
@@ -928,6 +930,10 @@ void print_usage() {
         << "      --diffusion-conv-direct             Use ggml_conv2d_direct for diffusion\n"
         << "      --vae-conv-direct                   Use ggml_conv2d_direct for VAE\n"
         << "      --force-sdxl-vae-conv-scale         Force conv scale for SDXL VAE\n"
+        << "\n"
+        << "Invisible watermark (every generated and upscaled image is marked right before it is encoded):\n"
+        << "      --watermark-model <path>            PixelSeal weights from script/convert_pixelseal.py (env SDCPP_WATERMARK_MODEL)\n"
+        << "      --watermark-message <hex>           256-bit message as 64 hex characters (env SDCPP_WATERMARK_MESSAGE)\n"
         << "\n"
         << "Chroma:\n"
         << "      --chroma-disable-dit-mask           Disable DiT mask usage\n"
@@ -1037,6 +1043,18 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
                 return false;
             }
             options.photo_maker_path = argv[++i];
+        } else if (arg == "--watermark-model") {
+            if (i + 1 >= argc) {
+                error = "missing value for --watermark-model";
+                return false;
+            }
+            options.watermark_model_path = argv[++i];
+        } else if (arg == "--watermark-message") {
+            if (i + 1 >= argc) {
+                error = "missing value for --watermark-message";
+                return false;
+            }
+            options.watermark_message = argv[++i];
         } else if (arg == "-p" || arg == "--port") {
             if (i + 1 >= argc) {
                 error = "missing value for --port";
@@ -1430,6 +1448,27 @@ bool parse_arguments(int argc, char** argv, CLIOptions& options, bool& show_help
         return false;
     }
 
+    // The image sets these, so that callers passing their own arguments still get watermarked output.
+    if (options.watermark_model_path.empty()) {
+        if (const char* value = std::getenv("SDCPP_WATERMARK_MODEL")) {
+            options.watermark_model_path = value;
+        }
+    }
+    if (options.watermark_message.empty()) {
+        if (const char* value = std::getenv("SDCPP_WATERMARK_MESSAGE")) {
+            options.watermark_message = value;
+        }
+    }
+    if (options.watermark_model_path.empty() != options.watermark_message.empty()) {
+        error = "--watermark-model and --watermark-message must be given together";
+        return false;
+    }
+    if (!options.watermark_message.empty() &&
+        (options.watermark_message.size() != 64 || options.watermark_message.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)) {
+        error = "--watermark-message must be 64 hex characters (256 bits)";
+        return false;
+    }
+
     return true;
 }
 
@@ -1585,7 +1624,48 @@ struct ServerState {
     sd_cache_params_t default_cache = make_cache_defaults();
     sd_model_version_t ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
     std::unordered_map<std::string, sd_model_version_t> model_version_cache;
+
+    // Guards the watermark context on its own: upscaling runs without `mutex`.
+    std::mutex watermark_mutex;
+    sd_watermark_ctx_t* watermark_ctx = nullptr;
+    std::string watermark_model_path;
+    std::string watermark_message;
+    int watermark_threads = -1;
 };
+
+// Loads the watermark model if it isn't loaded: /free releases it along with everything else on the GPU.
+bool ensure_watermark(ServerState& state) {
+    if (state.watermark_ctx == nullptr) {
+        state.watermark_ctx = new_watermark_ctx(state.watermark_model_path.c_str(), state.watermark_message.c_str(), state.watermark_threads);
+    }
+    return state.watermark_ctx != nullptr;
+}
+
+void release_watermark(ServerState& state) {
+    std::lock_guard<std::mutex> lock(state.watermark_mutex);
+    if (state.watermark_ctx != nullptr) {
+        free_watermark_ctx(state.watermark_ctx);
+        state.watermark_ctx = nullptr;
+    }
+}
+
+// Marks an image in place; `chunk` gets what happened. A no-op unless the server was started with a watermark.
+bool watermark_output(ServerState& state, sd_image_t image, json& chunk) {
+    if (state.watermark_model_path.empty()) {
+        return true;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    bool already_marked = false;
+    {
+        std::lock_guard<std::mutex> lock(state.watermark_mutex);
+        if (!ensure_watermark(state) || !watermark_image(state.watermark_ctx, image, &already_marked)) {
+            return false;
+        }
+    }
+    chunk["watermark"] = already_marked ? "present" : "embedded";
+    chunk["watermark_ms"] = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count() / 1000.0;
+    return true;
+}
 
 class LogCaptureScope {
    public:
@@ -1941,6 +2021,12 @@ class StreamingImageResponder {
             output_image = resized_output.as_sd_image();
         }
 
+        json image_chunk = json::object();
+        if (!watermark_output(state_, output_image, image_chunk)) {
+            emit_error(sink, "failed to watermark image", index);
+            return false;
+        }
+
         auto encode_start = std::chrono::steady_clock::now();
 
         int png_size = 0;
@@ -1966,7 +2052,6 @@ class StreamingImageResponder {
         int64_t actual_seed = random_seed_requested_ ? (effective_seed_ + index) : (request_.seed + index);
         int64_t reported_seed = random_seed_requested_ ? -1 : actual_seed;
 
-        json image_chunk = json::object();
         image_chunk["type"] = "image";
         image_chunk["index"] = index;
         image_chunk["seed"] = reported_seed;
@@ -5745,6 +5830,9 @@ int main(int argc, char** argv) {
     state.ctx_config.prediction = options.prediction;
     state.ctx_config.lora_apply_mode = options.lora_apply_mode;
     state.default_config = state.ctx_config;
+    state.watermark_model_path = options.watermark_model_path;
+    state.watermark_message = options.watermark_message;
+    state.watermark_threads = options.n_threads;
     state.default_cache = make_cache_defaults();
     if (options.cache_provided) {
         state.default_cache = options.cache_params;
@@ -5762,6 +5850,14 @@ int main(int argc, char** argv) {
             for (const auto& entry : collector.entries) {
                 std::cerr << '[' << log_level_tag(entry.level) << "] " << entry.message << std::endl;
             }
+            return 1;
+        }
+    }
+
+    if (!state.watermark_model_path.empty()) {
+        std::lock_guard<std::mutex> lock(state.watermark_mutex);
+        if (!ensure_watermark(state)) {
+            std::cerr << "failed to load the watermark model: " << state.watermark_model_path << std::endl;
             return 1;
         }
     }
@@ -5990,6 +6086,17 @@ int main(int argc, char** argv) {
             telemetry_data.pass_ms.push_back(pass_ms);
         }
 
+        json image_chunk = json::object();
+        if (!watermark_output(state, current_image, image_chunk)) {
+            if (owns_current_data && current_image.data != nullptr) {
+                free(current_image.data);
+            }
+            auto response = make_error_response("failed to watermark image", collector);
+            res.status = 500;
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
+
         auto encode_start = std::chrono::steady_clock::now();
         int png_size = 0;
         unsigned char* png_data = stbi_write_png_to_mem(current_image.data,
@@ -6031,7 +6138,6 @@ int main(int argc, char** argv) {
         const int64_t encoded_bytes = static_cast<int64_t>(encoded.size());
         const int scale = get_upscale_factor(upscaler_ctx.get());
 
-        json image_chunk = json::object();
         image_chunk["type"] = "image";
         image_chunk["index"] = 0;
         image_chunk["width"] = output_width;
@@ -6198,6 +6304,7 @@ int main(int argc, char** argv) {
             state.ctx = nullptr;
             state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
         }
+        release_watermark(state);
 #ifdef SD_USE_CUDA
         for (int device = 0; device < ggml_backend_cuda_get_device_count(); ++device) {
             ggml_backend_cuda_device_reset(device);
@@ -6221,6 +6328,7 @@ int main(int argc, char** argv) {
         state.ctx_model_version = SD_MODEL_VERSION_UNKNOWN;
         release_allocator_pages();
     }
+    release_watermark(state);
 
     return 0;
 }
