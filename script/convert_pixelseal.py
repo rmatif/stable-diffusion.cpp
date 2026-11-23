@@ -2,7 +2,7 @@
 (https://github.com/facebookresearch/videoseal, MIT): the embedder UNet with its batchnorms folded into the convs, the
 message embeddings and the extractor, as fp16 safetensors under the checkpoint's own tensor names.
 
-    pip install torch safetensors
+    pip install torch safetensors numpy
     python script/convert_pixelseal.py pixelseal.safetensors
 """
 

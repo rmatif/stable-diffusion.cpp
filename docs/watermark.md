@@ -7,7 +7,7 @@ and `/upscale` results, right before they are encoded.
 - Build the weights once. The script downloads Meta's checkpoint (sha256-pinned) and writes a 150 MB safetensors file:
 
 ```bash
-pip install torch safetensors
+pip install torch safetensors numpy
 python script/convert_pixelseal.py pixelseal.safetensors
 ```
 
